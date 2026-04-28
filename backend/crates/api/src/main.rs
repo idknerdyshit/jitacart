@@ -1,26 +1,27 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
-use anyhow::Context;
-use axum::{routing::get, Json, Router};
+use anyhow::{anyhow, Context};
+use axum::{extract::State, routing::get, Json, Router};
 use figment::{
     providers::{Env, Format, Toml},
     Figment,
 };
-use serde::Deserialize;
+use nea_esi::EsiClient;
+use secrecy::SecretString;
 use sqlx::postgres::PgPoolOptions;
+use time::Duration as TimeDuration;
 use tower_http::trace::TraceLayer;
+use tower_sessions::{Expiry, SessionManagerLayer};
+use tower_sessions_sqlx_store::PostgresStore;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-#[derive(Debug, Deserialize)]
-struct Config {
-    server: ServerConfig,
-    database_url: String,
-}
+mod auth;
+mod config;
+mod crypto;
+mod jwt;
+mod state;
 
-#[derive(Debug, Deserialize)]
-struct ServerConfig {
-    bind: String,
-}
+use crate::{config::Config, crypto::TokenCipher, jwt::JwksCache, state::AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -46,24 +47,66 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("running migrations")?;
 
+    let cipher = TokenCipher::from_b64(&config.token_enc_key)
+        .context("building token cipher from TOKEN_ENC_KEY")?;
+
+    let http = reqwest::Client::builder()
+        .user_agent(&config.esi.user_agent)
+        .build()
+        .context("building reqwest client")?;
+
+    let jwks = JwksCache::new(http, config.eve_sso.client_id.clone());
+
+    let esi = EsiClient::with_web_app(
+        &config.esi.user_agent,
+        &config.eve_sso.client_id,
+        SecretString::from(config.eve_sso.client_secret.clone()),
+    )
+    .map_err(|e| anyhow!("EsiClient::with_web_app: {e}"))?;
+
+    let session_store = PostgresStore::new(pool.clone());
+    session_store
+        .migrate()
+        .await
+        .context("running tower-sessions migrations")?;
+    let session_layer = SessionManagerLayer::new(session_store)
+        .with_secure(false)
+        .with_http_only(true)
+        .with_same_site(tower_sessions::cookie::SameSite::Lax)
+        .with_expiry(Expiry::OnInactivity(TimeDuration::days(30)));
+
+    let state = AppState {
+        pool,
+        config: Arc::new(config),
+        cipher,
+        jwks,
+        esi: Arc::new(esi),
+    };
+
+    let bind: SocketAddr = state
+        .config
+        .server
+        .bind
+        .parse()
+        .context("parsing bind addr")?;
+
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .with_state(pool)
+        .merge(auth::router())
+        .with_state(state)
+        .layer(session_layer)
         .layer(TraceLayer::new_for_http());
 
-    let addr: SocketAddr = config.server.bind.parse().context("parsing bind addr")?;
-    tracing::info!("listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("listening on {bind}");
+    let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-async fn healthz(
-    axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
-) -> Json<serde_json::Value> {
+async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
     let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&pool)
+        .fetch_one(&state.pool)
         .await
         .is_ok();
     Json(serde_json::json!({

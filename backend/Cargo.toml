@@ -52,6 +52,20 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# auth / crypto
+nea-esi = "0.7"
+tower-sessions = "0.14"
+tower-sessions-sqlx-store = { version = "0.15", features = ["postgres"] }
+jsonwebtoken = "10"
+aes-gcm = "0.10"
+secrecy = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "http2", "charset"] }
+base64 = "0.22"
+rand = "0.8"
+async-trait = "0.1"
+url = "2"
+time = "0.3"
+
 # internal
 domain = { path = "crates/domain" }
 

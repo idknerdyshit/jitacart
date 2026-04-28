@@ -1,12 +1,17 @@
 # Default configuration. Override with environment variables (figment env layer).
-# Secrets (EVE_CLIENT_SECRET, SESSION_SECRET, TOKEN_ENC_KEY) MUST come from env.
+# Secrets (EVE_CLIENT_SECRET, TOKEN_ENC_KEY) MUST come from env.
+#
+# figment is configured with `Env::raw().split("__")`, so nested keys map like:
+#   EVE_SSO__CLIENT_ID -> [eve_sso].client_id
+#   ESI__USER_AGENT    -> [esi].user_agent
+# DATABASE_URL and TOKEN_ENC_KEY are flat top-level keys.
 
 [server]
 bind = "0.0.0.0:8080"
 
 [esi]
-# Required by CCP on every request. Set in env via ESI_USER_AGENT for real deployments.
-user_agent = "jitacart-dev (set ESI_USER_AGENT in env; +https://example.com)"
+# Required by CCP on every request. Set in env via ESI__USER_AGENT for real deployments.
+user_agent = "jitacart-dev (set ESI__USER_AGENT in env; +https://example.com)"
 
 [esi.poll_intervals_secs]
 contracts = 300
@@ -15,4 +20,5 @@ market_prices = 300
 
 [eve_sso]
 callback_url = "http://localhost:8080/auth/eve/callback"
-# client_id / client_secret come from env (EVE_CLIENT_ID, EVE_CLIENT_SECRET)
+# client_id / client_secret come from env (EVE_SSO__CLIENT_ID, EVE_SSO__CLIENT_SECRET)
+login_scopes = ["publicData"]

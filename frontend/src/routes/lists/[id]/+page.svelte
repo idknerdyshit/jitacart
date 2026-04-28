@@ -8,13 +8,14 @@
         type ListDetail,
         type ListStatus,
         type LiveItemPrice,
-        type Market
+        type GroupMarket
     } from '$lib/api';
 
     const listId = $derived(page.params.id);
+    const STALE_AFTER_MS = 2 * 600 * 1000;
 
     let detail = $state<ListDetail | null>(null);
-    let allMarkets = $state<Market[] | null>(null);
+    let allMarkets = $state<GroupMarket[] | null>(null);
     let error = $state<string | null>(null);
     let editingMarkets = $state<boolean>(false);
     let editSelected = $state<Set<string>>(new Set());
@@ -27,10 +28,10 @@
     async function load() {
         error = null;
         try {
-            const [d, all] = await Promise.all([
-                api<ListDetail>(`/lists/${listId}`),
-                allMarkets ? Promise.resolve(allMarkets) : api<Market[]>('/markets')
-            ]);
+            const d = await api<ListDetail>(`/lists/${listId}`);
+            const all = allMarkets
+                ? allMarkets
+                : await api<GroupMarket[]>(`/groups/${d.list.group_id}/markets`);
             detail = d;
             allMarkets = all;
             editSelected = new Set(d.markets.map((m) => m.id));
@@ -137,6 +138,19 @@
         }
     }
 
+    function isStaleMarket(mid: string): boolean {
+        const m = allMarkets?.find((x) => x.id === mid);
+        if (!m) return false;
+        if (!m.is_public) return true;
+        if (m.kind !== 'public_structure') return false;
+        if (!m.last_orders_synced_at) return true;
+        return Date.now() - new Date(m.last_orders_synced_at).getTime() > STALE_AFTER_MS;
+    }
+
+    function isCitadel(mid: string): boolean {
+        return allMarkets?.find((x) => x.id === mid)?.kind === 'public_structure';
+    }
+
     const priceIndex = $derived.by(() => {
         const m = new Map<string, LiveItemPrice>();
         if (detail) {
@@ -197,10 +211,17 @@
                     <button
                         class="chip"
                         class:selected={editSelected.has(m.id)}
+                        class:stale={isStaleMarket(m.id)}
                         onclick={() => toggleEditMarket(m.id)}
                         type="button"
+                        title={m.kind === 'public_structure'
+                            ? `${m.name ?? ''}${m.accessing_character_name ? ` · via ${m.accessing_character_name}` : ''}`
+                            : (m.name ?? '')}
                     >
-                        {m.short_label}
+                        {m.short_label ?? '(unnamed)'}
+                        {#if m.kind === 'public_structure'}
+                            <span class="badge">citadel</span>
+                        {/if}
                     </button>
                 {/each}
             </div>
@@ -214,7 +235,10 @@
                             onclick={() => (editPrimary = m.id)}
                             type="button"
                         >
-                            ★ {m.short_label}
+                            ★ {m.short_label ?? '(unnamed)'}
+                            {#if m.kind === 'public_structure'}
+                                <span class="badge">citadel</span>
+                            {/if}
                         </button>
                     {/each}
                 </div>
@@ -224,8 +248,9 @@
             <p>
                 {#each detail.markets as m, i (m.id)}
                     {#if i > 0}, {/if}
-                    {#if m.id === detail.primary_market_id}<strong>★ {m.short_label}</strong
-                        >{:else}{m.short_label}{/if}
+                    {#if m.id === detail.primary_market_id}<strong>★ {m.short_label ?? '(unnamed)'}</strong
+                        >{:else}{m.short_label ?? '(unnamed)'}{/if}
+                    {#if m.kind === 'public_structure'}<span class="badge">citadel</span>{/if}
                 {/each}
             </p>
         {/if}
@@ -240,7 +265,10 @@
                     <th>Qty</th>
                     <th>Saved unit</th>
                     {#each detail.markets as m (m.id)}
-                        <th>{m.short_label}</th>
+                        <th>
+                            {m.short_label ?? '(unnamed)'}
+                            {#if m.kind === 'public_structure'}<span class="badge">citadel</span>{/if}
+                        </th>
                     {/each}
                     <th></th>
                 </tr>
@@ -265,10 +293,25 @@
                         <td>{fmtIsk(it.est_unit_price_isk)}</td>
                         {#each detail.markets as m (m.id)}
                             {@const lp = priceFor(it.id, m.id)}
-                            <td title={lp?.computed_at == null
-                                ? 'worker has not priced this yet — refreshes every ~60s'
-                                : `priced at ${new Date(lp.computed_at).toLocaleTimeString()}`}>
-                                {fmtIsk(lp?.best_sell ?? null)}
+                            {@const cellStale = isStaleMarket(m.id) ||
+                                (lp?.computed_at && Date.now() - new Date(lp.computed_at).getTime() > STALE_AFTER_MS)}
+                            <td
+                                class:stale={cellStale}
+                                title={lp?.computed_at == null
+                                    ? 'worker has not priced this yet'
+                                    : `priced at ${new Date(lp.computed_at).toLocaleTimeString()}`}
+                            >
+                                {#if lp == null || lp.best_sell == null}
+                                    <span class="muted">no offers</span>
+                                {:else}
+                                    {fmtIsk(lp.best_sell)}
+                                    {#if lp.sell_volume <= it.qty_requested}
+                                        <span class="warn">·thin (vol {lp.sell_volume.toLocaleString()})</span>
+                                    {:else}
+                                        <span class="muted vol">vol {lp.sell_volume.toLocaleString()}</span>
+                                    {/if}
+                                    {#if cellStale}<span class="muted">·stale</span>{/if}
+                                {/if}
                             </td>
                         {/each}
                         <td>
@@ -337,6 +380,31 @@
     .chip.selected {
         border-color: #2f6feb;
         background: #1f2937;
+    }
+    .chip.stale {
+        opacity: 0.5;
+    }
+    .badge {
+        font-size: 0.7em;
+        padding: 0.05em 0.4em;
+        border-radius: 4px;
+        background: #30363d;
+        color: #8b949e;
+        margin-left: 0.35em;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+    td.stale {
+        opacity: 0.55;
+    }
+    .vol {
+        font-size: 0.85em;
+        margin-left: 0.4em;
+    }
+    .warn {
+        color: #fbbf24;
+        font-size: 0.85em;
+        margin-left: 0.4em;
     }
     button {
         background: #21262d;

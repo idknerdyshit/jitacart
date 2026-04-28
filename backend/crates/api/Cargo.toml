@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 domain = { workspace = true }
 market = { workspace = true }
+auth-tokens = { workspace = true }
 rust_decimal = { workspace = true }
 
 tokio = { workspace = true }

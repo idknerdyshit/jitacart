@@ -198,9 +198,11 @@ pub struct Market {
     pub id: Uuid,
     pub kind: MarketKind,
     pub esi_location_id: i64,
-    pub region_id: i64,
-    pub name: String,
-    pub short_label: String,
+    /// `None` only for citadels still pending detail-fetch resolution.
+    /// NPC hubs always carry `Some(_)`; the DB CHECK constraint enforces this.
+    pub region_id: Option<i64>,
+    pub name: Option<String>,
+    pub short_label: Option<String>,
     pub is_hub: bool,
     pub is_public: bool,
 }

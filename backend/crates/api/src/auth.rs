@@ -16,8 +16,9 @@ use sqlx::PgPool;
 use tower_sessions::Session;
 use uuid::Uuid;
 
+use auth_tokens::TokenCipher;
+
 use crate::{
-    crypto::TokenCipher,
     extract::{CurrentUser, SESSION_KEY_USER},
     jwt::EveClaims,
     state::AppState,
@@ -29,6 +30,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/auth/eve/login", get(login))
         .route("/auth/eve/callback", get(callback))
+        .route("/auth/eve/upgrade", get(upgrade))
         .route("/auth/logout", post(logout))
         .route("/me", get(me))
 }
@@ -39,6 +41,15 @@ struct PendingAuth {
     state: String,
     attach: bool,
     return_to: Option<String>,
+    /// When set, the callback verifies the returned `claims.character_id`
+    /// matches this. Used by the upgrade flow so the user can't accidentally
+    /// re-auth as a different character on the EVE consent screen.
+    #[serde(default)]
+    target_character_id: Option<i64>,
+    /// Scopes requested for this consent flow. Validated against config
+    /// (`login_scopes ∪ upgrade_scopes`) before redirecting to EVE.
+    #[serde(default)]
+    requested_scopes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +84,85 @@ async fn login(
         state: challenge.state.clone(),
         attach: q.attach,
         return_to: safe_return_to(q.return_to),
+        target_character_id: None,
+        requested_scopes: cfg.login_scopes.clone(),
+    };
+    session
+        .insert(SESSION_KEY_PENDING, &pending)
+        .await
+        .map_err(internal)?;
+
+    Ok(Redirect::to(&challenge.authorize_url))
+}
+
+#[derive(Deserialize)]
+struct UpgradeQuery {
+    character_id: i64,
+    /// Comma-separated list. Each must be in `login_scopes ∪ upgrade_scopes`.
+    scopes: String,
+    return_to: Option<String>,
+}
+
+async fn upgrade(
+    State(state): State<AppState>,
+    session: Session,
+    CurrentUser(user_id): CurrentUser,
+    Query(q): Query<UpgradeQuery>,
+) -> Result<Redirect, AuthError> {
+    // Confirm the character belongs to this user.
+    let owns: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM characters WHERE character_id = $1 AND user_id = $2")
+            .bind(q.character_id)
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?;
+    if owns.is_none() {
+        return Err(AuthError::Unauthorized);
+    }
+
+    let cfg = &state.config.eve_sso;
+    let requested: Vec<String> = q
+        .scopes
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if requested.is_empty() {
+        return Err(AuthError::Internal(anyhow!("no scopes requested")));
+    }
+    let allowed: std::collections::HashSet<&str> = cfg
+        .login_scopes
+        .iter()
+        .chain(cfg.upgrade_scopes.iter())
+        .map(String::as_str)
+        .collect();
+    for s in &requested {
+        if !allowed.contains(s.as_str()) {
+            return Err(AuthError::Internal(anyhow!("scope not allowed: {s}")));
+        }
+    }
+
+    // EVE SSO replaces the granted set on each consent — always include base
+    // scopes so we don't accidentally drop e.g. `publicData`.
+    let mut all: std::collections::BTreeSet<String> = cfg.login_scopes.iter().cloned().collect();
+    for s in &requested {
+        all.insert(s.clone());
+    }
+    let scopes_vec: Vec<&str> = all.iter().map(String::as_str).collect();
+
+    let challenge: PkceChallenge = state
+        .esi
+        .authorize_url(&cfg.callback_url, &scopes_vec)
+        .map_err(|e| AuthError::Internal(anyhow!("authorize_url: {e}")))?;
+
+    let pending = PendingAuth {
+        code_verifier: challenge.code_verifier.expose_secret().to_string(),
+        state: challenge.state.clone(),
+        attach: true,
+        return_to: safe_return_to(q.return_to),
+        target_character_id: Some(q.character_id),
+        requested_scopes: all.into_iter().collect(),
     };
     session
         .insert(SESSION_KEY_PENDING, &pending)
@@ -117,6 +207,13 @@ async fn callback(
         .verify(tokens.access_token.expose_secret())
         .await
         .map_err(AuthError::Internal)?;
+
+    if let Some(target) = pending.target_character_id {
+        let returned = claims.character_id().map_err(AuthError::Internal)?;
+        if returned != target {
+            return Err(AuthError::WrongCharacter);
+        }
+    }
 
     let session_user: Option<Uuid> = session.get(SESSION_KEY_USER).await.map_err(internal)?;
 
@@ -327,6 +424,7 @@ pub enum AuthError {
     Unauthorized,
     StateMismatch,
     NoPending,
+    WrongCharacter,
     Internal(anyhow::Error),
 }
 
@@ -342,6 +440,11 @@ impl IntoResponse for AuthError {
             AuthError::NoPending => {
                 (StatusCode::BAD_REQUEST, "no pending auth in session").into_response()
             }
+            AuthError::WrongCharacter => (
+                StatusCode::BAD_REQUEST,
+                "consent returned a different character than the one requested",
+            )
+                .into_response(),
             AuthError::Internal(e) => {
                 tracing::error!(error = ?e, "auth handler error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()

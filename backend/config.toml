@@ -17,11 +17,22 @@ user_agent = "jitacart-dev (set ESI__USER_AGENT in env; +https://example.com)"
 contracts = 300
 wallet_transactions = 3600
 market_prices = 300
+citadel_discovery = 3600
+citadel_details = 86400
+citadel_orders = 600
+structure_access_backoff = 86400
 
 [worker]
 tick_secs = 60
+citadel_discovery_missing_threshold = 3
+citadel_details_concurrency = 4
+citadel_orders_concurrency = 8
 
 [eve_sso]
 callback_url = "http://localhost:8080/auth/eve/callback"
 # client_id / client_secret come from env (EVE_SSO__CLIENT_ID, EVE_SSO__CLIENT_SECRET)
 login_scopes = ["publicData"]
+upgrade_scopes = [
+    "esi-markets.structure_markets.v1",
+    "esi-universe.read_structures.v1",
+]

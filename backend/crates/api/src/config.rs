@@ -24,6 +24,10 @@ pub struct EveSsoConfig {
     /// later phases will add per-feature scope upgrades.
     #[serde(default = "default_login_scopes")]
     pub login_scopes: Vec<String>,
+    /// Scopes that may be requested by `/auth/eve/upgrade`. Each request is
+    /// validated to lie inside `login_scopes ∪ upgrade_scopes`.
+    #[serde(default)]
+    pub upgrade_scopes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +46,14 @@ pub struct PollIntervals {
     pub contracts: u64,
     #[serde(default = "default_wallet_transactions_secs")]
     pub wallet_transactions: u64,
+    #[serde(default = "default_citadel_discovery_secs")]
+    pub citadel_discovery: u64,
+    #[serde(default = "default_citadel_details_secs")]
+    pub citadel_details: u64,
+    #[serde(default = "default_citadel_orders_secs")]
+    pub citadel_orders: u64,
+    #[serde(default = "default_structure_access_backoff_secs")]
+    pub structure_access_backoff: u64,
 }
 
 impl Default for PollIntervals {
@@ -50,6 +62,10 @@ impl Default for PollIntervals {
             market_prices: default_market_prices_secs(),
             contracts: default_contracts_secs(),
             wallet_transactions: default_wallet_transactions_secs(),
+            citadel_discovery: default_citadel_discovery_secs(),
+            citadel_details: default_citadel_details_secs(),
+            citadel_orders: default_citadel_orders_secs(),
+            structure_access_backoff: default_structure_access_backoff_secs(),
         }
     }
 }
@@ -62,6 +78,18 @@ fn default_contracts_secs() -> u64 {
 }
 fn default_wallet_transactions_secs() -> u64 {
     3600
+}
+fn default_citadel_discovery_secs() -> u64 {
+    3600
+}
+fn default_citadel_details_secs() -> u64 {
+    86400
+}
+fn default_citadel_orders_secs() -> u64 {
+    600
+}
+fn default_structure_access_backoff_secs() -> u64 {
+    86400
 }
 
 fn default_login_scopes() -> Vec<String> {

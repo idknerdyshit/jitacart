@@ -16,11 +16,19 @@ export type Market = {
     id: string;
     kind: 'npc_hub' | 'public_structure';
     esi_location_id: number;
-    region_id: number;
-    name: string;
-    short_label: string;
+    /** NPC hubs always carry these; citadels may be null until detail-fetch resolves them. */
+    region_id: number | null;
+    name: string | null;
+    short_label: string | null;
     is_hub: boolean;
     is_public: boolean;
+};
+
+export type GroupMarket = Market & {
+    last_orders_synced_at: string | null;
+    untrackable_until: string | null;
+    accessing_character_id: string | null;
+    accessing_character_name: string | null;
 };
 
 export type ListStatus = 'open' | 'closed' | 'archived';

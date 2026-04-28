@@ -5,6 +5,7 @@ members = [
     "crates/worker",
     "crates/domain",
     "crates/market",
+    "crates/auth-tokens",
 ]
 
 [workspace.package]
@@ -74,6 +75,7 @@ time = "0.3"
 # internal
 domain = { path = "crates/domain" }
 market = { path = "crates/market" }
+auth-tokens = { path = "crates/auth-tokens" }
 
 [profile.dev]
 opt-level = 0

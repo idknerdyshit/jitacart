@@ -5,14 +5,16 @@
     import {
         api,
         fmtIsk,
-        type Market,
+        type GroupMarket,
         type PreviewResponse,
         type ListDetail
     } from '$lib/api';
 
     const groupId = $derived(page.params.id);
+    // 2× the citadel-orders cadence (default 600s) is the staleness gate.
+    const STALE_AFTER_MS = 2 * 600 * 1000;
 
-    let markets = $state<Market[] | null>(null);
+    let markets = $state<GroupMarket[] | null>(null);
     let selectedIds = $state<Set<string>>(new Set());
     let primaryId = $state<string | null>(null);
     let multibuy = $state<string>('');
@@ -27,7 +29,7 @@
 
     onMount(async () => {
         try {
-            markets = await api<Market[]>('/markets');
+            markets = await api<GroupMarket[]>(`/groups/${groupId}/markets`);
             // Default-select Jita as primary if present.
             const jita = markets.find((m) => m.short_label === 'Jita');
             if (jita) {
@@ -38,6 +40,13 @@
             error = (e as Error).message;
         }
     });
+
+    function isStale(m: GroupMarket): boolean {
+        if (!m.is_public) return true;
+        if (m.kind !== 'public_structure') return false;
+        if (!m.last_orders_synced_at) return true;
+        return Date.now() - new Date(m.last_orders_synced_at).getTime() > STALE_AFTER_MS;
+    }
 
     function toggleMarket(id: string) {
         const next = new Set(selectedIds);
@@ -158,10 +167,17 @@
                 <button
                     class="chip"
                     class:selected={selectedIds.has(m.id)}
+                    class:stale={isStale(m)}
                     onclick={() => toggleMarket(m.id)}
                     type="button"
+                    title={m.kind === 'public_structure'
+                        ? `${m.name ?? '(unnamed)'}${m.accessing_character_name ? ` · via ${m.accessing_character_name}` : ''}${isStale(m) ? ' · stale' : ''}`
+                        : (m.name ?? '')}
                 >
-                    {m.short_label}
+                    {m.short_label ?? '(unnamed)'}
+                    {#if m.kind === 'public_structure'}
+                        <span class="badge">citadel</span>
+                    {/if}
                 </button>
             {/each}
         </div>
@@ -175,7 +191,10 @@
                         onclick={() => setPrimary(m.id)}
                         type="button"
                     >
-                        ★ {m.short_label}
+                        ★ {m.short_label ?? '(unnamed)'}
+                        {#if m.kind === 'public_structure'}
+                            <span class="badge">citadel</span>
+                        {/if}
                     </button>
                 {/each}
             </div>
@@ -256,8 +275,23 @@
                         <td>{line.qty.toLocaleString()}</td>
                         {#each markets ?? [] as m (m.id)}
                             {#if selectedIds.has(m.id)}
-                                <td class:cheapest={cheapestPerLine.get(i) === m.id}>
-                                    {fmtIsk(line.prices[m.id]?.best_sell ?? null)}
+                                {@const p = line.prices[m.id]}
+                                <td
+                                    class:cheapest={cheapestPerLine.get(i) === m.id}
+                                    class:stale={isStale(m) || (p?.computed_at &&
+                                        Date.now() - new Date(p.computed_at).getTime() > STALE_AFTER_MS)}
+                                >
+                                    {#if p == null || p.best_sell == null}
+                                        <span class="muted">no offers</span>
+                                    {:else}
+                                        {fmtIsk(p.best_sell)}
+                                        {#if p.sell_volume <= line.qty}
+                                            <span class="warn">·thin (vol {p.sell_volume.toLocaleString()})</span>
+                                        {:else}
+                                            <span class="muted vol">vol {p.sell_volume.toLocaleString()}</span>
+                                        {/if}
+                                        {#if isStale(m)}<span class="muted">·stale</span>{/if}
+                                    {/if}
                                 </td>
                             {/if}
                         {/each}
@@ -299,6 +333,31 @@
     .chip.selected {
         border-color: #2f6feb;
         background: #1f2937;
+    }
+    .chip.stale {
+        opacity: 0.5;
+    }
+    .badge {
+        font-size: 0.7em;
+        padding: 0.05em 0.4em;
+        border-radius: 4px;
+        background: #30363d;
+        color: #8b949e;
+        margin-left: 0.35em;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+    td.stale {
+        opacity: 0.55;
+    }
+    .vol {
+        font-size: 0.85em;
+        margin-left: 0.4em;
+    }
+    .warn {
+        color: #fbbf24;
+        font-size: 0.85em;
+        margin-left: 0.4em;
     }
     textarea,
     input[type='text'] {

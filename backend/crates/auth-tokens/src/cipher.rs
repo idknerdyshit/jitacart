@@ -45,7 +45,6 @@ impl TokenCipher {
     }
 
     /// Decrypt with the stored ciphertext + nonce.
-    #[allow(dead_code)] // used by the worker crate in later phases
     pub fn decrypt(&self, ciphertext: &[u8], nonce: &[u8]) -> anyhow::Result<Vec<u8>> {
         if nonce.len() != 12 {
             return Err(anyhow!("nonce must be 12 bytes, got {}", nonce.len()));

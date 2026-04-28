@@ -129,7 +129,12 @@
 
     <section>
         <h2>Shopping lists</h2>
-        <p><a href="/groups/{groupId}/lists">Lists →</a></p>
+        <p><a href={`/groups/${groupId}/lists`}>Lists →</a></p>
+    </section>
+
+    <section>
+        <h2>Markets</h2>
+        <p><a href={`/groups/${groupId}/tracked-markets`}>Tracked citadels →</a></p>
     </section>
 
     <section>

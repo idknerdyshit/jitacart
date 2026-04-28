@@ -16,8 +16,8 @@ use tower_sessions_sqlx_store::PostgresStore;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod auth;
+mod citadels;
 mod config;
-mod crypto;
 mod extract;
 mod groups;
 mod jwt;
@@ -25,7 +25,9 @@ mod lists;
 mod markets;
 mod state;
 
-use crate::{config::Config, crypto::TokenCipher, jwt::JwksCache, state::AppState};
+use auth_tokens::{CharacterTokenStore, EsiBudgetGuard, TokenCipher};
+
+use crate::{config::Config, jwt::JwksCache, state::AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -80,12 +82,24 @@ async fn main() -> anyhow::Result<()> {
         .with_same_site(tower_sessions::cookie::SameSite::Lax)
         .with_expiry(Expiry::OnInactivity(TimeDuration::days(30)));
 
+    let token_store = CharacterTokenStore::new(
+        pool.clone(),
+        cipher.clone(),
+        config.esi.user_agent.clone(),
+        config.eve_sso.client_id.clone(),
+        SecretString::from(config.eve_sso.client_secret.clone()),
+    );
+
+    let budget_guard = EsiBudgetGuard::default();
+
     let state = AppState {
         pool,
         config: Arc::new(config),
         cipher,
         jwks,
         esi: Arc::new(esi),
+        token_store,
+        budget_guard,
     };
 
     let bind: SocketAddr = state
@@ -101,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(groups::router())
         .merge(markets::router())
         .merge(lists::router())
+        .merge(citadels::router())
         .with_state(state)
         .layer(session_layer)
         .layer(TraceLayer::new_for_http());

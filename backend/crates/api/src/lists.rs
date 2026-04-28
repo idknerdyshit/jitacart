@@ -6,8 +6,9 @@
 //! - distinct dedup'd type names:      <= [`MAX_DISTINCT_NAMES`]
 //! - `market_ids`:                     <= [`MAX_MARKET_IDS`]
 //!
-//! Each `market_id` must point to a public NPC-hub market (Phase 3 limit;
-//! enforced by [`require_phase3_markets`]).
+//! Each `market_id` must point to either a public NPC hub or a citadel that
+//! the calling group has explicitly tracked (enforced by
+//! [`validate_markets_for_group`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -127,7 +128,7 @@ struct PatchItemBody {
 
 async fn preview(
     State(state): State<AppState>,
-    CurrentGroup { .. }: CurrentGroup,
+    CurrentGroup { group_id, .. }: CurrentGroup,
     Json(body): Json<PreviewBody>,
 ) -> Result<Json<PreviewResponse>, ListError> {
     validate_multibuy_size(&body.multibuy)?;
@@ -151,14 +152,14 @@ async fn preview(
     }
 
     let markets = load_markets(&state, &body.market_ids).await?;
-    require_phase3_markets(&markets)?;
+    validate_markets_for_group(&state.pool, group_id, &markets).await?;
 
     let (resolved, unresolved) = market::resolve_type_ids(&state.pool, &state.esi, &distinct_names)
         .await
         .map_err(internal)?;
 
     let type_ids = dedup_type_ids(resolved.values().map(|r| r.type_id));
-    let prices_by_market = fetch_prices_for_markets(&state, &markets, &type_ids).await?;
+    let prices_by_market = fetch_prices_for_markets(&state, group_id, &markets, &type_ids).await?;
 
     let lines: Vec<PreviewLine> = parsed
         .lines
@@ -250,7 +251,7 @@ async fn create(
     }
 
     let markets = load_markets(&state, &body.market_ids).await?;
-    require_phase3_markets(&markets)?;
+    validate_markets_for_group(&state.pool, group_id, &markets).await?;
 
     let (resolved, unresolved) = market::resolve_type_ids(&state.pool, &state.esi, &distinct_names)
         .await
@@ -264,7 +265,7 @@ async fn create(
 
     // Refresh prices up front so the snapshot insert below sees fresh data.
     let type_ids = dedup_type_ids(resolved.values().map(|r| r.type_id));
-    let prices_by_market = fetch_prices_for_markets(&state, &markets, &type_ids).await?;
+    let prices_by_market = fetch_prices_for_markets(&state, group_id, &markets, &type_ids).await?;
 
     struct ItemRow {
         type_id: i64,
@@ -439,7 +440,9 @@ async fn delete_list(
 
 async fn replace_markets(
     State(state): State<AppState>,
-    CurrentList { list_id, .. }: CurrentList,
+    CurrentList {
+        list_id, group_id, ..
+    }: CurrentList,
     Json(body): Json<ReplaceMarketsBody>,
 ) -> Result<Json<ListDetail>, ListError> {
     validate_market_ids_size(&body.market_ids)?;
@@ -449,7 +452,7 @@ async fn replace_markets(
         ));
     }
     let markets = load_markets(&state, &body.market_ids).await?;
-    require_phase3_markets(&markets)?;
+    validate_markets_for_group(&state.pool, group_id, &markets).await?;
 
     let updated_after = {
         let mut tx = state.pool.begin().await.map_err(internal)?;
@@ -739,22 +742,142 @@ fn dedup_type_ids(iter: impl IntoIterator<Item = i64>) -> Vec<i64> {
     v
 }
 
-/// Fan out price refreshes to all markets in parallel, capped by the
-/// process-wide ESI semaphore in [`market::prices`].
+/// Fan out price lookups to all markets in parallel.
+///
+/// NPC hubs can safely refresh on demand through the anonymous regional market
+/// endpoint. Citadels are intentionally cache-only on API request paths: the
+/// worker proves group access, refreshes the structure order book, and records
+/// which group member succeeded before these handlers expose cached rows.
 async fn fetch_prices_for_markets(
     state: &AppState,
+    group_id: Uuid,
     markets: &[Market],
     type_ids: &[i64],
 ) -> Result<HashMap<Uuid, HashMap<i64, market::PriceAggregate>>, ListError> {
-    let ttl = state.config.esi.poll_intervals_secs.market_prices as i64;
+    let npc_ttl = state.config.esi.poll_intervals_secs.market_prices as i64;
+    let citadel_ttl = state
+        .config
+        .esi
+        .poll_intervals_secs
+        .citadel_orders
+        .saturating_mul(2) as i64;
     let futs = markets.iter().map(|m| async move {
-        let map = market::get_or_refresh_prices(&state.pool, &state.esi, m, type_ids, ttl).await?;
+        let map = match m.kind {
+            MarketKind::NpcHub => {
+                market::get_or_refresh_prices(&state.pool, &state.esi, m, type_ids, npc_ttl).await?
+            }
+            MarketKind::PublicStructure => {
+                read_group_citadel_prices(state, group_id, m, type_ids, citadel_ttl).await?
+            }
+        };
         Ok::<_, anyhow::Error>((m.id, map))
     });
     let results = futures_util::future::try_join_all(futs)
         .await
         .map_err(internal)?;
     Ok(results.into_iter().collect())
+}
+
+async fn read_group_citadel_prices(
+    state: &AppState,
+    group_id: Uuid,
+    market: &Market,
+    type_ids: &[i64],
+    ttl_secs: i64,
+) -> anyhow::Result<HashMap<i64, market::PriceAggregate>> {
+    if !market.is_public || type_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let accessible = accessible_market_ids(&state.pool, group_id, &[market.id]).await?;
+    if !accessible.contains(&market.id) {
+        return Ok(HashMap::new());
+    }
+    read_cached_prices(&state.pool, market.id, type_ids, ttl_secs).await
+}
+
+/// Subset of `market_ids` that the group can read prices for: NPC hubs are
+/// always accessible; citadels are accessible iff some group member has an
+/// `ok` `character_structure_access` row plus the structure-markets scope.
+async fn accessible_market_ids(
+    pool: &sqlx::PgPool,
+    group_id: Uuid,
+    market_ids: &[Uuid],
+) -> anyhow::Result<HashSet<Uuid>> {
+    if market_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let rows: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT m.id
+        FROM markets m
+        WHERE m.id = ANY($2::uuid[])
+          AND (
+              m.kind = 'npc_hub'
+              OR EXISTS (
+                  SELECT 1
+                  FROM characters c
+                  JOIN group_memberships gm
+                    ON gm.user_id = c.user_id AND gm.group_id = $1
+                  JOIN character_structure_access csa
+                    ON csa.character_id = c.id AND csa.market_id = m.id
+                  WHERE csa.market_status = 'ok'
+                    AND c.scopes @> ARRAY['esi-markets.structure_markets.v1']
+              )
+          )
+        "#,
+    )
+    .bind(group_id)
+    .bind(market_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+async fn read_cached_prices(
+    pool: &sqlx::PgPool,
+    market_id: Uuid,
+    type_ids: &[i64],
+    ttl_secs: i64,
+) -> anyhow::Result<HashMap<i64, market::PriceAggregate>> {
+    if type_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let cutoff: DateTime<Utc> = Utc::now() - chrono::Duration::seconds(ttl_secs.max(0));
+    let rows: Vec<CachedPriceRow> = sqlx::query_as(
+        "SELECT type_id, best_sell, best_buy, sell_volume, buy_volume, computed_at \
+         FROM market_prices \
+         WHERE market_id = $1 AND type_id = ANY($2::bigint[]) AND computed_at >= $3",
+    )
+    .bind(market_id)
+    .bind(type_ids)
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|r| (r.type_id, r.into())).collect())
+}
+
+#[derive(sqlx::FromRow)]
+struct CachedPriceRow {
+    type_id: i64,
+    best_sell: Option<Decimal>,
+    best_buy: Option<Decimal>,
+    sell_volume: i64,
+    buy_volume: i64,
+    computed_at: DateTime<Utc>,
+}
+
+impl From<CachedPriceRow> for market::PriceAggregate {
+    fn from(r: CachedPriceRow) -> Self {
+        Self {
+            best_sell: r.best_sell,
+            best_buy: r.best_buy,
+            sell_volume: r.sell_volume,
+            buy_volume: r.buy_volume,
+            computed_at: r.computed_at,
+        }
+    }
 }
 
 fn validate_multibuy_size(mb: &str) -> Result<(), ListError> {
@@ -809,19 +932,62 @@ async fn load_markets(state: &AppState, ids: &[Uuid]) -> Result<Vec<Market>, Lis
         .map_err(internal)
 }
 
-fn require_phase3_markets(markets: &[Market]) -> Result<(), ListError> {
+/// Allow if every market is either an NPC hub or present in
+/// `group_tracked_markets` for the given group. Discovered-but-untracked
+/// citadels are rejected so a user can't pull a Keepstar into a list for a
+/// group that hasn't opted in to it.
+async fn validate_markets_for_group(
+    pool: &sqlx::PgPool,
+    group_id: Uuid,
+    markets: &[Market],
+) -> Result<(), ListError> {
+    if markets.is_empty() {
+        return Ok(());
+    }
+    let citadel_ids: Vec<Uuid> = markets
+        .iter()
+        .filter(|m| m.kind == MarketKind::PublicStructure)
+        .map(|m| m.id)
+        .collect();
+
+    let tracked: std::collections::HashSet<Uuid> = if citadel_ids.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT market_id FROM group_tracked_markets \
+             WHERE group_id = $1 AND market_id = ANY($2::uuid[])",
+        )
+        .bind(group_id)
+        .bind(&citadel_ids)
+        .fetch_all(pool)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .collect()
+    };
+
     for m in markets {
+        let label = m.short_label.as_deref().unwrap_or("(unnamed)");
         if !m.is_public {
             return Err(ListError::BadRequest(format!(
-                "market {} is not public",
-                m.short_label
+                "market {label} is not public"
             )));
         }
-        if !m.is_hub || m.kind != MarketKind::NpcHub {
-            return Err(ListError::BadRequest(format!(
-                "Phase 3 only supports NPC hubs; '{}' is not one",
-                m.short_label
-            )));
+        match m.kind {
+            MarketKind::NpcHub => {
+                if !m.is_hub {
+                    return Err(ListError::BadRequest(format!(
+                        "market {label} is marked as NPC hub but is_hub=false"
+                    )));
+                }
+            }
+            MarketKind::PublicStructure => {
+                if !tracked.contains(&m.id) {
+                    return Err(ListError::BadRequest(format!(
+                        "citadel '{label}' is not tracked by this group"
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -857,6 +1023,13 @@ async fn recompute_estimates(
     mut updated_after: DateTime<Utc>,
 ) -> Result<(), ListError> {
     for _ in 0..RECOMPUTE_RETRY_LIMIT {
+        let group_id: Uuid = sqlx::query_scalar("SELECT group_id FROM lists WHERE id = $1")
+            .bind(list_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?
+            .ok_or(ListError::NotFound)?;
+
         let market_rows: Vec<MarketRow> = sqlx::query_as(
             "SELECT m.id, m.kind, m.esi_location_id, m.region_id, m.name, m.short_label, \
                     m.is_hub, m.is_public \
@@ -881,7 +1054,8 @@ async fn recompute_estimates(
                 .map_err(internal)?;
 
         let type_ids = dedup_type_ids(items.iter().map(|(_, t)| *t));
-        let prices_by_market = fetch_prices_for_markets(state, &markets, &type_ids).await?;
+        let prices_by_market =
+            fetch_prices_for_markets(state, group_id, &markets, &type_ids).await?;
 
         let mut tx = state.pool.begin().await.map_err(internal)?;
         let current_updated: DateTime<Utc> =
@@ -948,6 +1122,7 @@ async fn load_list_detail(state: &AppState, list_id: Uuid) -> Result<ListDetail,
     .await
     .map_err(internal)?
     .ok_or(ListError::NotFound)?;
+    let group_id = list_row.group_id;
     let list = list_row.into_list().map_err(internal)?;
 
     let item_rows: Vec<ListItemRow> = sqlx::query_as(
@@ -985,6 +1160,13 @@ async fn load_list_detail(state: &AppState, list_id: Uuid) -> Result<ListDetail,
         .collect::<anyhow::Result<Vec<_>>>()
         .map_err(internal)?;
 
+    let market_ids: Vec<Uuid> = markets.iter().map(|m| m.id).collect();
+    let accessible: Vec<Uuid> = accessible_market_ids(&state.pool, group_id, &market_ids)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .collect();
+
     let live_rows: Vec<LivePriceRow> = sqlx::query_as(
         r#"
         SELECT li.id          AS list_item_id,
@@ -997,11 +1179,15 @@ async fn load_list_detail(state: &AppState, list_id: Uuid) -> Result<ListDetail,
         FROM list_items li
         JOIN list_markets lm ON lm.list_id = li.list_id
         JOIN markets       m ON m.id       = lm.market_id
-        LEFT JOIN market_prices mp ON mp.market_id = m.id AND mp.type_id = li.type_id
+        LEFT JOIN market_prices mp
+          ON mp.market_id = m.id
+         AND mp.type_id   = li.type_id
+         AND mp.market_id = ANY($2::uuid[])
         WHERE li.list_id = $1
         "#,
     )
     .bind(list_id)
+    .bind(&accessible)
     .fetch_all(&state.pool)
     .await
     .map_err(internal)?;
@@ -1119,9 +1305,9 @@ struct MarketWithPrimaryRow {
     id: Uuid,
     kind: String,
     esi_location_id: i64,
-    region_id: i64,
-    name: String,
-    short_label: String,
+    region_id: Option<i64>,
+    name: Option<String>,
+    short_label: Option<String>,
     is_hub: bool,
     is_public: bool,
     is_primary: bool,

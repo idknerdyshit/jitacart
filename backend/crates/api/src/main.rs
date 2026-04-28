@@ -18,6 +18,8 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 mod auth;
 mod config;
 mod crypto;
+mod extract;
+mod groups;
 mod jwt;
 mod state;
 
@@ -93,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .merge(auth::router())
+        .merge(groups::router())
         .with_state(state)
         .layer(session_layer)
         .layer(TraceLayer::new_for_http());

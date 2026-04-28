@@ -44,6 +44,7 @@
     {#if me}
         <p>Signed in as <strong>{me.user.display_name}</strong>.</p>
         <p><a href="/me">Profile &amp; characters →</a></p>
+        <p><a href="/groups">Groups →</a></p>
         <button onclick={logout}>Log out</button>
     {:else}
         <p>Sign in with EVE to link a character.</p>

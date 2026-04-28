@@ -16,9 +16,13 @@ use sqlx::PgPool;
 use tower_sessions::Session;
 use uuid::Uuid;
 
-use crate::{crypto::TokenCipher, jwt::EveClaims, state::AppState};
+use crate::{
+    crypto::TokenCipher,
+    extract::{CurrentUser, SESSION_KEY_USER},
+    jwt::EveClaims,
+    state::AppState,
+};
 
-const SESSION_KEY_USER: &str = "user_id";
 const SESSION_KEY_PENDING: &str = "pending_auth";
 
 pub fn router() -> Router<AppState> {
@@ -34,12 +38,14 @@ struct PendingAuth {
     code_verifier: String,
     state: String,
     attach: bool,
+    return_to: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct LoginQuery {
     #[serde(default)]
     attach: bool,
+    return_to: Option<String>,
 }
 
 async fn login(
@@ -66,6 +72,7 @@ async fn login(
         code_verifier: challenge.code_verifier.expose_secret().to_string(),
         state: challenge.state.clone(),
         attach: q.attach,
+        return_to: safe_return_to(q.return_to),
     };
     session
         .insert(SESSION_KEY_PENDING, &pending)
@@ -129,7 +136,7 @@ async fn callback(
         .await
         .map_err(internal)?;
 
-    Ok(Redirect::to("/me"))
+    Ok(Redirect::to(pending.return_to.as_deref().unwrap_or("/me")))
 }
 
 async fn logout(session: Session) -> Result<Redirect, AuthError> {
@@ -145,14 +152,8 @@ struct MeResponse {
 
 async fn me(
     State(state): State<AppState>,
-    session: Session,
+    CurrentUser(user_id): CurrentUser,
 ) -> Result<Json<MeResponse>, AuthError> {
-    let user_id: Uuid = session
-        .get(SESSION_KEY_USER)
-        .await
-        .map_err(internal)?
-        .ok_or(AuthError::Unauthorized)?;
-
     let user_q = sqlx::query_as::<_, UserRow>(
         "SELECT id, display_name, created_at FROM users WHERE id = $1",
     )
@@ -311,6 +312,15 @@ async fn create_user(
         .fetch_one(&mut **tx)
         .await
         .context("creating user")
+}
+
+fn safe_return_to(return_to: Option<String>) -> Option<String> {
+    let path = return_to?;
+    if path.starts_with('/') && !path.starts_with("//") && !path.contains(['\r', '\n']) {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 pub enum AuthError {

@@ -1,0 +1,21 @@
+[package]
+name = "jitacart-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "jitacart-worker"
+path = "src/main.rs"
+
+[dependencies]
+domain = { workspace = true }
+
+tokio = { workspace = true }
+sqlx = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+anyhow = { workspace = true }

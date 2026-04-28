@@ -1,0 +1,27 @@
+# Rust
+/backend/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node
+node_modules/
+.pnpm-store/
+.svelte-kit/
+build/
+dist/
+
+# Env / secrets
+.env
+.env.local
+*.pem
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+# sqlx offline cache (commit if you want offline builds in CI)
+# /backend/.sqlx/

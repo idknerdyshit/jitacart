@@ -1,0 +1,18 @@
+# Default configuration. Override with environment variables (figment env layer).
+# Secrets (EVE_CLIENT_SECRET, SESSION_SECRET, TOKEN_ENC_KEY) MUST come from env.
+
+[server]
+bind = "0.0.0.0:8080"
+
+[esi]
+# Required by CCP on every request. Set in env via ESI_USER_AGENT for real deployments.
+user_agent = "jitacart-dev (set ESI_USER_AGENT in env; +https://example.com)"
+
+[esi.poll_intervals_secs]
+contracts = 300
+wallet_transactions = 3600
+market_prices = 300
+
+[eve_sso]
+callback_url = "http://localhost:8080/auth/eve/callback"
+# client_id / client_secret come from env (EVE_CLIENT_ID, EVE_CLIENT_SECRET)

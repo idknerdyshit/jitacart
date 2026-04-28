@@ -4,6 +4,7 @@ members = [
     "crates/api",
     "crates/worker",
     "crates/domain",
+    "crates/market",
 ]
 
 [workspace.package]
@@ -31,7 +32,11 @@ sqlx = { version = "0.8", default-features = false, features = [
     "uuid",
     "chrono",
     "json",
+    "rust_decimal",
 ] }
+
+# decimals (ISK columns)
+rust_decimal = { version = "1", features = ["serde"] }
 
 # serialization
 serde = { version = "1", features = ["derive"] }
@@ -68,6 +73,7 @@ time = "0.3"
 
 # internal
 domain = { path = "crates/domain" }
+market = { path = "crates/market" }
 
 [profile.dev]
 opt-level = 0

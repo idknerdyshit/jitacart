@@ -18,6 +18,9 @@ contracts = 300
 wallet_transactions = 3600
 market_prices = 300
 
+[worker]
+tick_secs = 60
+
 [eve_sso]
 callback_url = "http://localhost:8080/auth/eve/callback"
 # client_id / client_secret come from env (EVE_SSO__CLIENT_ID, EVE_SSO__CLIENT_SECRET)

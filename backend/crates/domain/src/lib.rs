@@ -1,10 +1,13 @@
 //! Shared domain types.
 
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
+
+pub mod multibuy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -77,4 +80,202 @@ pub struct GroupMember {
     pub display_name: String,
     pub role: GroupRole,
     pub joined_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketKind {
+    NpcHub,
+    PublicStructure,
+}
+
+impl MarketKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarketKind::NpcHub => "npc_hub",
+            MarketKind::PublicStructure => "public_structure",
+        }
+    }
+}
+
+impl fmt::Display for MarketKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for MarketKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "npc_hub" => Ok(MarketKind::NpcHub),
+            "public_structure" => Ok(MarketKind::PublicStructure),
+            other => Err(format!("unknown market kind: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListStatus {
+    Open,
+    Closed,
+    Archived,
+}
+
+impl ListStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ListStatus::Open => "open",
+            ListStatus::Closed => "closed",
+            ListStatus::Archived => "archived",
+        }
+    }
+}
+
+impl fmt::Display for ListStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ListStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "open" => Ok(ListStatus::Open),
+            "closed" => Ok(ListStatus::Closed),
+            "archived" => Ok(ListStatus::Archived),
+            other => Err(format!("unknown list status: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListItemStatus {
+    Open,
+    Claimed,
+    Bought,
+    Delivered,
+    Settled,
+}
+
+impl ListItemStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ListItemStatus::Open => "open",
+            ListItemStatus::Claimed => "claimed",
+            ListItemStatus::Bought => "bought",
+            ListItemStatus::Delivered => "delivered",
+            ListItemStatus::Settled => "settled",
+        }
+    }
+}
+
+impl fmt::Display for ListItemStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ListItemStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "open" => Ok(ListItemStatus::Open),
+            "claimed" => Ok(ListItemStatus::Claimed),
+            "bought" => Ok(ListItemStatus::Bought),
+            "delivered" => Ok(ListItemStatus::Delivered),
+            "settled" => Ok(ListItemStatus::Settled),
+            other => Err(format!("unknown list item status: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Market {
+    pub id: Uuid,
+    pub kind: MarketKind,
+    pub esi_location_id: i64,
+    pub region_id: i64,
+    pub name: String,
+    pub short_label: String,
+    pub is_hub: bool,
+    pub is_public: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketPrice {
+    pub market_id: Uuid,
+    pub type_id: i64,
+    pub best_sell: Option<Decimal>,
+    pub best_buy: Option<Decimal>,
+    pub sell_volume: i64,
+    pub buy_volume: i64,
+    pub computed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct List {
+    pub id: Uuid,
+    pub group_id: Uuid,
+    pub created_by_user_id: Uuid,
+    pub destination_label: Option<String>,
+    pub notes: Option<String>,
+    pub status: ListStatus,
+    pub total_estimate_isk: Decimal,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListItem {
+    pub id: Uuid,
+    pub list_id: Uuid,
+    pub type_id: i64,
+    pub type_name: String,
+    pub qty_requested: i64,
+    pub qty_fulfilled: i64,
+    pub est_unit_price_isk: Option<Decimal>,
+    pub est_priced_market_id: Option<Uuid>,
+    pub status: ListItemStatus,
+    pub source_line_no: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListSummary {
+    pub id: Uuid,
+    pub destination_label: Option<String>,
+    pub status: ListStatus,
+    pub item_count: i64,
+    pub total_estimate_isk: Decimal,
+    pub primary_market_short_label: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveItemPrice {
+    pub list_item_id: Uuid,
+    pub market_id: Uuid,
+    pub best_sell: Option<Decimal>,
+    pub best_buy: Option<Decimal>,
+    pub sell_volume: i64,
+    pub buy_volume: i64,
+    pub computed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListDetail {
+    pub list: List,
+    pub items: Vec<ListItem>,
+    pub markets: Vec<Market>,
+    pub primary_market_id: Uuid,
+    pub live_prices: Vec<LiveItemPrice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedType {
+    pub type_id: i64,
+    pub type_name: String,
 }

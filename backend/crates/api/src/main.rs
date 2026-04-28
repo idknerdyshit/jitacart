@@ -21,6 +21,8 @@ mod crypto;
 mod extract;
 mod groups;
 mod jwt;
+mod lists;
+mod markets;
 mod state;
 
 use crate::{config::Config, crypto::TokenCipher, jwt::JwksCache, state::AppState};
@@ -64,7 +66,8 @@ async fn main() -> anyhow::Result<()> {
         &config.eve_sso.client_id,
         SecretString::from(config.eve_sso.client_secret.clone()),
     )
-    .map_err(|e| anyhow!("EsiClient::with_web_app: {e}"))?;
+    .map_err(|e| anyhow!("EsiClient::with_web_app: {e}"))?
+    .with_cache();
 
     let session_store = PostgresStore::new(pool.clone());
     session_store
@@ -96,6 +99,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(healthz))
         .merge(auth::router())
         .merge(groups::router())
+        .merge(markets::router())
+        .merge(lists::router())
         .with_state(state)
         .layer(session_layer)
         .layer(TraceLayer::new_for_http());

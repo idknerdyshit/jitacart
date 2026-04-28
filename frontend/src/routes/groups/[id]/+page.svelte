@@ -128,6 +128,11 @@
     </section>
 
     <section>
+        <h2>Shopping lists</h2>
+        <p><a href="/groups/{groupId}/lists">Lists →</a></p>
+    </section>
+
+    <section>
         <h2>Members</h2>
         <ul>
             {#each detail.members as m (m.user_id)}

@@ -29,6 +29,39 @@ pub struct EveSsoConfig {
 #[derive(Debug, Deserialize)]
 pub struct EsiConfig {
     pub user_agent: String,
+    #[serde(default)]
+    pub poll_intervals_secs: PollIntervals,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // contracts/wallet_transactions are read in Phase 5+
+pub struct PollIntervals {
+    #[serde(default = "default_market_prices_secs")]
+    pub market_prices: u64,
+    #[serde(default = "default_contracts_secs")]
+    pub contracts: u64,
+    #[serde(default = "default_wallet_transactions_secs")]
+    pub wallet_transactions: u64,
+}
+
+impl Default for PollIntervals {
+    fn default() -> Self {
+        Self {
+            market_prices: default_market_prices_secs(),
+            contracts: default_contracts_secs(),
+            wallet_transactions: default_wallet_transactions_secs(),
+        }
+    }
+}
+
+fn default_market_prices_secs() -> u64 {
+    300
+}
+fn default_contracts_secs() -> u64 {
+    300
+}
+fn default_wallet_transactions_secs() -> u64 {
+    3600
 }
 
 fn default_login_scopes() -> Vec<String> {

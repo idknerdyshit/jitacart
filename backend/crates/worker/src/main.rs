@@ -217,12 +217,8 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn spawn_guarded<F, Fut>(
-    ctx: &Arc<Ctx>,
-    running: &Arc<AtomicBool>,
-    label: &'static str,
-    job: F,
-) where
+fn spawn_guarded<F, Fut>(ctx: &Arc<Ctx>, running: &Arc<AtomicBool>, label: &'static str, job: F)
+where
     F: FnOnce(Arc<Ctx>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 {

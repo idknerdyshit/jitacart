@@ -19,6 +19,7 @@ mod auth;
 mod citadels;
 mod config;
 mod extract;
+mod fulfillment;
 mod groups;
 mod jwt;
 mod lists;
@@ -116,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(markets::router())
         .merge(lists::router())
         .merge(citadels::router())
+        .merge(fulfillment::router())
         .with_state(state)
         .layer(session_layer)
         .layer(TraceLayer::new_for_http());

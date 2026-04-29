@@ -22,8 +22,9 @@ use axum::{
 use chrono::{DateTime, Utc};
 use domain::{
     multibuy::{parse_multibuy, LineError, ParsedLine},
-    List, ListDetail, ListItem, ListItemStatus, ListStatus, ListSummary, LiveItemPrice, Market,
-    MarketKind, ResolvedType,
+    Claim, ClaimStatus, Fulfillment, FulfillmentSource, GroupRole, List, ListDetail, ListItem,
+    ListItemStatus, ListStatus, ListSummary, LiveItemPrice, Market, MarketKind, Reimbursement,
+    ReimbursementStatus, ResolvedType,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -212,7 +213,9 @@ async fn preview(
 async fn create(
     State(state): State<AppState>,
     CurrentGroup {
-        user_id, group_id, ..
+        user_id,
+        group_id,
+        role,
     }: CurrentGroup,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<ListDetail>, ListError> {
@@ -263,7 +266,6 @@ async fn create(
         )));
     }
 
-    // Refresh prices up front so the snapshot insert below sees fresh data.
     let type_ids = dedup_type_ids(resolved.values().map(|r| r.type_id));
     let prices_by_market = fetch_prices_for_markets(&state, group_id, &markets, &type_ids).await?;
 
@@ -299,8 +301,12 @@ async fn create(
     let mut tx = state.pool.begin().await.map_err(internal)?;
 
     let list_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO lists (group_id, created_by_user_id, destination_label, notes, total_estimate_isk) \
-         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        "INSERT INTO lists \
+         (group_id, created_by_user_id, destination_label, notes, total_estimate_isk, \
+          tip_pct) \
+         VALUES ($1, $2, $3, $4, $5, \
+                 (SELECT default_tip_pct FROM groups WHERE id = $1)) \
+         RETURNING id",
     )
     .bind(group_id)
     .bind(user_id)
@@ -345,7 +351,7 @@ async fn create(
 
     tx.commit().await.map_err(internal)?;
 
-    let detail = load_list_detail(&state, list_id).await?;
+    let detail = load_list_detail(&state, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
 
@@ -384,15 +390,25 @@ async fn list_for_group(
 
 async fn detail(
     State(state): State<AppState>,
-    CurrentList { list_id, .. }: CurrentList,
+    CurrentList {
+        list_id,
+        user_id,
+        role,
+        ..
+    }: CurrentList,
 ) -> Result<Json<ListDetail>, ListError> {
-    let detail = load_list_detail(&state, list_id).await?;
+    let detail = load_list_detail(&state, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
 
 async fn patch_list(
     State(state): State<AppState>,
-    CurrentList { list_id, .. }: CurrentList,
+    CurrentList {
+        list_id,
+        user_id,
+        role,
+        ..
+    }: CurrentList,
     Json(body): Json<PatchListBody>,
 ) -> Result<Json<ListDetail>, ListError> {
     if body.destination_label.is_none() && body.notes.is_none() && body.status.is_none() {
@@ -416,7 +432,7 @@ async fn patch_list(
     q.push_bind(list_id);
     q.build().execute(&state.pool).await.map_err(internal)?;
 
-    let detail = load_list_detail(&state, list_id).await?;
+    let detail = load_list_detail(&state, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
 
@@ -441,7 +457,11 @@ async fn delete_list(
 async fn replace_markets(
     State(state): State<AppState>,
     CurrentList {
-        list_id, group_id, ..
+        list_id,
+        group_id,
+        user_id,
+        role,
+        ..
     }: CurrentList,
     Json(body): Json<ReplaceMarketsBody>,
 ) -> Result<Json<ListDetail>, ListError> {
@@ -491,14 +511,17 @@ async fn replace_markets(
     };
 
     recompute_estimates(&state, list_id, updated_after).await?;
-    let detail = load_list_detail(&state, list_id).await?;
+    let detail = load_list_detail(&state, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
 
 async fn add_items(
     State(state): State<AppState>,
     CurrentList {
-        list_id, user_id, ..
+        list_id,
+        user_id,
+        role,
+        ..
     }: CurrentList,
     Json(body): Json<AddItemsBody>,
 ) -> Result<Json<ListDetail>, ListError> {
@@ -599,7 +622,7 @@ async fn add_items(
     };
 
     recompute_estimates(&state, list_id, updated_after).await?;
-    let detail = load_list_detail(&state, list_id).await?;
+    let detail = load_list_detail(&state, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
 
@@ -614,7 +637,6 @@ async fn patch_item(
         return Err(ListError::BadRequest("nothing to update".into()));
     }
 
-    // If retyping, resolve before any tx.
     let resolved_type: Option<ResolvedType> = if let Some(name) = &body.type_name {
         let (resolved, unresolved) =
             market::resolve_type_ids(&state.pool, &state.esi, std::slice::from_ref(name))
@@ -650,14 +672,24 @@ async fn patch_item(
             .await
             .map_err(internal)?
             .ok_or(ListError::NotFound)?;
-        let _: (Uuid,) =
-            sqlx::query_as("SELECT id FROM list_items WHERE id = $1 AND list_id = $2 FOR UPDATE")
-                .bind(item_id)
-                .bind(list_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(internal)?
-                .ok_or(ListError::NotFound)?;
+        let item_status: String = sqlx::query_scalar(
+            "SELECT status FROM list_items WHERE id = $1 AND list_id = $2 FOR UPDATE",
+        )
+        .bind(item_id)
+        .bind(list_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?
+        .ok_or(ListError::NotFound)?;
+        // Once a hauler has claimed or fulfilled this item, qty/type edits would
+        // make status, qty_fulfilled, and reimbursement totals inconsistent.
+        // The hauler must release the claim or reverse fulfillments first.
+        if item_status != "open" {
+            return Err(ListError::Conflict(format!(
+                "cannot edit item with status '{item_status}'; \
+                 release the claim or reverse fulfillments first"
+            )));
+        }
         if let Some(qty) = body.qty_requested {
             sqlx::query("UPDATE list_items SET qty_requested = $1 WHERE id = $2 AND list_id = $3")
                 .bind(qty)
@@ -692,7 +724,7 @@ async fn patch_item(
     };
 
     recompute_estimates(&state, list_id, updated_after).await?;
-    let detail = load_list_detail(&state, list_id).await?;
+    let detail = load_list_detail(&state, list_id, cur.user_id, cur.role).await?;
     Ok(Json(detail))
 }
 
@@ -710,6 +742,25 @@ async fn delete_item(
             .await
             .map_err(internal)?
             .ok_or(ListError::NotFound)?;
+        let item_status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM list_items WHERE id = $1 AND list_id = $2 FOR UPDATE",
+        )
+        .bind(item_id)
+        .bind(list_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?;
+        let item_status = item_status.ok_or(ListError::NotFound)?;
+        // Deleting cascades fulfillments and claim_items, but leaves
+        // reimbursements with stale totals (and still settleable). Block
+        // until the item is back to 'open' — i.e. no active claim and no
+        // non-reversed fulfillments.
+        if item_status != "open" {
+            return Err(ListError::Conflict(format!(
+                "cannot delete item with status '{item_status}'; \
+                 release the claim or reverse fulfillments first"
+            )));
+        }
         let r = sqlx::query("DELETE FROM list_items WHERE id = $1 AND list_id = $2")
             .bind(item_id)
             .bind(list_id)
@@ -731,7 +782,7 @@ async fn delete_item(
     };
 
     recompute_estimates(&state, list_id, updated_after).await?;
-    let detail = load_list_detail(&state, list_id).await?;
+    let detail = load_list_detail(&state, list_id, cur.user_id, cur.role).await?;
     Ok(Json(detail))
 }
 
@@ -798,7 +849,7 @@ async fn read_group_citadel_prices(
 /// Subset of `market_ids` that the group can read prices for: NPC hubs are
 /// always accessible; citadels are accessible iff some group member has an
 /// `ok` `character_structure_access` row plus the structure-markets scope.
-async fn accessible_market_ids(
+pub(crate) async fn accessible_market_ids(
     pool: &sqlx::PgPool,
     group_id: Uuid,
     market_ids: &[Uuid],
@@ -911,7 +962,7 @@ fn validate_market_ids_size(ids: &[Uuid]) -> Result<(), ListError> {
     Ok(())
 }
 
-async fn load_markets(state: &AppState, ids: &[Uuid]) -> Result<Vec<Market>, ListError> {
+pub(crate) async fn load_markets(state: &AppState, ids: &[Uuid]) -> Result<Vec<Market>, ListError> {
     let rows: Vec<MarketRow> = sqlx::query_as(
         "SELECT id, kind, esi_location_id, region_id, name, short_label, is_hub, is_public \
          FROM markets WHERE id = ANY($1::uuid[])",
@@ -933,10 +984,8 @@ async fn load_markets(state: &AppState, ids: &[Uuid]) -> Result<Vec<Market>, Lis
 }
 
 /// Allow if every market is either an NPC hub or present in
-/// `group_tracked_markets` for the given group. Discovered-but-untracked
-/// citadels are rejected so a user can't pull a Keepstar into a list for a
-/// group that hasn't opted in to it.
-async fn validate_markets_for_group(
+/// `group_tracked_markets` for the given group.
+pub(crate) async fn validate_markets_for_group(
     pool: &sqlx::PgPool,
     group_id: Uuid,
     markets: &[Market],
@@ -1091,8 +1140,6 @@ async fn recompute_estimates(
             }
         }
 
-        // Skip the write when the total is unchanged so downstream consumers
-        // of `updated_at` don't see no-op churn.
         sqlx::query(
             "UPDATE lists \
              SET total_estimate_isk = $1, \
@@ -1108,13 +1155,20 @@ async fn recompute_estimates(
         tx.commit().await.map_err(internal)?;
         return Ok(());
     }
-    Err(ListError::Conflict)
+    Err(ListError::Conflict(
+        "list was concurrently modified; please retry".into(),
+    ))
 }
 
-async fn load_list_detail(state: &AppState, list_id: Uuid) -> Result<ListDetail, ListError> {
+pub(crate) async fn load_list_detail(
+    state: &AppState,
+    list_id: Uuid,
+    viewer_user_id: Uuid,
+    viewer_role: GroupRole,
+) -> Result<ListDetail, ListError> {
     let list_row: ListRow = sqlx::query_as(
         "SELECT id, group_id, created_by_user_id, destination_label, notes, status, \
-                total_estimate_isk, created_at, updated_at \
+                total_estimate_isk, tip_pct, created_at, updated_at \
          FROM lists WHERE id = $1",
     )
     .bind(list_id)
@@ -1127,7 +1181,8 @@ async fn load_list_detail(state: &AppState, list_id: Uuid) -> Result<ListDetail,
 
     let item_rows: Vec<ListItemRow> = sqlx::query_as(
         "SELECT id, list_id, type_id, type_name, qty_requested, qty_fulfilled, \
-                est_unit_price_isk, est_priced_market_id, status, source_line_no \
+                est_unit_price_isk, est_priced_market_id, status, source_line_no, \
+                requested_by_user_id \
          FROM list_items WHERE list_id = $1 ORDER BY source_line_no NULLS LAST, created_at",
     )
     .bind(list_id)
@@ -1194,12 +1249,120 @@ async fn load_list_detail(state: &AppState, list_id: Uuid) -> Result<ListDetail,
     let live_prices: Vec<LiveItemPrice> =
         live_rows.into_iter().map(LivePriceRow::into_live).collect();
 
+    // Phase 5: claims
+    let claim_rows: Vec<ClaimRow> = sqlx::query_as(
+        r#"
+        SELECT c.id, c.list_id, c.hauler_user_id, c.status, c.note,
+               c.created_at, c.released_at,
+               u.display_name AS hauler_display_name,
+               ARRAY_AGG(ci.list_item_id) FILTER (WHERE ci.list_item_id IS NOT NULL AND ci.active)
+                   AS item_ids
+        FROM claims c
+        JOIN users u ON u.id = c.hauler_user_id
+        LEFT JOIN claim_items ci ON ci.claim_id = c.id
+        WHERE c.list_id = $1
+        GROUP BY c.id, u.display_name
+        ORDER BY c.created_at
+        "#,
+    )
+    .bind(list_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal)?;
+    let claims = claim_rows
+        .into_iter()
+        .map(ClaimRow::into_claim)
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(internal)?;
+
+    // Phase 5: fulfillments (non-reversed only)
+    let fulfillment_rows: Vec<FulfillmentRow> = sqlx::query_as(
+        r#"
+        SELECT f.id, f.list_item_id, f.claim_id, f.hauler_user_id, f.hauler_character_id,
+               f.source, f.qty, f.unit_price_isk, f.bought_at_market_id, f.bought_at_note,
+               f.bought_at, f.reversed_at,
+               ch.character_name AS hauler_character_name,
+               m.short_label     AS bought_at_market_short_label
+        FROM fulfillments f
+        JOIN list_items li ON li.id = f.list_item_id
+        LEFT JOIN characters ch ON ch.id = f.hauler_character_id
+        LEFT JOIN markets    m  ON m.id  = f.bought_at_market_id
+        WHERE li.list_id = $1
+          AND f.reversed_at IS NULL
+        ORDER BY f.bought_at
+        "#,
+    )
+    .bind(list_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal)?;
+    let fulfillments = fulfillment_rows
+        .into_iter()
+        .map(FulfillmentRow::into_fulfillment)
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(internal)?;
+
+    // Phase 5: reimbursements
+    let reimbursement_rows: Vec<ReimbursementRow> = sqlx::query_as(
+        r#"
+        SELECT r.id, r.list_id, r.requester_user_id, r.hauler_user_id,
+               r.subtotal_isk, r.tip_isk, r.total_isk, r.status,
+               r.settled_at, r.settled_by_user_id, r.contract_id,
+               r.created_at, r.updated_at,
+               ru.display_name AS requester_display_name,
+               hu.display_name AS hauler_display_name
+        FROM reimbursements r
+        JOIN users ru ON ru.id = r.requester_user_id
+        JOIN users hu ON hu.id = r.hauler_user_id
+        WHERE r.list_id = $1
+        ORDER BY r.created_at
+        "#,
+    )
+    .bind(list_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal)?;
+    let reimbursements = reimbursement_rows
+        .into_iter()
+        .map(ReimbursementRow::into_reimbursement)
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(internal)?;
+
+    let last_hauler_character_id: Option<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(
+            (SELECT f.hauler_character_id
+             FROM fulfillments f
+             JOIN list_items li ON li.id = f.list_item_id
+             WHERE li.list_id = $1
+               AND f.hauler_user_id = $2
+               AND f.reversed_at IS NULL
+               AND f.hauler_character_id IS NOT NULL
+             ORDER BY f.bought_at DESC
+             LIMIT 1),
+            (SELECT id FROM characters WHERE user_id = $2 ORDER BY created_at ASC LIMIT 1)
+        )
+        "#,
+    )
+    .bind(list_id)
+    .bind(viewer_user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?
+    .flatten();
+
     Ok(ListDetail {
         list,
         items,
         markets,
         primary_market_id,
         live_prices,
+        claims,
+        fulfillments,
+        reimbursements,
+        last_hauler_character_id,
+        viewer_user_id,
+        viewer_role,
     })
 }
 
@@ -1212,6 +1375,7 @@ struct ListRow {
     notes: Option<String>,
     status: String,
     total_estimate_isk: Decimal,
+    tip_pct: Decimal,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -1230,6 +1394,7 @@ impl ListRow {
             notes: self.notes,
             status,
             total_estimate_isk: self.total_estimate_isk,
+            tip_pct: self.tip_pct,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
@@ -1248,6 +1413,7 @@ struct ListItemRow {
     est_priced_market_id: Option<Uuid>,
     status: String,
     source_line_no: Option<i32>,
+    requested_by_user_id: Uuid,
 }
 
 impl ListItemRow {
@@ -1267,6 +1433,7 @@ impl ListItemRow {
             est_priced_market_id: self.est_priced_market_id,
             status,
             source_line_no: self.source_line_no,
+            requested_by_user_id: self.requested_by_user_id,
         })
     }
 }
@@ -1357,15 +1524,136 @@ impl LivePriceRow {
     }
 }
 
+#[derive(sqlx::FromRow)]
+pub(crate) struct ClaimRow {
+    pub id: Uuid,
+    pub list_id: Uuid,
+    pub hauler_user_id: Uuid,
+    pub hauler_display_name: String,
+    pub status: String,
+    pub note: Option<String>,
+    pub item_ids: Option<Vec<Uuid>>,
+    pub created_at: DateTime<Utc>,
+    pub released_at: Option<DateTime<Utc>>,
+}
+
+impl ClaimRow {
+    pub(crate) fn into_claim(self) -> anyhow::Result<Claim> {
+        let status = self
+            .status
+            .parse::<ClaimStatus>()
+            .map_err(anyhow::Error::msg)?;
+        Ok(Claim {
+            id: self.id,
+            list_id: self.list_id,
+            hauler_user_id: self.hauler_user_id,
+            hauler_display_name: self.hauler_display_name,
+            status,
+            note: self.note,
+            item_ids: self.item_ids.unwrap_or_default(),
+            created_at: self.created_at,
+            released_at: self.released_at,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct FulfillmentRow {
+    pub id: Uuid,
+    pub list_item_id: Uuid,
+    pub claim_id: Option<Uuid>,
+    pub hauler_user_id: Uuid,
+    pub hauler_character_id: Option<Uuid>,
+    pub source: String,
+    pub qty: i64,
+    pub unit_price_isk: Decimal,
+    pub bought_at_market_id: Option<Uuid>,
+    pub bought_at_note: Option<String>,
+    pub bought_at: DateTime<Utc>,
+    pub reversed_at: Option<DateTime<Utc>>,
+    pub hauler_character_name: Option<String>,
+    pub bought_at_market_short_label: Option<String>,
+}
+
+impl FulfillmentRow {
+    pub(crate) fn into_fulfillment(self) -> anyhow::Result<Fulfillment> {
+        let source = self
+            .source
+            .parse::<FulfillmentSource>()
+            .map_err(anyhow::Error::msg)?;
+        Ok(Fulfillment {
+            id: self.id,
+            list_item_id: self.list_item_id,
+            claim_id: self.claim_id,
+            hauler_user_id: self.hauler_user_id,
+            hauler_character_id: self.hauler_character_id,
+            hauler_character_name: self.hauler_character_name,
+            source,
+            qty: self.qty,
+            unit_price_isk: self.unit_price_isk,
+            bought_at_market_id: self.bought_at_market_id,
+            bought_at_market_short_label: self.bought_at_market_short_label,
+            bought_at_note: self.bought_at_note,
+            bought_at: self.bought_at,
+            reversed_at: self.reversed_at,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct ReimbursementRow {
+    pub id: Uuid,
+    pub list_id: Uuid,
+    pub requester_user_id: Uuid,
+    pub hauler_user_id: Uuid,
+    pub subtotal_isk: Decimal,
+    pub tip_isk: Decimal,
+    pub total_isk: Decimal,
+    pub status: String,
+    pub settled_at: Option<DateTime<Utc>>,
+    pub settled_by_user_id: Option<Uuid>,
+    pub contract_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub requester_display_name: String,
+    pub hauler_display_name: String,
+}
+
+impl ReimbursementRow {
+    pub(crate) fn into_reimbursement(self) -> anyhow::Result<Reimbursement> {
+        let status = self
+            .status
+            .parse::<ReimbursementStatus>()
+            .map_err(anyhow::Error::msg)?;
+        Ok(Reimbursement {
+            id: self.id,
+            list_id: self.list_id,
+            requester_user_id: self.requester_user_id,
+            requester_display_name: self.requester_display_name,
+            hauler_user_id: self.hauler_user_id,
+            hauler_display_name: self.hauler_display_name,
+            subtotal_isk: self.subtotal_isk,
+            tip_isk: self.tip_isk,
+            total_isk: self.total_isk,
+            status,
+            settled_at: self.settled_at,
+            settled_by_user_id: self.settled_by_user_id,
+            contract_id: self.contract_id,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
 pub enum ListError {
     BadRequest(String),
     NotFound,
     Forbidden,
-    Conflict,
+    Conflict(String),
     Internal(anyhow::Error),
 }
 
-fn internal<E: Into<anyhow::Error>>(e: E) -> ListError {
+pub(crate) fn internal<E: Into<anyhow::Error>>(e: E) -> ListError {
     ListError::Internal(e.into())
 }
 
@@ -1377,11 +1665,7 @@ impl IntoResponse for ListError {
             ListError::Forbidden => {
                 (StatusCode::FORBIDDEN, "you cannot perform this action").into_response()
             }
-            ListError::Conflict => (
-                StatusCode::CONFLICT,
-                "list was concurrently modified; please retry",
-            )
-                .into_response(),
+            ListError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
             ListError::Internal(e) => {
                 tracing::error!(error = ?e, "lists handler error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()

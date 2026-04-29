@@ -10,6 +10,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use domain::{Group, GroupMember, GroupRole};
 use rand::distributions::{Alphanumeric, DistString};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -70,7 +71,7 @@ async fn create(
         match sqlx::query_as::<_, GroupRow>(
             "INSERT INTO groups (name, invite_code, created_by_user_id) \
              VALUES ($1, $2, $3) \
-             RETURNING id, name, invite_code, created_by_user_id, created_at",
+             RETURNING id, name, invite_code, created_by_user_id, created_at, default_tip_pct",
         )
         .bind(name)
         .bind(&code)
@@ -106,6 +107,7 @@ async fn list(
     let rows = sqlx::query_as::<_, GroupListRow>(
         r#"
         SELECT g.id, g.name, g.invite_code, g.created_by_user_id, g.created_at,
+               g.default_tip_pct,
                m.role,
                (SELECT count(*) FROM group_memberships gm WHERE gm.group_id = g.id) AS member_count
         FROM groups g
@@ -131,7 +133,8 @@ async fn detail(
     CurrentGroup { group_id, role, .. }: CurrentGroup,
 ) -> Result<Json<GroupDetail>, GroupError> {
     let group_q = sqlx::query_as::<_, GroupRow>(
-        "SELECT id, name, invite_code, created_by_user_id, created_at FROM groups WHERE id = $1",
+        "SELECT id, name, invite_code, created_by_user_id, created_at, default_tip_pct \
+         FROM groups WHERE id = $1",
     )
     .bind(group_id)
     .fetch_optional(&state.pool);
@@ -245,7 +248,7 @@ async fn rotate_invite(
         let code = random_invite_code();
         match sqlx::query_as::<_, GroupRow>(
             "UPDATE groups SET invite_code = $1 WHERE id = $2 \
-             RETURNING id, name, invite_code, created_by_user_id, created_at",
+             RETURNING id, name, invite_code, created_by_user_id, created_at, default_tip_pct",
         )
         .bind(&code)
         .bind(group_id)
@@ -269,12 +272,10 @@ async fn join(
     CurrentUser(user_id): CurrentUser,
     Path(code): Path<String>,
 ) -> Result<Json<Group>, GroupError> {
-    // Single round-trip: resolve invite, insert membership (idempotent),
-    // and return the group row in one statement.
     let group = sqlx::query_as::<_, GroupRow>(
         r#"
         WITH g AS (
-            SELECT id, name, invite_code, created_by_user_id, created_at
+            SELECT id, name, invite_code, created_by_user_id, created_at, default_tip_pct
             FROM groups WHERE invite_code = $1
         ),
         ins AS (
@@ -282,7 +283,7 @@ async fn join(
             SELECT $2, id, 'member' FROM g
             ON CONFLICT (user_id, group_id) DO NOTHING
         )
-        SELECT id, name, invite_code, created_by_user_id, created_at FROM g
+        SELECT id, name, invite_code, created_by_user_id, created_at, default_tip_pct FROM g
         "#,
     )
     .bind(&code)
@@ -317,6 +318,7 @@ struct GroupRow {
     invite_code: String,
     created_by_user_id: Uuid,
     created_at: DateTime<Utc>,
+    default_tip_pct: Decimal,
 }
 
 impl GroupRow {
@@ -327,6 +329,7 @@ impl GroupRow {
             invite_code: self.invite_code,
             created_by_user_id: self.created_by_user_id,
             created_at: self.created_at,
+            default_tip_pct: self.default_tip_pct,
         }
     }
 }
@@ -338,6 +341,7 @@ struct GroupListRow {
     invite_code: String,
     created_by_user_id: Uuid,
     created_at: DateTime<Utc>,
+    default_tip_pct: Decimal,
     role: String,
     member_count: i64,
 }
@@ -352,6 +356,7 @@ impl GroupListRow {
                 invite_code: self.invite_code,
                 created_by_user_id: self.created_by_user_id,
                 created_at: self.created_at,
+                default_tip_pct: self.default_tip_pct,
             },
             role,
             member_count: self.member_count,

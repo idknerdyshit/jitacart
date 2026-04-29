@@ -2,19 +2,13 @@
     import { onMount } from 'svelte';
     import { goto } from '$app/navigation';
     import { page } from '$app/state';
+    import { api, fmtPct, type Group } from '$lib/api';
 
     type Member = {
         user_id: string;
         display_name: string;
         role: 'owner' | 'member';
         joined_at: string;
-    };
-    type Group = {
-        id: string;
-        name: string;
-        invite_code: string;
-        created_by_user_id: string;
-        created_at: string;
     };
     type Detail = {
         group: Group;
@@ -25,6 +19,10 @@
     let detail = $state<Detail | null>(null);
     let error = $state<string | null>(null);
     let copyMsg = $state<string | null>(null);
+
+    let editingTip = $state(false);
+    let tipInput = $state('');
+    let savingTip = $state(false);
 
     const groupId = $derived(page.params.id);
 
@@ -103,6 +101,35 @@
         }
         goto('/groups');
     }
+
+    function startEditTip() {
+        if (!detail) return;
+        tipInput = (Number(detail.group.default_tip_pct) * 100).toFixed(2);
+        editingTip = true;
+    }
+
+    async function saveTip() {
+        if (!detail || savingTip) return;
+        const pct = Number(tipInput);
+        if (isNaN(pct) || pct < 0 || pct > 100) {
+            error = 'Tip must be 0–100%';
+            return;
+        }
+        savingTip = true;
+        try {
+            const updated = await api<Group>(`/groups/${groupId}/default-tip`, {
+                method: 'PATCH',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ tip_pct: pct / 100 })
+            });
+            detail = { ...detail, group: updated };
+            editingTip = false;
+        } catch (e) {
+            error = (e as Error).message;
+        } finally {
+            savingTip = false;
+        }
+    }
 </script>
 
 <p><a href="/groups">← Groups</a></p>
@@ -129,13 +156,43 @@
 
     <section>
         <h2>Shopping lists</h2>
-        <p><a href={`/groups/${groupId}/lists`}>Lists →</a></p>
+        <div class="nav-row">
+            <a href={`/groups/${groupId}/lists`}>Lists →</a>
+            <a href={`/groups/${groupId}/runs`}>Runs →</a>
+        </div>
     </section>
 
     <section>
         <h2>Markets</h2>
         <p><a href={`/groups/${groupId}/tracked-markets`}>Tracked citadels →</a></p>
     </section>
+
+    {#if detail.role === 'owner'}
+        <section>
+            <h2>Default tip</h2>
+            {#if editingTip}
+                <div class="tip-row">
+                    <input
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="0.1"
+                        bind:value={tipInput}
+                        style="width: 6rem"
+                    />
+                    <span class="muted">%</span>
+                    <button class="primary" disabled={savingTip} onclick={saveTip}>Save</button>
+                    <button onclick={() => (editingTip = false)}>Cancel</button>
+                </div>
+            {:else}
+                <div class="tip-row">
+                    <span>{fmtPct(detail.group.default_tip_pct)}</span>
+                    <button onclick={startEditTip}>Edit</button>
+                </div>
+            {/if}
+            <p class="muted small">New lists inherit this tip percentage.</p>
+        </section>
+    {/if}
 
     <section>
         <h2>Members</h2>
@@ -174,6 +231,16 @@
         gap: 0.5rem;
         align-items: center;
     }
+    .nav-row {
+        display: flex;
+        gap: 1.5rem;
+        margin-top: 0.25rem;
+    }
+    .tip-row {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+    }
     button {
         background: #21262d;
         color: #e6edf3;
@@ -182,14 +249,35 @@
         border-radius: 6px;
         cursor: pointer;
     }
+    button.primary {
+        border-color: #2f6feb;
+    }
     button.danger {
         border-color: #6e2832;
         color: #f87171;
+    }
+    button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
     }
     li {
         margin-bottom: 0.3rem;
     }
     .muted {
         color: #8b949e;
+    }
+    .small {
+        font-size: 0.85rem;
+        margin-top: 0.25rem;
+    }
+    input[type='number'] {
+        background: #0d1117;
+        color: #e6edf3;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 0.3rem 0.5rem;
+    }
+    section {
+        margin-top: 1.25rem;
     }
 </style>

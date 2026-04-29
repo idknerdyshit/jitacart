@@ -5,11 +5,15 @@
     import {
         api,
         fmtIsk,
+        fmtPct,
         type ListDetail,
         type ListStatus,
         type LiveItemPrice,
         type GroupMarket
     } from '$lib/api';
+    import ClaimChips from '$lib/lists/ClaimChips.svelte';
+    import BuyModal from '$lib/lists/BuyModal.svelte';
+    import ReimbursementPanel from '$lib/lists/ReimbursementPanel.svelte';
 
     const listId = $derived(page.params.id);
     const STALE_AFTER_MS = 2 * 600 * 1000;
@@ -24,6 +28,12 @@
     let addingItem = $state<boolean>(false);
     let newItemName = $state<string>('');
     let newItemQty = $state<number>(1);
+
+    let buyModalItem = $state<string | null>(null);
+
+    let editingTip = $state(false);
+    let tipInput = $state('');
+    let savingTip = $state(false);
 
     async function load() {
         error = null;
@@ -138,6 +148,45 @@
         }
     }
 
+    async function markDelivered(itemId: string) {
+        if (!detail) return;
+        try {
+            detail = await api<ListDetail>(`/lists/${listId}/items/${itemId}/mark-delivered`, {
+                method: 'POST'
+            });
+        } catch (e) {
+            error = (e as Error).message;
+        }
+    }
+
+    async function saveTip() {
+        if (!detail || savingTip) return;
+        const pct = Number(tipInput);
+        if (isNaN(pct) || pct < 0 || pct > 100) {
+            error = 'Tip must be 0–100%';
+            return;
+        }
+        savingTip = true;
+        try {
+            detail = await api<ListDetail>(`/lists/${listId}/tip`, {
+                method: 'PATCH',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ tip_pct: pct / 100 })
+            });
+            editingTip = false;
+        } catch (e) {
+            error = (e as Error).message;
+        } finally {
+            savingTip = false;
+        }
+    }
+
+    function startEditTip() {
+        if (!detail) return;
+        tipInput = (Number(detail.list.tip_pct) * 100).toFixed(2);
+        editingTip = true;
+    }
+
     function isStaleMarket(mid: string): boolean {
         const m = allMarkets?.find((x) => x.id === mid);
         if (!m) return false;
@@ -163,12 +212,50 @@
     function priceFor(itemId: string, marketId: string) {
         return priceIndex.get(`${itemId}|${marketId}`) ?? null;
     }
+
+    const canEditTip = $derived(
+        detail !== null &&
+            (detail.viewer_role === 'owner' ||
+                detail.viewer_user_id === detail.list.created_by_user_id)
+    );
+    const tipLocked = $derived(
+        detail !== null &&
+            detail.viewer_role !== 'owner' &&
+            detail.fulfillments.length > 0
+    );
+
+    const buyItem = $derived(
+        buyModalItem ? detail?.items.find((it) => it.id === buyModalItem) ?? null : null
+    );
+
+    function isLastHauler(itemId: string): boolean {
+        if (!detail) return false;
+        const relevant = detail.fulfillments.filter(
+            (f) => f.list_item_id === itemId && f.reversed_at === null
+        );
+        if (relevant.length === 0) return false;
+        const last = relevant[relevant.length - 1];
+        return last.hauler_user_id === detail.viewer_user_id;
+    }
+
+    function claimLabel(itemId: string): string {
+        if (!detail) return '';
+        const claim = detail.claims.find(
+            (c) => c.item_ids.includes(itemId) && c.status === 'active'
+        );
+        if (!claim) return '';
+        if (claim.hauler_user_id === detail.viewer_user_id) return 'claimed by me';
+        return `claimed by ${claim.hauler_display_name}`;
+    }
+
+    function statusPill(itemId: string, status: string): string {
+        if (status === 'claimed') return claimLabel(itemId) || 'claimed';
+        return status;
+    }
 </script>
 
 <p>
-    <a
-        href={detail ? `/groups/${detail.list.group_id}/lists` : '/'}
-    >← Lists</a>
+    <a href={detail ? `/groups/${detail.list.group_id}/lists` : '/'}>← Lists</a>
 </p>
 
 {#if error}
@@ -176,7 +263,36 @@
 {/if}
 
 {#if detail}
-    <h1>{detail.list.destination_label ?? '(unnamed list)'}</h1>
+    <div class="row-between">
+        <h1>{detail.list.destination_label ?? '(unnamed list)'}</h1>
+        {#if canEditTip}
+            <div class="tip-editor">
+                {#if editingTip}
+                    <input
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="0.1"
+                        bind:value={tipInput}
+                        style="width: 5rem"
+                    />
+                    <span class="muted">%</span>
+                    <button class="primary" disabled={savingTip} onclick={saveTip}>Save</button>
+                    <button onclick={() => (editingTip = false)}>Cancel</button>
+                {:else}
+                    <span class="muted">Tip: {fmtPct(detail.list.tip_pct)}</span>
+                    {#if !tipLocked}
+                        <button onclick={startEditTip}>Edit</button>
+                    {:else}
+                        <span class="muted small">(locked — fulfillments exist)</span>
+                    {/if}
+                {/if}
+            </div>
+        {:else}
+            <span class="muted">Tip: {fmtPct(detail.list.tip_pct)}</span>
+        {/if}
+    </div>
+
     <p class="muted">
         Status: {detail.list.status} · Saved budget:
         {fmtIsk(detail.list.total_estimate_isk)}
@@ -263,6 +379,8 @@
                 <tr>
                     <th>Item</th>
                     <th>Qty</th>
+                    <th>Status</th>
+                    <th>Claim</th>
                     <th>Saved unit</th>
                     {#each detail.markets as m (m.id)}
                         <th>
@@ -282,6 +400,10 @@
                                 type="number"
                                 min="1"
                                 value={it.qty_requested}
+                                disabled={it.status !== 'open'}
+                                title={it.status !== 'open'
+                                    ? 'Release the claim or reverse fulfillments to edit'
+                                    : ''}
                                 onchange={(e) =>
                                     updateQty(
                                         it.id,
@@ -290,11 +412,23 @@
                                 style="width: 6rem"
                             />
                         </td>
+                        <td>
+                            <span class="status-pill" class:pill-open={it.status === 'open'} class:pill-claimed={it.status === 'claimed'} class:pill-bought={it.status === 'bought'} class:pill-delivered={it.status === 'delivered'} class:pill-settled={it.status === 'settled'}>
+                                {statusPill(it.id, it.status)}
+                            </span>
+                        </td>
+                        <td>
+                            <ClaimChips
+                                item={it}
+                                {detail}
+                                onUpdate={(d) => (detail = d)}
+                            />
+                        </td>
                         <td>{fmtIsk(it.est_unit_price_isk)}</td>
                         {#each detail.markets as m (m.id)}
                             {@const lp = priceFor(it.id, m.id)}
                             {@const cellStale = isStaleMarket(m.id) ||
-                                (lp?.computed_at && Date.now() - new Date(lp.computed_at).getTime() > STALE_AFTER_MS)}
+                                (lp?.computed_at != null && Date.now() - new Date(lp.computed_at).getTime() > STALE_AFTER_MS)}
                             <td
                                 class:stale={cellStale}
                                 title={lp?.computed_at == null
@@ -314,8 +448,25 @@
                                 {/if}
                             </td>
                         {/each}
-                        <td>
-                            <button class="danger" onclick={() => deleteItem(it.id)}>×</button>
+                        <td class="actions-cell">
+                            {#if (it.status === 'open' || it.status === 'claimed') }
+                                <button class="primary small" onclick={() => (buyModalItem = it.id)}>
+                                    Buy
+                                </button>
+                            {/if}
+                            {#if it.status === 'bought' && (isLastHauler(it.id) || detail.viewer_role === 'owner')}
+                                <button class="small" onclick={() => markDelivered(it.id)}>
+                                    Delivered
+                                </button>
+                            {/if}
+                            <button
+                                class="danger"
+                                disabled={it.status !== 'open'}
+                                title={it.status !== 'open'
+                                    ? 'Release the claim or reverse fulfillments to delete'
+                                    : ''}
+                                onclick={() => deleteItem(it.id)}
+                            >×</button>
                         </td>
                     </tr>
                 {/each}
@@ -338,11 +489,22 @@
         </div>
     </section>
 
+    <ReimbursementPanel {detail} onUpdate={(d) => (detail = d)} />
+
     <section>
         <button class="danger" onclick={deleteList}>Delete list</button>
     </section>
 {:else if !error}
     <p>Loading…</p>
+{/if}
+
+{#if buyItem && detail}
+    <BuyModal
+        item={buyItem}
+        {detail}
+        onUpdate={(d) => (detail = d)}
+        onClose={() => (buyModalItem = null)}
+    />
 {/if}
 
 <style>
@@ -361,6 +523,12 @@
     .row-between {
         display: flex;
         justify-content: space-between;
+        align-items: center;
+        gap: 1rem;
+    }
+    .tip-editor {
+        display: flex;
+        gap: 0.4rem;
         align-items: center;
     }
     .chips {
@@ -421,6 +589,10 @@
         border-color: #6e2832;
         color: #f87171;
     }
+    button.small {
+        padding: 0.2rem 0.5rem;
+        font-size: 0.82rem;
+    }
     table {
         width: 100%;
         border-collapse: collapse;
@@ -430,6 +602,12 @@
         text-align: left;
         padding: 0.35rem 0.55rem;
         border-bottom: 1px solid #21262d;
+    }
+    .actions-cell {
+        display: flex;
+        gap: 0.3rem;
+        align-items: center;
+        flex-wrap: nowrap;
     }
     input[type='text'],
     input[type='number'],
@@ -443,4 +621,19 @@
     .muted {
         color: #8b949e;
     }
+    .small {
+        font-size: 0.8rem;
+    }
+    .status-pill {
+        font-size: 0.75rem;
+        padding: 0.1rem 0.45rem;
+        border-radius: 999px;
+        border: 1px solid #30363d;
+        white-space: nowrap;
+    }
+    .pill-open { border-color: #30363d; color: #8b949e; }
+    .pill-claimed { border-color: #388bfd; color: #79c0ff; }
+    .pill-bought { border-color: #d29922; color: #e3b341; }
+    .pill-delivered { border-color: #3fb950; color: #3fb950; }
+    .pill-settled { border-color: #8b949e; color: #8b949e; }
 </style>

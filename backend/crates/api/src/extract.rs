@@ -5,7 +5,7 @@ use axum::{
     http::{request::Parts, StatusCode},
     response::{IntoResponse, Response},
 };
-use domain::GroupRole;
+use domain::{ClaimStatus, GroupRole};
 use serde::Deserialize;
 use tower_sessions::Session;
 use uuid::Uuid;
@@ -38,10 +38,12 @@ where
     }
 }
 
-fn parse_role(raw: String) -> Result<GroupRole, Response> {
+/// Returns a small `(StatusCode, &str)` tuple so callers can convert via
+/// `.map_err(IntoResponse::into_response)` without boxing a large `Response`.
+fn parse_role(raw: String) -> Result<GroupRole, (StatusCode, &'static str)> {
     raw.parse::<GroupRole>().map_err(|e| {
         tracing::error!(error = ?e, "invalid group role in database");
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
     })
 }
 
@@ -89,12 +91,90 @@ impl FromRequestParts<AppState> for CurrentGroup {
 
         let role = parse_role(role.ok_or_else(|| {
             (StatusCode::FORBIDDEN, "you are not a member of this group").into_response()
-        })?)?;
+        })?)
+        .map_err(IntoResponse::into_response)?;
 
         Ok(CurrentGroup {
             user_id,
             group_id,
             role,
+        })
+    }
+}
+
+/// Looks up a claim by `{id}` path param and verifies the caller is a member
+/// of the claim's list's group.
+pub struct CurrentClaim {
+    pub user_id: Uuid,
+    #[allow(dead_code)]
+    pub group_id: Uuid,
+    pub list_id: Uuid,
+    pub claim_id: Uuid,
+    pub hauler_user_id: Uuid,
+    pub role: GroupRole,
+    pub status: ClaimStatus,
+}
+
+#[derive(Deserialize)]
+struct ClaimPath {
+    id: Option<Uuid>,
+    claim_id: Option<Uuid>,
+}
+
+impl FromRequestParts<AppState> for CurrentClaim {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let CurrentUser(user_id) = CurrentUser::from_request_parts(parts, state).await?;
+        let Path(path) = Path::<ClaimPath>::from_request_parts(parts, state)
+            .await
+            .map_err(|e| e.into_response())?;
+        let claim_id = path.claim_id.or(path.id).ok_or_else(|| {
+            (StatusCode::BAD_REQUEST, "missing claim id in route").into_response()
+        })?;
+
+        let row: Option<(Uuid, Uuid, Uuid, String, Option<String>)> = sqlx::query_as(
+            "SELECT c.list_id, l.group_id, c.hauler_user_id, c.status, gm.role \
+             FROM claims c \
+             JOIN lists l ON l.id = c.list_id \
+             LEFT JOIN group_memberships gm \
+               ON gm.group_id = l.group_id AND gm.user_id = $1 \
+             WHERE c.id = $2",
+        )
+        .bind(user_id)
+        .bind(claim_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| db_error("claim lookup failed", e))?;
+
+        let (list_id, group_id, hauler_user_id, status_raw, role_opt) =
+            row.ok_or_else(|| (StatusCode::NOT_FOUND, "claim not found").into_response())?;
+
+        let role = parse_role(role_opt.ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "you are not a member of this claim's group",
+            )
+                .into_response()
+        })?)
+        .map_err(IntoResponse::into_response)?;
+
+        let status: ClaimStatus = status_raw.parse().map_err(|e| {
+            tracing::error!(error = ?e, "invalid claim status in database");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        })?;
+
+        Ok(CurrentClaim {
+            user_id,
+            group_id,
+            list_id,
+            claim_id,
+            hauler_user_id,
+            role,
+            status,
         })
     }
 }
@@ -157,7 +237,8 @@ impl FromRequestParts<AppState> for CurrentList {
                 "you are not a member of this list's group",
             )
                 .into_response()
-        })?)?;
+        })?)
+        .map_err(IntoResponse::into_response)?;
 
         Ok(CurrentList {
             user_id,

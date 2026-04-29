@@ -10,7 +10,7 @@
 //! 5. For any contract that just transitioned to a terminal status, settle or
 //!    unbind via the shared [`settlement`] crate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -23,9 +23,13 @@ use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use domain::principals::{EsiContractParties, resolve_contract_parties};
+
+use super::corp_contracts::{build_principal_index, find_user_for_principal};
+
 use crate::Ctx;
 
-mod r#match;
+pub(crate) mod r#match;
 
 const CONTRACTS_SCOPE: &str = "esi-contracts.read_character_contracts.v1";
 /// Hard ceiling on how many contracts we attempt to fetch items for per tick.
@@ -52,6 +56,13 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
             .await?;
 
     if eligible_count == 0 {
+        // No character scope, but corp ambassadors can still fetch items.
+        let synced = sync_pending_items(ctx).await?;
+        if !synced.is_empty() {
+            if let Err(e) = r#match::run_for_contracts(&ctx.pool, &synced).await {
+                tracing::warn!(error = ?e, "contract matcher (items-only) failed");
+            }
+        }
         return Ok(());
     }
 
@@ -111,9 +122,15 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
         }
     }
 
-    sync_pending_items(ctx).await?;
+    let synced_ids = sync_pending_items(ctx).await?;
 
-    let candidate_ids: Vec<Uuid> = upserts.iter().map(|u| u.contract_id).collect();
+    // Run matcher on upserted contracts plus any whose items just landed.
+    let mut candidate_ids: Vec<Uuid> = upserts.iter().map(|u| u.contract_id).collect();
+    for id in &synced_ids {
+        if !candidate_ids.contains(id) {
+            candidate_ids.push(*id);
+        }
+    }
     if !candidate_ids.is_empty() {
         if let Err(e) = r#match::run_for_contracts(&ctx.pool, &candidate_ids).await {
             tracing::warn!(error = ?e, "contract matcher failed");
@@ -190,28 +207,21 @@ async fn poll_one_character(
         }
     };
 
-    // Filter to item_exchange contracts where at least one party is one of ours.
-    // Resolve issuer/assignee EVE ids → user ids via a single batched lookup.
+    // Build a principal index covering all EVE entity ids in this batch.
+    // This handles both character→user and corporation→corp-principal lookups,
+    // enabling resolution of "hauler issues contract to corp" assignments.
     let all_eve_ids: Vec<i64> = contracts
         .iter()
-        .flat_map(|c| std::iter::once(c.issuer_id).chain(c.assignee_id))
+        .flat_map(|c| {
+            std::iter::once(c.issuer_id)
+                .chain(c.assignee_id)
+                .chain(std::iter::once(c.issuer_corporation_id))
+        })
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
 
-    let user_map: HashMap<i64, Uuid> = if all_eve_ids.is_empty() {
-        HashMap::new()
-    } else {
-        sqlx::query_as::<_, (i64, Uuid)>(
-            "SELECT character_id, user_id FROM characters \
-             WHERE character_id = ANY($1::bigint[])",
-        )
-        .bind(&all_eve_ids)
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .collect()
-    };
+    let idx = build_principal_index(pool, &all_eve_ids).await?;
 
     let mut out: Vec<UpsertedContract> = Vec::new();
     let mut tx = pool.begin().await?;
@@ -219,13 +229,30 @@ async fn poll_one_character(
         if c.contract_type != "item_exchange" {
             continue;
         }
-        let issuer_user_id = user_map.get(&c.issuer_id).copied();
-        let assignee_user_id = c.assignee_id.and_then(|a| user_map.get(&a).copied());
-        if issuer_user_id.is_none() && assignee_user_id.is_none() {
+
+        let parties = resolve_contract_parties(
+            &EsiContractParties {
+                issuer_id: c.issuer_id,
+                issuer_corporation_id: c.issuer_corporation_id,
+                for_corporation: c.for_corporation,
+                assignee_id: c.assignee_id,
+            },
+            &idx,
+        );
+
+        if parties.issuer_principal_id.is_none() && parties.assignee_principal_id.is_none() {
             // Drop contracts that aren't between two of ours; they can't bind
             // to a JitaCart reimbursement.
             continue;
         }
+
+        // Legacy user-id fields (deprecated; NULL for pure-corp contracts).
+        let issuer_user_id = parties
+            .issuer_principal_id
+            .and_then(|pid| find_user_for_principal(&idx, pid));
+        let assignee_user_id = parties
+            .assignee_principal_id
+            .and_then(|pid| find_user_for_principal(&idx, pid));
 
         let upsert = ContractUpsert {
             esi_contract_id: c.contract_id,
@@ -233,6 +260,8 @@ async fn poll_one_character(
             issuer_user_id,
             assignee_character_id: c.assignee_id,
             assignee_user_id,
+            issuer_principal_id: parties.issuer_principal_id,
+            assignee_principal_id: parties.assignee_principal_id,
             contract_type: c.contract_type.clone(),
             status: c.status.clone(),
             price_isk: Decimal::from_f64(c.price.unwrap_or(0.0)).unwrap_or(Decimal::ZERO),
@@ -245,6 +274,7 @@ async fn poll_one_character(
             start_location_id: c.start_location_id,
             end_location_id: c.end_location_id,
             raw_json: serde_json::to_value(c).unwrap_or(Value::Null),
+            source_corp_id: None,
         };
 
         let outcome = settlement::upsert_contract(&mut tx, &upsert)
@@ -298,10 +328,14 @@ fn jitter_secs(base: u64) -> i64 {
     r.rem_euclid(2 * span + 1) - span
 }
 
-async fn sync_pending_items(ctx: &Ctx) -> anyhow::Result<()> {
+/// Sync items for contracts that still have `items_synced_at IS NULL`.
+/// Returns the contract IDs that were successfully synced this pass so
+/// callers can immediately re-run the matcher on them.
+pub(crate) async fn sync_pending_items(ctx: &Ctx) -> anyhow::Result<Vec<Uuid>> {
     let needs: Vec<NeedsItemsRow> = sqlx::query_as(
         r#"
-        SELECT id, esi_contract_id, issuer_character_id, assignee_character_id
+        SELECT id, esi_contract_id, issuer_character_id, assignee_character_id,
+               source_corp_id
         FROM contracts
         WHERE items_synced_at IS NULL
           AND contract_type = 'item_exchange'
@@ -314,11 +348,11 @@ async fn sync_pending_items(ctx: &Ctx) -> anyhow::Result<()> {
     .await?;
 
     if needs.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let sem = Arc::new(Semaphore::new(ctx.config.worker.contracts_concurrency));
-    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut tasks: Vec<tokio::task::JoinHandle<Option<Uuid>>> = Vec::new();
 
     for row in needs {
         let permit = sem.clone().acquire_owned().await?;
@@ -327,15 +361,29 @@ async fn sync_pending_items(ctx: &Ctx) -> anyhow::Result<()> {
         let budget = ctx.budget.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = sync_items_for(&pool, &token_store, &budget, &row).await {
-                tracing::warn!(error = ?e, esi_contract_id = row.esi_contract_id, "items sync failed");
+            let contract_id = row.id;
+            match sync_items_for(&pool, &token_store, &budget, &row).await {
+                Ok(true) => Some(contract_id),
+                Ok(false) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        esi_contract_id = row.esi_contract_id,
+                        "items sync failed"
+                    );
+                    None
+                }
             }
         }));
     }
+
+    let mut synced: Vec<Uuid> = Vec::new();
     for h in tasks {
-        let _ = h.await;
+        if let Ok(Some(id)) = h.await {
+            synced.push(id);
+        }
     }
-    Ok(())
+    Ok(synced)
 }
 
 #[derive(sqlx::FromRow)]
@@ -344,16 +392,19 @@ struct NeedsItemsRow {
     esi_contract_id: i64,
     issuer_character_id: i64,
     assignee_character_id: Option<i64>,
+    source_corp_id: Option<Uuid>,
 }
 
+/// Returns `true` when items were fetched and `items_synced_at` was committed,
+/// `false` when no usable token was available (will be retried next tick).
 async fn sync_items_for(
     pool: &PgPool,
     token_store: &auth_tokens::CharacterTokenStore,
     budget: &auth_tokens::EsiBudgetGuard,
     row: &NeedsItemsRow,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if !budget.has_budget() {
-        return Ok(());
+        return Ok(false);
     }
     // Try issuer first (whoever made the contract can read its items), then
     // assignee. Both must be a JitaCart-tracked character with the contracts
@@ -371,21 +422,61 @@ async fn sync_items_for(
     .fetch_optional(pool)
     .await?;
 
-    let (char_uuid, eve_char_id) = match pick {
-        Some(v) => v,
-        None => return Ok(()),
-    };
-
-    let client = token_store.authed_client_for(char_uuid).await?;
-    let items = match client
-        .character_contract_items(eve_char_id, row.esi_contract_id)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            budget.record_non_2xx();
-            return Err(e.into());
+    // token_rotation_char tracks which character we should call persist_rotations for.
+    let token_rotation_char: Uuid;
+    let items = if let Some((char_uuid, eve_char_id)) = pick {
+        token_rotation_char = char_uuid;
+        let client = token_store.authed_client_for(char_uuid).await?;
+        match client
+            .character_contract_items(eve_char_id, row.esi_contract_id)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                budget.record_non_2xx();
+                return Err(e.into());
+            }
         }
+    } else if let Some(corp_uuid) = row.source_corp_id {
+        // No tracked character has the character-contracts scope; fall back to
+        // the corp endpoint via an active ambassador.
+        let amb: Option<(Uuid, i64)> = sqlx::query_as(
+            "SELECT ca.character_id, c.esi_corporation_id \
+             FROM corp_ambassadors ca \
+             JOIN characters ch ON ch.id = ca.character_id \
+             JOIN corps c ON c.id = ca.corp_id \
+             WHERE ca.corp_id = $1 \
+               AND ca.disabled_at IS NULL \
+               AND $2 = ANY(ch.scopes) \
+               AND (ca.last_auth_error_at IS NULL \
+                    OR ca.last_auth_error_at < now() - interval '1 hour') \
+             ORDER BY ca.last_used_at NULLS FIRST \
+             LIMIT 1",
+        )
+        .bind(corp_uuid)
+        .bind(super::corp_contracts::CORP_CONTRACTS_SCOPE)
+        .fetch_optional(pool)
+        .await?;
+
+        let (amb_char_uuid, esi_corp_id) = match amb {
+            Some(v) => v,
+            None => return Ok(false), // no usable ambassador; retried next tick
+        };
+
+        token_rotation_char = amb_char_uuid;
+        let client = token_store.authed_client_for(amb_char_uuid).await?;
+        match client
+            .corp_contract_items(esi_corp_id, row.esi_contract_id)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                budget.record_non_2xx();
+                return Err(e.into());
+            }
+        }
+    } else {
+        return Ok(false); // character-only contract with no usable token; retried next tick
     };
 
     let mut tx = pool.begin().await?;
@@ -418,8 +509,8 @@ async fn sync_items_for(
         .await?;
     tx.commit().await?;
 
-    let _ = token_store.persist_rotations(char_uuid).await;
-    Ok(())
+    let _ = token_store.persist_rotations(token_rotation_char).await;
+    Ok(true)
 }
 
 async fn handle_terminal_transition(pool: &PgPool, u: &UpsertedContract) -> anyhow::Result<()> {

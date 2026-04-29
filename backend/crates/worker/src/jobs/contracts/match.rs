@@ -39,22 +39,23 @@ async fn run_one(pool: &PgPool, contract_id: Uuid) -> anyhow::Result<()> {
         String,
         Option<chrono::DateTime<chrono::Utc>>,
     )> = sqlx::query_as(
-        "SELECT issuer_user_id, assignee_user_id, contract_type, items_synced_at \
+        "SELECT issuer_principal_id, assignee_principal_id, contract_type, items_synced_at \
              FROM contracts WHERE id = $1",
     )
     .bind(contract_id)
     .fetch_optional(pool)
     .await?;
 
-    let (issuer_user_id, assignee_user_id, contract_type, items_synced_at) = match header {
-        Some(h) => h,
-        None => return Ok(()),
-    };
+    let (issuer_principal_id, assignee_principal_id, contract_type, items_synced_at) =
+        match header {
+            Some(h) => h,
+            None => return Ok(()),
+        };
 
     if contract_type != "item_exchange" || items_synced_at.is_none() {
         return Ok(());
     }
-    let (Some(issuer), Some(assignee)) = (issuer_user_id, assignee_user_id) else {
+    let (Some(issuer), Some(assignee)) = (issuer_principal_id, assignee_principal_id) else {
         return Ok(());
     };
 
@@ -75,18 +76,43 @@ async fn run_one(pool: &PgPool, contract_id: Uuid) -> anyhow::Result<()> {
     }
 
     // One grouped query covers every candidate reimbursement and its
-    // fulfillment totals by type. Reimbursements with no fulfillments don't
-    // appear and are skipped (score_match returns None for empty f_totals).
+    // fulfillment totals by type. Mode-aware:
+    // - Personal (is_corp_funded=false): join on requested_by_user_id = requester's user.
+    // - Corp-funded (is_corp_funded=true): drop the requested_by_user_id filter;
+    //   coverage = all items on the list fulfilled by this hauler.
+    //
+    // We handle both modes in a single UNION query so we get a single scan.
     let rows: Vec<(Uuid, i32, i64)> = sqlx::query_as(
         r#"
+        -- Personal mode: match by requester user
+        SELECT r.id, li.type_id::int, COALESCE(SUM(f.qty), 0)::bigint
+        FROM reimbursements r
+        JOIN principals rp ON rp.id = r.requester_principal_id AND rp.kind = 'user'
+        JOIN list_items   li ON li.list_id = r.list_id
+                            AND li.requested_by_user_id = rp.user_id
+        JOIN fulfillments f  ON f.list_item_id = li.id
+                            AND f.hauler_user_id = (
+                                SELECT hp.user_id FROM principals hp WHERE hp.id = r.hauler_principal_id
+                            )
+                            AND f.reversed_at IS NULL
+        WHERE r.hauler_principal_id = $1 AND r.requester_principal_id = $2
+          AND r.is_corp_funded = false
+          AND r.contract_id IS NULL AND r.status = 'pending'
+        GROUP BY r.id, li.type_id
+
+        UNION ALL
+
+        -- Corp-funded mode: all items on list, any requester
         SELECT r.id, li.type_id::int, COALESCE(SUM(f.qty), 0)::bigint
         FROM reimbursements r
         JOIN list_items   li ON li.list_id = r.list_id
-                            AND li.requested_by_user_id = r.requester_user_id
         JOIN fulfillments f  ON f.list_item_id = li.id
-                            AND f.hauler_user_id = r.hauler_user_id
+                            AND f.hauler_user_id = (
+                                SELECT hp.user_id FROM principals hp WHERE hp.id = r.hauler_principal_id
+                            )
                             AND f.reversed_at IS NULL
-        WHERE r.hauler_user_id = $1 AND r.requester_user_id = $2
+        WHERE r.hauler_principal_id = $1 AND r.requester_principal_id = $2
+          AND r.is_corp_funded = true
           AND r.contract_id IS NULL AND r.status = 'pending'
         GROUP BY r.id, li.type_id
         "#,

@@ -9,7 +9,8 @@
         type ListDetail,
         type ListStatus,
         type LiveItemPrice,
-        type GroupMarket
+        type GroupMarket,
+        type Corp
     } from '$lib/api';
     import ClaimChips from '$lib/lists/ClaimChips.svelte';
     import BuyModal from '$lib/lists/BuyModal.svelte';
@@ -35,6 +36,13 @@
     let tipInput = $state('');
     let savingTip = $state(false);
 
+    // Phase 7: payer picker
+    let groupCorps = $state<Corp[]>([]);
+    let payerCorpId = $state<string>('');
+    let payerDivision = $state<number>(1);
+    let savingPayer = $state(false);
+    let payerErr = $state<string | null>(null);
+
     async function load() {
         error = null;
         try {
@@ -46,6 +54,18 @@
             allMarkets = all;
             editSelected = new Set(d.markets.map((m) => m.id));
             editPrimary = d.primary_market_id;
+            // Load linked corps for payer picker.
+            if (!groupCorps.length) {
+                try {
+                    const cr = await api<{ corps: Corp[] }>(`/groups/${d.list.group_id}/corps`);
+                    groupCorps = cr.corps.filter((c) => c.disabled_at === null);
+                } catch {
+                    // Non-fatal: corps section may be empty.
+                }
+            }
+            // Sync payer fields from list.
+            payerCorpId = d.list.payer_corp_id ?? '';
+            payerDivision = d.list.payer_division ?? 1;
         } catch (e) {
             error = (e as Error).message;
         }
@@ -252,6 +272,32 @@
         if (status === 'claimed') return claimLabel(itemId) || 'claimed';
         return status;
     }
+
+    async function savePayer() {
+        if (!detail || savingPayer) return;
+        savingPayer = true;
+        payerErr = null;
+        try {
+            detail = await api<ListDetail>(`/lists/${listId}/payer`, {
+                method: 'PATCH',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                    payer_corp_id: payerCorpId || null,
+                    payer_division: payerCorpId ? payerDivision : null
+                })
+            });
+        } catch (e) {
+            payerErr = (e as Error).message;
+        } finally {
+            savingPayer = false;
+        }
+    }
+
+    const canEditPayer = $derived(
+        detail !== null &&
+            detail.viewer_role === 'owner' &&
+            detail.reimbursements.length === 0
+    );
 </script>
 
 <p>
@@ -489,6 +535,45 @@
         </div>
     </section>
 
+    {#if groupCorps.length > 0 || detail.list.payer_corp_id}
+        <section>
+            <h2>Corp payer</h2>
+            {#if detail.list.payer_corp_id}
+                {@const payerCorp = groupCorps.find((c) => c.id === detail?.list.payer_corp_id)}
+                <p class="muted small">
+                    Reimbursements funded by corp wallet:
+                    <strong>{payerCorp?.name ?? detail.list.payer_corp_id}</strong>
+                    division {detail.list.payer_division ?? 1}
+                </p>
+            {:else}
+                <p class="muted small">No corp payer set — reimbursements are personal.</p>
+            {/if}
+            {#if canEditPayer}
+                <div class="row">
+                    <select bind:value={payerCorpId}>
+                        <option value="">— Personal (no corp) —</option>
+                        {#each groupCorps as c (c.id)}
+                            <option value={c.id}>{c.name}{c.ticker ? ` [${c.ticker}]` : ''}</option>
+                        {/each}
+                    </select>
+                    {#if payerCorpId}
+                        <select bind:value={payerDivision} style="width: 7rem">
+                            {#each [1,2,3,4,5,6,7] as d}
+                                <option value={d}>Division {d}</option>
+                            {/each}
+                        </select>
+                    {/if}
+                    <button class="primary" disabled={savingPayer} onclick={savePayer}>
+                        {savingPayer ? 'Saving…' : 'Save payer'}
+                    </button>
+                </div>
+                {#if payerErr}<p class="err">{payerErr}</p>{/if}
+            {:else if detail.reimbursements.length > 0}
+                <p class="muted small">(locked — reimbursements already exist)</p>
+            {/if}
+        </section>
+    {/if}
+
     <ReimbursementPanel {detail} onUpdate={(d) => (detail = d)} />
 
     <section>
@@ -636,4 +721,8 @@
     .pill-bought { border-color: #d29922; color: #e3b341; }
     .pill-delivered { border-color: #3fb950; color: #3fb950; }
     .pill-settled { border-color: #8b949e; color: #8b949e; }
+    .err {
+        color: #f87171;
+        margin: 0;
+    }
 </style>

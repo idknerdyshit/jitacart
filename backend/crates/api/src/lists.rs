@@ -1168,7 +1168,8 @@ pub(crate) async fn load_list_detail(
 ) -> Result<ListDetail, ListError> {
     let list_row: ListRow = sqlx::query_as(
         "SELECT id, group_id, created_by_user_id, destination_label, notes, status, \
-                total_estimate_isk, tip_pct, created_at, updated_at \
+                total_estimate_isk, tip_pct, created_at, updated_at, \
+                payer_corp_id, payer_division \
          FROM lists WHERE id = $1",
     )
     .bind(list_id)
@@ -1308,7 +1309,9 @@ pub(crate) async fn load_list_detail(
                r.subtotal_isk, r.tip_isk, r.total_isk, r.status,
                r.settled_at, r.settled_by_user_id, r.contract_id,
                r.created_at, r.updated_at,
-               ru.display_name AS requester_display_name,
+               r.requester_principal_id, r.hauler_principal_id,
+               r.is_corp_funded, r.verified_by_wallet, r.wallet_settlement_delta_isk,
+               COALESCE(ru.display_name, corp_p.name, 'Corp') AS requester_display_name,
                hu.display_name AS hauler_display_name,
                c.esi_contract_id      AS contract_esi_contract_id,
                c.status               AS contract_status,
@@ -1317,7 +1320,10 @@ pub(crate) async fn load_list_detail(
                c.settlement_delta_isk AS contract_settlement_delta_isk,
                c.date_completed       AS contract_date_completed
         FROM reimbursements r
-        JOIN users ru ON ru.id = r.requester_user_id
+        -- requester may be a user or a corp (corp-funded rows have no requester_user_id)
+        LEFT JOIN users ru ON ru.id = r.requester_user_id
+        LEFT JOIN principals rp ON rp.id = r.requester_principal_id AND rp.kind = 'corp'
+        LEFT JOIN corps corp_p ON corp_p.id = rp.corp_id
         JOIN users hu ON hu.id = r.hauler_user_id
         LEFT JOIN contracts c ON c.id = r.contract_id
         WHERE r.list_id = $1
@@ -1384,6 +1390,9 @@ struct ListRow {
     tip_pct: Decimal,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    // Phase 7
+    payer_corp_id: Option<Uuid>,
+    payer_division: Option<i16>,
 }
 
 impl ListRow {
@@ -1403,6 +1412,8 @@ impl ListRow {
             tip_pct: self.tip_pct,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            payer_corp_id: self.payer_corp_id,
+            payer_division: self.payer_division,
         })
     }
 }
@@ -1610,7 +1621,7 @@ impl FulfillmentRow {
 pub(crate) struct ReimbursementRow {
     pub id: Uuid,
     pub list_id: Uuid,
-    pub requester_user_id: Uuid,
+    pub requester_user_id: Option<Uuid>,
     pub hauler_user_id: Uuid,
     pub subtotal_isk: Decimal,
     pub tip_isk: Decimal,
@@ -1629,6 +1640,12 @@ pub(crate) struct ReimbursementRow {
     pub contract_expected_total_isk: Option<Decimal>,
     pub contract_settlement_delta_isk: Option<Decimal>,
     pub contract_date_completed: Option<DateTime<Utc>>,
+    // Phase 7
+    pub requester_principal_id: Uuid,
+    pub hauler_principal_id: Uuid,
+    pub is_corp_funded: bool,
+    pub verified_by_wallet: bool,
+    pub wallet_settlement_delta_isk: Option<Decimal>,
 }
 
 impl ReimbursementRow {
@@ -1674,6 +1691,11 @@ impl ReimbursementRow {
             contract,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            requester_principal_id: self.requester_principal_id,
+            hauler_principal_id: self.hauler_principal_id,
+            is_corp_funded: self.is_corp_funded,
+            verified_by_wallet: self.verified_by_wallet,
+            wallet_settlement_delta_isk: self.wallet_settlement_delta_isk,
         })
     }
 }

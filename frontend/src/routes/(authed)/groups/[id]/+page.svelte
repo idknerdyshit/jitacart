@@ -167,6 +167,11 @@
         <p><a href={`/groups/${groupId}/tracked-markets`}>Tracked citadels →</a></p>
     </section>
 
+    <section>
+        <h2>Corp wallets</h2>
+        <p><a href={`/groups/${groupId}/corps`}>Linked corps &amp; ambassadors →</a></p>
+    </section>
+
     {#if detail.role === 'owner'}
         <section>
             <h2>Default tip</h2>

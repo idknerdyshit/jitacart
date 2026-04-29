@@ -21,11 +21,33 @@ pub struct ListIds {
 }
 
 pub async fn insert_user(pool: &PgPool, name: &str) -> Uuid {
-    sqlx::query_scalar("INSERT INTO users (display_name) VALUES ($1) RETURNING id")
-        .bind(name)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    let user_id: Uuid =
+        sqlx::query_scalar("INSERT INTO users (display_name) VALUES ($1) RETURNING id")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    // Phase 7: every user gets a user-principal (the migration backfills existing
+    // rows, but for test-created rows we do it here).
+    sqlx::query(
+        "INSERT INTO principals (kind, user_id) VALUES ('user', $1) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    user_id
+}
+
+pub async fn get_user_principal_id(pool: &PgPool, user_id: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM principals WHERE kind = 'user' AND user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 pub async fn insert_group(pool: &PgPool, owner: Uuid, name: &str) -> Uuid {
@@ -87,15 +109,20 @@ pub async fn seed_two_party_list(pool: &PgPool, requester: Uuid, hauler: Uuid) -
     set_item_status(pool, item_b_id, "bought").await;
 
     let subtotal = Decimal::new(5_000 + 5_000, 0); // 10000
+    let requester_pid = get_user_principal_id(pool, requester).await;
+    let hauler_pid = get_user_principal_id(pool, hauler).await;
     let reimbursement_id: Uuid = sqlx::query_scalar(
         "INSERT INTO reimbursements \
-         (list_id, requester_user_id, hauler_user_id, subtotal_isk, tip_isk, total_isk) \
-         VALUES ($1, $2, $3, $4, 0, $4) RETURNING id",
+         (list_id, requester_user_id, hauler_user_id, subtotal_isk, tip_isk, total_isk, \
+          requester_principal_id, hauler_principal_id) \
+         VALUES ($1, $2, $3, $4, 0, $4, $5, $6) RETURNING id",
     )
     .bind(list_id)
     .bind(requester)
     .bind(hauler)
     .bind(subtotal)
+    .bind(requester_pid)
+    .bind(hauler_pid)
     .fetch_one(pool)
     .await
     .unwrap();
@@ -204,12 +231,18 @@ pub async fn insert_contract(
     )
     .then_some(now);
 
+    // Look up principals for the test users.
+    let issuer_pid = get_user_principal_id(pool, issuer_user_id).await;
+    let assignee_pid = get_user_principal_id(pool, assignee_user_id).await;
+
     let upsert = settlement::ContractUpsert {
         esi_contract_id: esi_id,
         issuer_character_id: 1,
         issuer_user_id: Some(issuer_user_id),
         assignee_character_id: Some(2),
         assignee_user_id: Some(assignee_user_id),
+        issuer_principal_id: Some(issuer_pid),
+        assignee_principal_id: Some(assignee_pid),
         contract_type: "item_exchange".into(),
         status: status.into(),
         price_isk,
@@ -222,6 +255,7 @@ pub async fn insert_contract(
         start_location_id: None,
         end_location_id: None,
         raw_json: serde_json::json!({}),
+        source_corp_id: None,
     };
 
     let mut tx = pool.begin().await.unwrap();

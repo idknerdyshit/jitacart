@@ -14,8 +14,13 @@
 
     const visible = $derived(detail.reimbursements.filter((r) => Number(r.total_isk) > 0 || r.status !== 'pending'));
 
+    function requesterLabel(r: Reimbursement): string {
+        if (r.is_corp_funded) return `Corp (${r.requester_display_name})`;
+        return r.requester_display_name;
+    }
+
     function canSettle(r: Reimbursement): boolean {
-        const isRequester = detail.viewer_user_id === r.requester_user_id;
+        const isRequester = !r.is_corp_funded && detail.viewer_user_id === r.requester_user_id;
         const isOwner = detail.viewer_role === 'owner';
         return (
             (isRequester || isOwner) &&
@@ -29,6 +34,20 @@
     }
 
     function hasUndelivered(r: Reimbursement): boolean {
+        if (r.is_corp_funded) {
+            // Corp-funded: check that all items bought by this hauler are delivered.
+            return detail.items.some(
+                (it) =>
+                    it.status !== 'delivered' &&
+                    it.status !== 'settled' &&
+                    detail.fulfillments.some(
+                        (f) =>
+                            f.list_item_id === it.id &&
+                            f.hauler_user_id === r.hauler_user_id &&
+                            f.reversed_at === null
+                    )
+            );
+        }
         return detail.items.some(
             (it) =>
                 it.requested_by_user_id === r.requester_user_id &&
@@ -68,10 +87,13 @@
         {/if}
         <div class="cards">
             {#each visible as r (r.id)}
-                <div class="card" class:settled={r.status === 'settled'}>
+                <div class="card" class:settled={r.status === 'settled'} class:corp-funded={r.is_corp_funded}>
                     <div class="row-between">
                         <span class="parties">
-                            <strong>{r.requester_display_name}</strong>
+                            {#if r.is_corp_funded}
+                                <span class="pill pill-corp">corp</span>
+                            {/if}
+                            <strong>{requesterLabel(r)}</strong>
                             <span class="arrow">→</span>
                             <strong>{r.hauler_display_name}</strong>
                         </span>
@@ -103,6 +125,20 @@
                                     Bound to contract #{r.contract.esi_contract_id} ({r.contract.status.replace('_', ' ')})
                                 </span>
                                 <span class="muted small">awaiting in-game completion</span>
+                            {/if}
+                        </div>
+                    {/if}
+                    {#if r.is_corp_funded}
+                        <div class="contract-chip-row">
+                            {#if r.verified_by_wallet}
+                                <span class="pill pill-settled">wallet verified</span>
+                                {#if r.wallet_settlement_delta_isk}
+                                    <span class={`small ${deltaClass(r.wallet_settlement_delta_isk)}`}>
+                                        Δ {fmtIsk(r.wallet_settlement_delta_isk)}
+                                    </span>
+                                {/if}
+                            {:else}
+                                <span class="pill muted">wallet not yet verified</span>
                             {/if}
                         </div>
                     {/if}
@@ -227,5 +263,13 @@
     }
     .neg {
         color: #f87171;
+    }
+    .pill-corp {
+        border-color: #9e6a03;
+        color: #e3b341;
+        background: #1c1500;
+    }
+    .corp-funded {
+        border-color: #2d2600;
     }
 </style>

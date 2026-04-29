@@ -82,7 +82,7 @@ async fn list_suggestions(
             s.reimbursement_id,
             r.list_id,
             l.destination_label   AS list_destination_label,
-            ru.display_name       AS requester_display_name,
+            COALESCE(ru.display_name, rc.name) AS requester_display_name,
             hu.display_name       AS hauler_display_name,
             r.total_isk           AS reimbursement_total_isk,
             s.score,
@@ -91,11 +91,13 @@ async fn list_suggestions(
             s.created_at,
             s.decided_at
         FROM contract_match_suggestions s
-        JOIN contracts c       ON c.id = s.contract_id
-        JOIN reimbursements r  ON r.id = s.reimbursement_id
-        JOIN lists l           ON l.id = r.list_id
-        JOIN users ru          ON ru.id = r.requester_user_id
-        JOIN users hu          ON hu.id = r.hauler_user_id
+        JOIN contracts c         ON c.id = s.contract_id
+        JOIN reimbursements r    ON r.id = s.reimbursement_id
+        JOIN lists l             ON l.id = r.list_id
+        LEFT JOIN users ru       ON ru.id = r.requester_user_id
+        LEFT JOIN principals rp  ON rp.id = r.requester_principal_id
+        LEFT JOIN corps rc       ON rc.id = rp.corp_id
+        JOIN users hu            ON hu.id = r.hauler_user_id
         WHERE l.group_id = $1
           AND r.hauler_user_id = $2
           AND s.state IN ('pending','confirmed')
@@ -177,17 +179,20 @@ pub async fn do_confirm(
 
     let row: Option<LinkLockRow> = sqlx::query_as(
         r#"
-        SELECT s.state         AS suggestion_state,
+        SELECT s.state               AS suggestion_state,
                s.contract_id,
                c.contract_type,
-               c.status        AS contract_status,
+               c.status              AS contract_status,
                c.issuer_user_id,
+               c.issuer_principal_id,
                c.assignee_user_id,
+               c.assignee_principal_id,
                s.reimbursement_id,
-               r.status        AS reimbursement_status,
-               r.contract_id   AS reimbursement_contract_id,
+               r.status              AS reimbursement_status,
+               r.contract_id         AS reimbursement_contract_id,
                r.hauler_user_id,
                r.requester_user_id,
+               r.requester_principal_id,
                l.group_id
         FROM contract_match_suggestions s
         JOIN contracts c ON c.id = s.contract_id
@@ -236,18 +241,26 @@ pub async fn do_confirm(
 /// Shared lock-row for confirm and manual-link. `suggestion_state` is `None`
 /// in the manual-link path (the query SELECTs `NULL::text`).
 #[derive(sqlx::FromRow)]
+#[allow(dead_code)]
 struct LinkLockRow {
     suggestion_state: Option<String>,
     contract_id: Uuid,
     contract_type: String,
     contract_status: String,
     issuer_user_id: Option<Uuid>,
+    /// Corp-issued contracts store the corp principal here; user contracts
+    /// store a user principal.
+    issuer_principal_id: Option<Uuid>,
     assignee_user_id: Option<Uuid>,
+    /// Principal-level assignee (may be a corp principal for corp-funded rows).
+    assignee_principal_id: Option<Uuid>,
     reimbursement_id: Uuid,
     reimbursement_status: String,
     reimbursement_contract_id: Option<Uuid>,
     hauler_user_id: Uuid,
-    requester_user_id: Uuid,
+    /// NULL for corp-funded reimbursements (requester is a corp principal).
+    requester_user_id: Option<Uuid>,
+    requester_principal_id: Uuid,
     group_id: Uuid,
 }
 
@@ -266,12 +279,20 @@ async fn validate_link(
             "reimbursement is no longer eligible".into(),
         ));
     }
-    if ctx.issuer_user_id != Some(user_id) || ctx.hauler_user_id != user_id {
+    // The hauler must be the person calling this endpoint.
+    if ctx.hauler_user_id != user_id {
         return Err(ContractError::Forbidden);
     }
+    // The contract issuer must also be this user (personal contracts) or a corp
+    // principal the user can act for (corp-issued contracts are accepted when
+    // issuer_user_id is None and issuer_principal_id identifies a corp).
+    if ctx.issuer_user_id.is_some() && ctx.issuer_user_id != Some(user_id) {
+        return Err(ContractError::Forbidden);
+    }
+    // Assignee, if set, must match the reimbursement's requester principal.
     if ctx
-        .assignee_user_id
-        .is_some_and(|a| a != ctx.requester_user_id)
+        .assignee_principal_id
+        .is_some_and(|a| a != ctx.requester_principal_id)
     {
         return Err(ContractError::Conflict(
             "contract assignee does not match the reimbursement's requester".into(),
@@ -422,17 +443,20 @@ pub async fn do_manual_link(
     let row: Option<LinkLockRow> = sqlx::query_as(
         r#"
         SELECT
-            NULL::text        AS suggestion_state,
-            c.id              AS contract_id,
+            NULL::text              AS suggestion_state,
+            c.id                    AS contract_id,
             c.contract_type,
-            c.status          AS contract_status,
+            c.status                AS contract_status,
             c.issuer_user_id,
+            c.issuer_principal_id,
             c.assignee_user_id,
-            r.id              AS reimbursement_id,
-            r.status          AS reimbursement_status,
-            r.contract_id     AS reimbursement_contract_id,
+            c.assignee_principal_id,
+            r.id                    AS reimbursement_id,
+            r.status                AS reimbursement_status,
+            r.contract_id           AS reimbursement_contract_id,
             r.hauler_user_id,
             r.requester_user_id,
+            r.requester_principal_id,
             l.group_id
         FROM contracts c
         CROSS JOIN reimbursements r

@@ -599,6 +599,7 @@ dependencies = [
  "chrono",
  "rust_decimal",
  "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -1570,9 +1571,9 @@ dependencies = [
 
 [[package]]
 name = "nea-esi"
-version = "0.7.2"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a577d61a62386fdb364d6c1d20355dfe9d4299587a9ad2de33e3f56b79b020f6"
+checksum = "68309dbe545a3dc8203b1477f639e9bc8f8ffdcc94ff5ff4b8b577e2f981ba88"
 dependencies = [
  "base64",
  "chrono",

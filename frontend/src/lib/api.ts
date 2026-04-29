@@ -68,6 +68,9 @@ export type List = {
     status: ListStatus;
     total_estimate_isk: string;
     tip_pct: string;
+    /** Phase 7: corp-funded reimbursement payer, if set. */
+    payer_corp_id: string | null;
+    payer_division: number | null;
     created_at: string;
     updated_at: string;
 };
@@ -165,7 +168,8 @@ export type ContractSummary = {
 export type Reimbursement = {
     id: string;
     list_id: string;
-    requester_user_id: string;
+    /** Null when this is a corp-funded reimbursement (hauler paid by corp). */
+    requester_user_id: string | null;
     requester_display_name: string;
     hauler_user_id: string;
     hauler_display_name: string;
@@ -177,6 +181,10 @@ export type Reimbursement = {
     settled_by_user_id: string | null;
     contract_id: string | null;
     contract: ContractSummary | null;
+    /** Phase 7 fields */
+    is_corp_funded: boolean;
+    verified_by_wallet: boolean;
+    wallet_settlement_delta_isk: string | null;
     created_at: string;
     updated_at: string;
 };
@@ -279,6 +287,60 @@ export type PreviewResponse = {
     lines: PreviewLine[];
     unresolved_names: string[];
     errors: { line_no: number; raw: string; reason: string }[];
+};
+
+// ── Phase 7: corps ────────────────────────────────────────────────────────────
+
+export type Corp = {
+    id: string;
+    esi_corporation_id: number;
+    name: string;
+    ticker: string;
+    linked_by_user_id: string;
+    linked_at: string;
+    disabled_at: string | null;
+};
+
+export type CorpAmbassador = {
+    character_id: string;
+    character_name: string;
+    granted_scopes: string[];
+    last_used_at: string | null;
+    last_auth_error_at: string | null;
+    disabled_at: string | null;
+};
+
+export type CorpWalletDivision = {
+    division: number;
+    name?: string;
+    /** Null when the caller is not an ambassador or group owner. */
+    balance_isk: string | null;
+    last_synced_at: string | null;
+};
+
+export type CorpJournalEntry = {
+    id: string;
+    division: number;
+    esi_journal_ref_id: number;
+    date: string;
+    ref_type: string;
+    amount: string;
+    balance: string;
+    first_party_id: number | null;
+    second_party_id: number | null;
+    context_id: number | null;
+    context_id_type: string | null;
+    reason: string | null;
+    /** Only present if viewer is an ambassador or group owner. */
+    raw_json: unknown | null;
+};
+
+export type CorpDetail = {
+    corp: Corp;
+    ambassadors: CorpAmbassador[];
+    wallet_divisions: CorpWalletDivision[];
+    role: 'owner' | 'member';
+    is_ambassador: boolean;
 };
 
 export function fmtIsk(v: string | null | undefined): string {

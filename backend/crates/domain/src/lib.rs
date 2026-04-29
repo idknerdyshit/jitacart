@@ -8,6 +8,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 pub mod multibuy;
+pub mod principals;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -336,6 +337,10 @@ pub struct List {
     pub tip_pct: Decimal,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Phase 7: corp wallet funding source. When set, reimbursements on this
+    /// list are corp-funded (one per hauler, covering all items).
+    pub payer_corp_id: Option<Uuid>,
+    pub payer_division: Option<i16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,7 +415,9 @@ pub struct Fulfillment {
 pub struct Reimbursement {
     pub id: Uuid,
     pub list_id: Uuid,
-    pub requester_user_id: Uuid,
+    /// Deprecated (Phase 7): NULL for corp-funded reimbursements. Kept for
+    /// backward compatibility; use `requester_principal` instead.
+    pub requester_user_id: Option<Uuid>,
     pub requester_display_name: String,
     pub hauler_user_id: Uuid,
     pub hauler_display_name: String,
@@ -425,6 +432,12 @@ pub struct Reimbursement {
     pub contract: Option<ContractSummary>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    // Phase 7 additions
+    pub requester_principal_id: Uuid,
+    pub hauler_principal_id: Uuid,
+    pub is_corp_funded: bool,
+    pub verified_by_wallet: bool,
+    pub wallet_settlement_delta_isk: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,8 +600,10 @@ pub struct Contract {
     pub id: Uuid,
     pub esi_contract_id: i64,
     pub issuer_character_id: i64,
+    /// Deprecated (Phase 7): use `issuer_principal_id`. Kept for compatibility.
     pub issuer_user_id: Option<Uuid>,
     pub assignee_character_id: Option<i64>,
+    /// Deprecated (Phase 7): use `assignee_principal_id`. Kept for compatibility.
     pub assignee_user_id: Option<Uuid>,
     pub contract_type: ContractType,
     pub status: ContractStatus,
@@ -604,6 +619,11 @@ pub struct Contract {
     pub start_location_id: Option<i64>,
     pub end_location_id: Option<i64>,
     pub items_synced_at: Option<DateTime<Utc>>,
+    // Phase 7
+    pub issuer_principal_id: Option<Uuid>,
+    pub assignee_principal_id: Option<Uuid>,
+    pub wallet_verified_at: Option<DateTime<Utc>>,
+    pub wallet_payout_aggregate_isk: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -681,4 +701,126 @@ pub struct ListDetail {
 pub struct ResolvedType {
     pub type_id: i64,
     pub type_name: String,
+}
+
+// ── Phase 7: Corp principals ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrincipalKind {
+    User,
+    Corp,
+}
+
+impl PrincipalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrincipalKind::User => "user",
+            PrincipalKind::Corp => "corp",
+        }
+    }
+}
+
+impl fmt::Display for PrincipalKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PrincipalKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "user" => Ok(PrincipalKind::User),
+            "corp" => Ok(PrincipalKind::Corp),
+            other => Err(format!("unknown principal kind: {other}")),
+        }
+    }
+}
+
+/// Polymorphic principal — either a user or a corporation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Principal {
+    pub id: Uuid,
+    pub kind: PrincipalKind,
+    pub user_id: Option<Uuid>,
+    pub corp_id: Option<Uuid>,
+}
+
+/// In-memory lookup index built from a batch DB query.
+#[derive(Debug, Default)]
+pub struct PrincipalIndex {
+    /// EVE corporation id → corp UUID in our `corps` table.
+    pub corp_by_esi_id: std::collections::HashMap<i64, Uuid>,
+    /// EVE character id → user UUID in our `users` table.
+    pub user_by_character_id: std::collections::HashMap<i64, Uuid>,
+    /// principal row keyed by user_id.
+    pub principal_by_user_id: std::collections::HashMap<Uuid, Principal>,
+    /// principal row keyed by corp_id.
+    pub principal_by_corp_id: std::collections::HashMap<Uuid, Principal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Corp {
+    pub id: Uuid,
+    pub esi_corporation_id: i64,
+    pub name: String,
+    pub ticker: String,
+    pub last_synced_at: Option<DateTime<Utc>>,
+    pub last_auth_error_at: Option<DateTime<Utc>>,
+    pub disabled_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub contracts_next_poll_at: Option<DateTime<Utc>>,
+    pub contracts_last_polled_at: Option<DateTime<Utc>>,
+    pub wallet_next_poll_at: Option<DateTime<Utc>>,
+    pub wallet_last_polled_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupCorp {
+    pub group_id: Uuid,
+    pub corp_id: Uuid,
+    pub linked_at: DateTime<Utc>,
+    pub linked_by_user_id: Uuid,
+    pub unlinked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorpAmbassador {
+    pub corp_id: Uuid,
+    pub character_id: Uuid,
+    pub character_name: String,
+    pub granted_scopes: Vec<String>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub last_auth_error_at: Option<DateTime<Utc>>,
+    pub disabled_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorpWalletDivision {
+    pub corp_id: Uuid,
+    pub division: i16,
+    pub name: Option<String>,
+    pub balance_isk: Decimal,
+    pub last_synced_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorpWalletJournalEntry {
+    pub id: Uuid,
+    pub corp_id: Uuid,
+    pub division: i16,
+    pub esi_journal_ref_id: i64,
+    pub date: DateTime<Utc>,
+    pub ref_type: String,
+    pub amount: Decimal,
+    pub balance: Decimal,
+    pub first_party_id: Option<i64>,
+    pub second_party_id: Option<i64>,
+    pub context_id: Option<i64>,
+    pub context_id_type: Option<String>,
+    pub reason: Option<String>,
+    /// Only visible to ambassadors; stripped for other members.
+    pub raw_json: Option<serde_json::Value>,
+    pub first_seen_at: DateTime<Utc>,
 }

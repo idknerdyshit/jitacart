@@ -2,6 +2,7 @@ pub mod auth;
 pub mod citadels;
 pub mod config;
 pub mod contracts;
+pub mod corps;
 pub mod extract;
 pub mod fulfillment;
 pub mod groups;

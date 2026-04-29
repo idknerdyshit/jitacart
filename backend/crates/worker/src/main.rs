@@ -65,6 +65,11 @@ pub struct PollIntervals {
     pub citadel_orders: u64,
     #[serde(default = "default_structure_access_backoff_secs")]
     pub structure_access_backoff: u64,
+    // Phase 7
+    #[serde(default = "default_corp_contracts_secs")]
+    pub corp_contracts: u64,
+    #[serde(default = "default_corp_wallet_secs")]
+    pub corp_wallet: u64,
 }
 
 impl Default for PollIntervals {
@@ -76,6 +81,8 @@ impl Default for PollIntervals {
             citadel_details: default_citadel_details_secs(),
             citadel_orders: default_citadel_orders_secs(),
             structure_access_backoff: default_structure_access_backoff_secs(),
+            corp_contracts: default_corp_contracts_secs(),
+            corp_wallet: default_corp_wallet_secs(),
         }
     }
 }
@@ -98,6 +105,18 @@ fn default_citadel_orders_secs() -> u64 {
 fn default_structure_access_backoff_secs() -> u64 {
     86400
 }
+fn default_corp_contracts_secs() -> u64 {
+    300
+}
+fn default_corp_wallet_secs() -> u64 {
+    3600
+}
+fn default_corp_contracts_concurrency() -> usize {
+    2
+}
+fn default_corp_wallet_concurrency() -> usize {
+    2
+}
 
 #[derive(Debug, Deserialize)]
 pub struct WorkerSection {
@@ -111,6 +130,11 @@ pub struct WorkerSection {
     pub citadel_orders_concurrency: usize,
     #[serde(default = "default_contracts_concurrency")]
     pub contracts_concurrency: usize,
+    // Phase 7
+    #[serde(default = "default_corp_contracts_concurrency")]
+    pub corp_contracts_concurrency: usize,
+    #[serde(default = "default_corp_wallet_concurrency")]
+    pub corp_wallet_concurrency: usize,
 }
 
 impl Default for WorkerSection {
@@ -121,6 +145,8 @@ impl Default for WorkerSection {
             citadel_details_concurrency: default_citadel_details_concurrency(),
             citadel_orders_concurrency: default_citadel_orders_concurrency(),
             contracts_concurrency: default_contracts_concurrency(),
+            corp_contracts_concurrency: default_corp_contracts_concurrency(),
+            corp_wallet_concurrency: default_corp_wallet_concurrency(),
         }
     }
 }
@@ -207,12 +233,18 @@ async fn main() -> anyhow::Result<()> {
     // Contracts polls a per-character cursor, so we tick at the worker cadence
     // and let the cursor's `next_poll_at` decide which characters are due.
     let mut contracts = mk_interval(ctx.config.worker.tick_secs);
+    // Corp pollers also tick at worker cadence; their per-corp cursors decide
+    // which corps are due each tick.
+    let mut corp_contracts = mk_interval(ctx.config.worker.tick_secs);
+    let mut corp_wallet = mk_interval(ctx.config.worker.tick_secs);
     let mut budget_reset = mk_interval(60);
     let hub_prices_running = Arc::new(AtomicBool::new(false));
     let citadel_discovery_running = Arc::new(AtomicBool::new(false));
     let citadel_details_running = Arc::new(AtomicBool::new(false));
     let citadel_orders_running = Arc::new(AtomicBool::new(false));
     let contracts_running = Arc::new(AtomicBool::new(false));
+    let corp_contracts_running = Arc::new(AtomicBool::new(false));
+    let corp_wallet_running = Arc::new(AtomicBool::new(false));
 
     loop {
         tokio::select! {
@@ -230,6 +262,12 @@ async fn main() -> anyhow::Result<()> {
             }),
             _ = contracts.tick() => spawn_guarded(&ctx, &contracts_running, "contracts", |c| async move {
                 jobs::contracts::run(&c).await
+            }),
+            _ = corp_contracts.tick() => spawn_guarded(&ctx, &corp_contracts_running, "corp_contracts", |c| async move {
+                jobs::corp_contracts::run(&c).await
+            }),
+            _ = corp_wallet.tick() => spawn_guarded(&ctx, &corp_wallet_running, "corp_wallet", |c| async move {
+                jobs::corp_wallet::run(&c).await
             }),
             _ = budget_reset.tick() => ctx.budget.reset(),
         }

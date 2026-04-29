@@ -36,4 +36,6 @@ upgrade_scopes = [
     "esi-markets.structure_markets.v1",
     "esi-universe.read_structures.v1",
     "esi-contracts.read_character_contracts.v1",
+    "esi-contracts.read_corporation_contracts.v1",
+    "esi-wallet.read_corporation_wallets.v1",
 ]

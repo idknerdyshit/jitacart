@@ -33,9 +33,14 @@ pub enum SettlementError {
 pub struct ContractUpsert {
     pub esi_contract_id: i64,
     pub issuer_character_id: i64,
+    /// Deprecated (Phase 7): NULL for corp contracts. Kept for backward compat.
     pub issuer_user_id: Option<Uuid>,
     pub assignee_character_id: Option<i64>,
+    /// Deprecated (Phase 7): NULL for corp-assignee contracts. Kept for compat.
     pub assignee_user_id: Option<Uuid>,
+    // Phase 7: principal-id fields (may be None if resolution failed).
+    pub issuer_principal_id: Option<Uuid>,
+    pub assignee_principal_id: Option<Uuid>,
     pub contract_type: String,
     pub status: String,
     pub price_isk: Decimal,
@@ -48,6 +53,9 @@ pub struct ContractUpsert {
     pub start_location_id: Option<i64>,
     pub end_location_id: Option<i64>,
     pub raw_json: Value,
+    /// Corp that discovered this contract via the corp contracts endpoint.
+    /// None for character-discovered contracts.
+    pub source_corp_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +107,9 @@ pub async fn upsert_contract(
                 start_location_id     = $15,
                 end_location_id       = $16,
                 raw_json              = $17,
+                issuer_principal_id   = COALESCE($18, issuer_principal_id),
+                assignee_principal_id = COALESCE($19, assignee_principal_id),
+                source_corp_id        = COALESCE($20, source_corp_id),
                 updated_at            = now()
             WHERE id = $1
             "#,
@@ -120,6 +131,9 @@ pub async fn upsert_contract(
         .bind(upsert.start_location_id)
         .bind(upsert.end_location_id)
         .bind(&upsert.raw_json)
+        .bind(upsert.issuer_principal_id)
+        .bind(upsert.assignee_principal_id)
+        .bind(upsert.source_corp_id)
         .execute(&mut **tx)
         .await?;
 
@@ -135,12 +149,14 @@ pub async fn upsert_contract(
             INSERT INTO contracts (
                 esi_contract_id, issuer_character_id, issuer_user_id,
                 assignee_character_id, assignee_user_id,
+                issuer_principal_id, assignee_principal_id,
                 contract_type, status,
                 price_isk, reward_isk, collateral_isk,
                 date_issued, date_expired, date_accepted, date_completed,
-                start_location_id, end_location_id, raw_json
+                start_location_id, end_location_id, raw_json, source_corp_id
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                $13, $14, $15, $16, $17, $18, $19, $20
             )
             RETURNING id
             "#,
@@ -150,6 +166,8 @@ pub async fn upsert_contract(
         .bind(upsert.issuer_user_id)
         .bind(upsert.assignee_character_id)
         .bind(upsert.assignee_user_id)
+        .bind(upsert.issuer_principal_id)
+        .bind(upsert.assignee_principal_id)
         .bind(&upsert.contract_type)
         .bind(&upsert.status)
         .bind(upsert.price_isk)
@@ -162,6 +180,7 @@ pub async fn upsert_contract(
         .bind(upsert.start_location_id)
         .bind(upsert.end_location_id)
         .bind(&upsert.raw_json)
+        .bind(upsert.source_corp_id)
         .fetch_one(&mut **tx)
         .await?;
 
@@ -231,32 +250,38 @@ pub async fn settle_via_contract(
     }
 
     // Bulk-flip every list_item that any reimbursement bound to this contract
-    // covers. Mirrors flip_items_to_settled's per-triple guard but lifted into
-    // a single set-based UPDATE joining the contract's reimbursements.
+    // covers. Mode-aware:
+    // - Personal (is_corp_funded=false): filter by requested_by_user_id = requester.
+    // - Corp-funded (is_corp_funded=true): drop that filter (all items on the list).
     sqlx::query(
         r#"
         UPDATE list_items li
         SET status = 'settled'
         FROM reimbursements r
+        LEFT JOIN principals rp ON rp.id = r.requester_principal_id AND rp.kind = 'user'
         WHERE r.contract_id = $1
           AND li.list_id = r.list_id
-          AND li.requested_by_user_id = r.requester_user_id
+          AND (
+              r.is_corp_funded = true
+              OR li.requested_by_user_id = rp.user_id
+          )
           AND li.status IN ('bought', 'delivered')
           AND EXISTS (
               SELECT 1 FROM fulfillments f
+              JOIN principals hp ON hp.id = r.hauler_principal_id AND hp.kind = 'user'
               WHERE f.list_item_id = li.id
-                AND f.hauler_user_id = r.hauler_user_id
+                AND f.hauler_user_id = hp.user_id
                 AND f.reversed_at IS NULL
           )
           AND NOT EXISTS (
               SELECT 1 FROM reimbursements r2
+              JOIN principals hp2 ON hp2.id = r2.hauler_principal_id AND hp2.kind = 'user'
               JOIN fulfillments f2
                 ON f2.list_item_id = li.id
-               AND f2.hauler_user_id = r2.hauler_user_id
+               AND f2.hauler_user_id = hp2.user_id
                AND f2.reversed_at IS NULL
               WHERE r2.list_id = r.list_id
-                AND r2.requester_user_id = r.requester_user_id
-                AND r2.hauler_user_id <> r.hauler_user_id
+                AND r2.hauler_principal_id <> r.hauler_principal_id
                 AND r2.status = 'pending'
           )
         "#,
@@ -339,41 +364,64 @@ pub async fn settle_manual(
     reimbursement_id: Uuid,
     settled_by_user_id: Uuid,
 ) -> Result<(), SettlementError> {
-    let row: Option<(Uuid, Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT list_id, requester_user_id, hauler_user_id, status \
+    let row: Option<(Uuid, Option<Uuid>, Uuid, String, bool)> = sqlx::query_as(
+        "SELECT list_id, requester_user_id, hauler_user_id, status, is_corp_funded \
          FROM reimbursements WHERE id = $1 FOR UPDATE",
     )
     .bind(reimbursement_id)
     .fetch_optional(&mut **tx)
     .await?;
 
-    let (list_id, requester_user_id, hauler_user_id, status) =
+    let (list_id, requester_user_id, hauler_user_id, status, is_corp_funded) =
         row.ok_or(SettlementError::NotFound)?;
 
     if status != "pending" {
         return Err(SettlementError::NotPending(status));
     }
 
-    let not_delivered: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COUNT(DISTINCT li.id)
-        FROM list_items li
-        WHERE li.list_id = $1
-          AND li.requested_by_user_id = $2
-          AND li.status NOT IN ('delivered', 'settled')
-          AND EXISTS (
-              SELECT 1 FROM fulfillments f
-              WHERE f.list_item_id = li.id
-                AND f.hauler_user_id = $3
-                AND f.reversed_at IS NULL
-          )
-        "#,
-    )
-    .bind(list_id)
-    .bind(requester_user_id)
-    .bind(hauler_user_id)
-    .fetch_one(&mut **tx)
-    .await?;
+    // Mode-aware: corp-funded reimbursements cover all items on the list.
+    let not_delivered: i64 = if is_corp_funded {
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(DISTINCT li.id)
+            FROM list_items li
+            WHERE li.list_id = $1
+              AND li.status NOT IN ('delivered', 'settled')
+              AND EXISTS (
+                  SELECT 1 FROM fulfillments f
+                  WHERE f.list_item_id = li.id
+                    AND f.hauler_user_id = $2
+                    AND f.reversed_at IS NULL
+              )
+            "#,
+        )
+        .bind(list_id)
+        .bind(hauler_user_id)
+        .fetch_one(&mut **tx)
+        .await?
+    } else {
+        let req_uid = requester_user_id.ok_or(SettlementError::NotFound)?;
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(DISTINCT li.id)
+            FROM list_items li
+            WHERE li.list_id = $1
+              AND li.requested_by_user_id = $2
+              AND li.status NOT IN ('delivered', 'settled')
+              AND EXISTS (
+                  SELECT 1 FROM fulfillments f
+                  WHERE f.list_item_id = li.id
+                    AND f.hauler_user_id = $3
+                    AND f.reversed_at IS NULL
+              )
+            "#,
+        )
+        .bind(list_id)
+        .bind(req_uid)
+        .bind(hauler_user_id)
+        .fetch_one(&mut **tx)
+        .await?
+    };
 
     if not_delivered > 0 {
         return Err(SettlementError::NotDelivered {
@@ -391,7 +439,180 @@ pub async fn settle_manual(
     .execute(&mut **tx)
     .await?;
 
-    flip_items_to_settled(tx, list_id, requester_user_id, hauler_user_id, false).await?;
+    if is_corp_funded {
+        // Corp-funded: flip all hauler-fulfilled items on the list, but only
+        // when no other hauler still has a pending reimbursement on the same
+        // item (mirrors the guard in flip_items_to_settled / settle_via_contract).
+        sqlx::query(
+            r#"
+            UPDATE list_items li
+            SET status = 'settled'
+            WHERE li.list_id = $1
+              AND li.status = 'delivered'
+              AND EXISTS (
+                  SELECT 1 FROM fulfillments f
+                  WHERE f.list_item_id = li.id
+                    AND f.hauler_user_id = $2
+                    AND f.reversed_at IS NULL
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM reimbursements r2
+                  JOIN fulfillments f2
+                    ON f2.list_item_id = li.id
+                   AND f2.hauler_user_id = r2.hauler_user_id
+                   AND f2.reversed_at IS NULL
+                  WHERE r2.list_id = $1
+                    AND r2.hauler_user_id <> $2
+                    AND r2.status = 'pending'
+              )
+            "#,
+        )
+        .bind(list_id)
+        .bind(hauler_user_id)
+        .execute(&mut **tx)
+        .await?;
+    } else {
+        let req_uid = requester_user_id.ok_or(SettlementError::NotFound)?;
+        flip_items_to_settled(tx, list_id, req_uid, hauler_user_id, false).await?;
+    }
+
+    Ok(())
+}
+
+/// Wallet verification (Phase 7, audit-only).
+///
+/// Looks up the ESI contract id, sums `corp_wallet_journal.amount` for
+/// `ref_type = 'contract_price'` entries that reference this contract, then:
+/// - Sets `contracts.wallet_verified_at` and `wallet_payout_aggregate_isk`.
+/// - For each reimbursement bound to this contract, sets `verified_by_wallet =
+///   true` and computes a per-reimbursement `wallet_settlement_delta_isk`.
+///
+/// If no journal rows match (not yet visible), does nothing — no error.
+pub async fn verify_contract_against_journal(
+    pool: &sqlx::PgPool,
+    contract_id: Uuid,
+) -> Result<(), SettlementError> {
+    // Fetch esi_contract_id and price_isk for this contract.
+    let row: Option<(i64, Decimal)> = sqlx::query_as(
+        "SELECT esi_contract_id, price_isk FROM contracts WHERE id = $1",
+    )
+    .bind(contract_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let (esi_contract_id, _price_isk) = match row {
+        Some(r) => r,
+        None => return Ok(()), // Unknown contract.
+    };
+
+    // Resolve the payer corp and division from the list linked via
+    // reimbursements so we only count journal entries from the correct wallet.
+    let payer: Option<(Uuid, i16)> = sqlx::query_as(
+        "SELECT l.payer_corp_id, l.payer_division \
+         FROM reimbursements r \
+         JOIN lists l ON l.id = r.list_id \
+         WHERE r.contract_id = $1 \
+           AND l.payer_corp_id IS NOT NULL \
+         LIMIT 1",
+    )
+    .bind(contract_id)
+    .fetch_optional(pool)
+    .await?;
+
+    // Sum journal entries for this ESI contract_id (contract_price ref_type only),
+    // scoped to the payer corp + division when known, otherwise to the discovering
+    // corp to prevent double-counting when both sides' wallets are linked.
+    let payout_sum: Option<Decimal> = match payer {
+        Some((corp_id, division)) => {
+            sqlx::query_scalar(
+                r#"
+                SELECT SUM(ABS(amount))
+                FROM corp_wallet_journal
+                WHERE context_id = $1
+                  AND context_id_type = 'contract_id'
+                  AND ref_type = 'contract_price'
+                  AND corp_id = $2
+                  AND division = $3
+                "#,
+            )
+            .bind(esi_contract_id)
+            .bind(corp_id)
+            .bind(division)
+            .fetch_one(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_scalar(
+                r#"
+                SELECT SUM(ABS(j.amount))
+                FROM corp_wallet_journal j
+                JOIN contracts c ON c.esi_contract_id = j.context_id
+                WHERE j.context_id = $1
+                  AND j.context_id_type = 'contract_id'
+                  AND j.ref_type = 'contract_price'
+                  AND j.corp_id = COALESCE(c.source_corp_id, j.corp_id)
+                "#,
+            )
+            .bind(esi_contract_id)
+            .fetch_one(pool)
+            .await?
+        }
+    };
+
+    let payout_aggregate = match payout_sum {
+        Some(v) if v > Decimal::ZERO => v,
+        _ => return Ok(()), // No journal rows yet; leave unverified.
+    };
+
+    // Stamp the contract.
+    sqlx::query(
+        "UPDATE contracts \
+         SET wallet_verified_at = now(), \
+             wallet_payout_aggregate_isk = $2, \
+             updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(contract_id)
+    .bind(payout_aggregate)
+    .execute(pool)
+    .await?;
+
+    // Fetch all pending/settled reimbursements bound to this contract.
+    let reimbs: Vec<(Uuid, Decimal)> = sqlx::query_as(
+        "SELECT id, total_isk FROM reimbursements \
+         WHERE contract_id = $1 AND status IN ('pending','settled')",
+    )
+    .bind(contract_id)
+    .fetch_all(pool)
+    .await?;
+
+    if reimbs.is_empty() {
+        return Ok(());
+    }
+
+    let total_reimb_sum: Decimal = reimbs.iter().map(|(_, t)| *t).sum();
+
+    for (reimb_id, total_isk) in reimbs {
+        let share = if total_reimb_sum > Decimal::ZERO {
+            payout_aggregate * total_isk / total_reimb_sum
+        } else {
+            Decimal::ZERO
+        };
+        let share = share.round_dp(2);
+        let delta = share - total_isk;
+
+        sqlx::query(
+            "UPDATE reimbursements \
+             SET verified_by_wallet = true, \
+                 wallet_settlement_delta_isk = $2, \
+                 updated_at = now() \
+             WHERE id = $1",
+        )
+        .bind(reimb_id)
+        .bind(delta)
+        .execute(pool)
+        .await?;
+    }
 
     Ok(())
 }

@@ -431,12 +431,27 @@ async fn record_fulfillment(
     }
 
     // Reject if a non-pending reimbursement already exists for this
-    // (list, requester, hauler) cycle: we'd have no place to attach the new
-    // fulfillment, and reversal of past fulfillments is also blocked once
-    // the row is settled. See `upsert_reimbursement` and `reverse_fulfillment`.
+    // (list, requester-principal, hauler-principal) cycle: we'd have no place
+    // to attach the new fulfillment, and reversal of past fulfillments is also
+    // blocked once the row is settled. Resolve principals from the list's payer
+    // so the lookup key matches what `upsert_reimbursement` will write.
     let existing_reimb_status: Option<String> = sqlx::query_scalar(
-        "SELECT status FROM reimbursements \
-         WHERE list_id = $1 AND requester_user_id = $2 AND hauler_user_id = $3",
+        r#"
+        SELECT r.status FROM reimbursements r
+        WHERE r.list_id = $1
+          AND r.requester_principal_id = (
+                SELECT p.id FROM lists l
+                JOIN principals p ON (
+                    (l.payer_corp_id IS NULL     AND p.kind = 'user' AND p.user_id = $2)
+                 OR (l.payer_corp_id IS NOT NULL AND p.kind = 'corp' AND p.corp_id = l.payer_corp_id)
+                )
+                WHERE l.id = $1
+                LIMIT 1
+          )
+          AND r.hauler_principal_id = (
+                SELECT id FROM principals WHERE kind = 'user' AND user_id = $3
+          )
+        "#,
     )
     .bind(list_id)
     .bind(requested_by_user_id)
@@ -628,10 +643,25 @@ async fn reverse_fulfillment(
     let mut tx = state.pool.begin().await.map_err(internal)?;
     lock_list(&mut tx, list_id).await?;
 
-    // Check reimbursement is not settled
+    // Check reimbursement is not settled; resolve principals from the list's
+    // payer so the lookup key matches what `upsert_reimbursement` wrote.
     let reimb_status: Option<String> = sqlx::query_scalar(
-        "SELECT status FROM reimbursements \
-         WHERE list_id = $1 AND requester_user_id = $2 AND hauler_user_id = $3",
+        r#"
+        SELECT r.status FROM reimbursements r
+        WHERE r.list_id = $1
+          AND r.requester_principal_id = (
+                SELECT p.id FROM lists l
+                JOIN principals p ON (
+                    (l.payer_corp_id IS NULL     AND p.kind = 'user' AND p.user_id = $2)
+                 OR (l.payer_corp_id IS NOT NULL AND p.kind = 'corp' AND p.corp_id = l.payer_corp_id)
+                )
+                WHERE l.id = $1
+                LIMIT 1
+          )
+          AND r.hauler_principal_id = (
+                SELECT id FROM principals WHERE kind = 'user' AND user_id = $3
+          )
+        "#,
     )
     .bind(list_id)
     .bind(requested_by_user_id)
@@ -825,8 +855,16 @@ async fn settle_reimbursement(
     CurrentUser(user_id): CurrentUser,
 ) -> Result<Json<ListDetail>, FulfillmentError> {
     // Load reimbursement (also for permission checks).
-    let row: Option<(Uuid, Uuid, Uuid, String, Option<Uuid>)> = sqlx::query_as(
-        "SELECT list_id, requester_user_id, hauler_user_id, status, contract_id \
+    // requester_user_id is nullable for corp-funded rows.
+    #[derive(sqlx::FromRow)]
+    struct ReimbRow {
+        list_id: Uuid,
+        requester_user_id: Option<Uuid>,
+        status: String,
+        contract_id: Option<Uuid>,
+    }
+    let row: Option<ReimbRow> = sqlx::query_as(
+        "SELECT list_id, requester_user_id, status, contract_id \
          FROM reimbursements WHERE id = $1",
     )
     .bind(reimb_id)
@@ -834,15 +872,16 @@ async fn settle_reimbursement(
     .await
     .map_err(internal)?;
 
-    let (list_id, requester_user_id, _hauler_user_id, status_str, contract_id) =
-        row.ok_or(FulfillmentError::NotFound)?;
-    let reimb_status: ReimbursementStatus = status_str
+    let r = row.ok_or(FulfillmentError::NotFound)?;
+    let (list_id, requester_user_id, contract_id) = (r.list_id, r.requester_user_id, r.contract_id);
+    let reimb_status: ReimbursementStatus = r
+        .status
         .parse()
         .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
 
     if reimb_status != ReimbursementStatus::Pending {
         return Err(FulfillmentError::Conflict(format!(
-            "reimbursement is already {status_str}"
+            "reimbursement is already {}", r.status
         )));
     }
 
@@ -874,7 +913,8 @@ async fn settle_reimbursement(
         .parse()
         .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
 
-    let is_requester = user_id == requester_user_id;
+    // Corp-funded reimbursements have no user requester; only owners can settle.
+    let is_requester = requester_user_id == Some(user_id);
     let is_owner = role == GroupRole::Owner;
 
     if !is_requester && !is_owner {
@@ -1123,6 +1163,8 @@ async fn recompute_item_statuses_bulk(
 }
 
 /// Upsert (or recompute) the pending reimbursement row for (list, requester, hauler).
+/// Resolves principal IDs from the list's payer_corp_id: corp-funded lists use the
+/// corp principal as requester; personal lists use the item requester's user principal.
 /// Never touches settled rows.
 async fn upsert_reimbursement(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1132,29 +1174,49 @@ async fn upsert_reimbursement(
 ) -> Result<(), FulfillmentError> {
     sqlx::query(
         r#"
-        WITH s AS (
+        WITH meta AS (
+            SELECT tip_pct, payer_corp_id FROM lists WHERE id = $1
+        ),
+        hauler_p AS (
+            SELECT id FROM principals WHERE kind = 'user' AND user_id = $3
+        ),
+        requester_p AS (
+            SELECT p.id,
+                   (m.payer_corp_id IS NOT NULL)                                        AS is_corp_funded,
+                   CASE WHEN m.payer_corp_id IS NULL THEN $2::uuid ELSE NULL END        AS req_user_id
+            FROM meta m
+            JOIN principals p ON (
+                    (m.payer_corp_id IS NULL     AND p.kind = 'user' AND p.user_id = $2)
+                 OR (m.payer_corp_id IS NOT NULL AND p.kind = 'corp' AND p.corp_id  = m.payer_corp_id)
+            )
+        ),
+        subtotal AS (
             SELECT COALESCE(SUM(f.qty * f.unit_price_isk), 0) AS subtotal
             FROM fulfillments f
-            JOIN list_items li ON li.id = f.list_item_id
-            WHERE li.list_id = $1
-              AND li.requested_by_user_id = $2
+            JOIN list_items   li ON li.id = f.list_item_id
+            CROSS JOIN requester_p rp
+            WHERE li.list_id      = $1
               AND f.hauler_user_id = $3
-              AND f.reversed_at IS NULL
-        ),
-        t AS (SELECT tip_pct FROM lists WHERE id = $1)
+              AND f.reversed_at   IS NULL
+              AND (rp.is_corp_funded OR li.requested_by_user_id = $2)
+        )
         INSERT INTO reimbursements
-            (list_id, requester_user_id, hauler_user_id, subtotal_isk, tip_isk, total_isk)
-        SELECT $1, $2, $3,
+            (list_id, requester_user_id, hauler_user_id,
+             requester_principal_id, hauler_principal_id, is_corp_funded,
+             subtotal_isk, tip_isk, total_isk)
+        SELECT $1, rp.req_user_id, $3, rp.id, hp.id, rp.is_corp_funded,
                s.subtotal,
-               s.subtotal * t.tip_pct,
-               s.subtotal * (1 + t.tip_pct)
-        FROM s, t
-        ON CONFLICT (list_id, requester_user_id, hauler_user_id) DO UPDATE
+               s.subtotal * m.tip_pct,
+               s.subtotal * (1 + m.tip_pct)
+        FROM subtotal s, meta m, requester_p rp, hauler_p hp
+        ON CONFLICT (list_id, requester_principal_id, hauler_principal_id)
+            WHERE status <> 'cancelled'
+        DO UPDATE
             SET subtotal_isk = EXCLUDED.subtotal_isk,
                 tip_isk      = EXCLUDED.tip_isk,
                 total_isk    = EXCLUDED.total_isk,
                 updated_at   = now()
-            WHERE reimbursements.status = 'pending'
+          WHERE reimbursements.status = 'pending'
         "#,
     )
     .bind(list_id)

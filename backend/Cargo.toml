@@ -60,7 +60,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # auth / crypto
-nea-esi = "0.7"
+nea-esi = "0.8.1"
 tower-sessions = "0.14"
 tower-sessions-sqlx-store = { version = "0.15", features = ["postgres"] }
 jsonwebtoken = "10"

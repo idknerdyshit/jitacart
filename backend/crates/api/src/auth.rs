@@ -143,12 +143,21 @@ async fn upgrade(
         }
     }
 
-    // EVE SSO replaces the granted set on each consent — always include base
-    // scopes so we don't accidentally drop e.g. `publicData`.
-    let mut all: std::collections::BTreeSet<String> = cfg.login_scopes.iter().cloned().collect();
-    for s in &requested {
-        all.insert(s.clone());
-    }
+    // EVE SSO replaces the granted set on each consent — always include:
+    //   (a) base login_scopes so we don't drop `publicData`,
+    //   (b) any scopes the character already holds so a corp-scope upgrade
+    //       doesn't silently revoke e.g. `esi-markets.structure_markets.v1`.
+    let existing_scopes: Vec<String> = sqlx::query_scalar(
+        "SELECT scopes FROM characters WHERE character_id = $1 AND user_id = $2",
+    )
+    .bind(q.character_id)
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?
+    .unwrap_or_default();
+
+    let all = merge_upgrade_scopes(&cfg.login_scopes, &existing_scopes, &requested);
     let scopes_vec: Vec<&str> = all.iter().map(String::as_str).collect();
 
     let challenge: PkceChallenge = state
@@ -162,7 +171,7 @@ async fn upgrade(
         attach: true,
         return_to: safe_return_to(q.return_to),
         target_character_id: Some(q.character_id),
-        requested_scopes: all.into_iter().collect(),
+        requested_scopes: all,
     };
     session
         .insert(SESSION_KEY_PENDING, &pending)
@@ -404,11 +413,42 @@ async fn create_user(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     display_name: &str,
 ) -> anyhow::Result<Uuid> {
-    sqlx::query_scalar("INSERT INTO users (display_name) VALUES ($1) RETURNING id")
-        .bind(display_name)
-        .fetch_one(&mut **tx)
-        .await
-        .context("creating user")
+    let user_id: Uuid =
+        sqlx::query_scalar("INSERT INTO users (display_name) VALUES ($1) RETURNING id")
+            .bind(display_name)
+            .fetch_one(&mut **tx)
+            .await
+            .context("creating user")?;
+
+    sqlx::query(
+        "INSERT INTO principals (kind, user_id) VALUES ('user', $1) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await
+    .context("creating user principal")?;
+
+    Ok(user_id)
+}
+
+/// Merge login scopes, existing character scopes, and the newly requested
+/// scopes into a deduplicated sorted set. Extracted for unit-testing the
+/// granted-set regression fix.
+pub fn merge_upgrade_scopes(
+    login_scopes: &[String],
+    existing_character_scopes: &[String],
+    requested: &[String],
+) -> Vec<String> {
+    let mut all: std::collections::BTreeSet<String> =
+        login_scopes.iter().cloned().collect();
+    for s in existing_character_scopes {
+        all.insert(s.clone());
+    }
+    for s in requested {
+        all.insert(s.clone());
+    }
+    all.into_iter().collect()
 }
 
 fn safe_return_to(return_to: Option<String>) -> Option<String> {
@@ -450,5 +490,59 @@ impl IntoResponse for AuthError {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sv(scopes: &[&str]) -> Vec<String> {
+        scopes.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Regression: upgrading to corp scopes must not drop already-granted
+    /// market scopes — or anything else the character already held.
+    #[test]
+    fn merge_preserves_existing_scopes() {
+        let login = sv(&["publicData"]);
+        let existing = sv(&[
+            "publicData",
+            "esi-markets.structure_markets.v1",
+            "esi-contracts.read_character_contracts.v1",
+        ]);
+        let requested = sv(&[
+            "esi-contracts.read_corporation_contracts.v1",
+            "esi-wallet.read_corporation_wallets.v1",
+        ]);
+        let merged = merge_upgrade_scopes(&login, &existing, &requested);
+        // All three origin-sets must be present in the output.
+        for s in existing.iter().chain(requested.iter()) {
+            assert!(
+                merged.contains(s),
+                "scope {s} missing from merged set: {merged:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_deduplicates() {
+        let login = sv(&["publicData"]);
+        let existing = sv(&["publicData", "esi-contracts.read_character_contracts.v1"]);
+        let requested = sv(&["publicData"]);
+        let merged = merge_upgrade_scopes(&login, &existing, &requested);
+        let count = merged.iter().filter(|s| s.as_str() == "publicData").count();
+        assert_eq!(count, 1, "publicData should appear exactly once");
+    }
+
+    #[test]
+    fn merge_is_sorted() {
+        let login = sv(&["zzz"]);
+        let existing = sv(&["aaa", "mmm"]);
+        let requested = sv(&["bbb"]);
+        let merged = merge_upgrade_scopes(&login, &existing, &requested);
+        let mut sorted = merged.clone();
+        sorted.sort();
+        assert_eq!(merged, sorted, "output should be lexicographically sorted");
     }
 }

@@ -18,8 +18,8 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use auth_tokens::{CharacterTokenStore, EsiBudgetGuard, TokenCipher};
 
 use jitacart_api::{
-    auth, citadels, config::Config, contracts, fulfillment, groups, jwt::JwksCache, lists, markets,
-    state::AppState,
+    auth, citadels, config::Config, contracts, corps, fulfillment, groups, jwt::JwksCache, lists,
+    markets, state::AppState,
 };
 
 #[tokio::main]
@@ -111,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(citadels::router())
         .merge(fulfillment::router())
         .merge(contracts::router())
+        .merge(corps::router())
         .with_state(state)
         .layer(session_layer)
         .layer(TraceLayer::new_for_http());

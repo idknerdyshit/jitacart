@@ -1,6 +1,13 @@
 <script lang="ts">
+    import { untrack } from 'svelte';
     import { api, findViewerClaim } from '$lib/api';
     import type { ListDetail, ListItem } from '$lib/api';
+    import {
+        viewerCharacters,
+        characterHasContractsScope,
+        CONTRACTS_SCOPE,
+        type ViewerCharacter
+    } from '$lib/stores/me';
 
     interface Props {
         item: ListItem;
@@ -11,21 +18,31 @@
 
     const { item, detail, onUpdate, onClose }: Props = $props();
 
-    // Characters for the viewer (inferred from detail: we don't have a full character list here,
-    // so we only offer the last-used one as default and an "other character id" free input)
     const remaining = $derived(item.qty_requested - item.qty_fulfilled);
 
-    let qty = $state(remaining);
+    let qty = $state(untrack(() => remaining));
     let unitPrice = $state('');
     let selectedMarketId = $state<string | null>(null);
     let otherNote = $state('');
     let useOther = $state(false);
-    let charId = $state<string>(detail.last_hauler_character_id ?? '');
+    let charId = $state<string>(untrack(() => detail.last_hauler_character_id ?? ''));
 
     let busy = $state(false);
     let errMsg = $state<string | null>(null);
 
     const viewerClaim = $derived(findViewerClaim(detail));
+
+    const characters = $derived($viewerCharacters);
+    const selectedCharacter = $derived<ViewerCharacter | undefined>(
+        characters.find((c) => c.id === charId)
+    );
+    const upgradeUrl = $derived(
+        selectedCharacter
+            ? `/api/auth/eve/upgrade?character_id=${selectedCharacter.character_id}` +
+                  `&scopes=${encodeURIComponent(CONTRACTS_SCOPE)}` +
+                  `&return_to=${encodeURIComponent(window.location.pathname)}`
+            : '#'
+    );
 
     const canSubmit = $derived(
         qty > 0 &&
@@ -133,13 +150,23 @@
         </div>
 
         <label>
-            Your character ID (optional)
-            <input
-                type="text"
-                placeholder="{detail.last_hauler_character_id ?? 'no default set'}"
-                bind:value={charId}
-            />
+            Your character
+            <select bind:value={charId}>
+                <option value="">— none —</option>
+                {#each characters as c (c.id)}
+                    <option value={c.id}>
+                        {c.character_name}
+                        {characterHasContractsScope(c) ? '✓ contracts' : ''}
+                    </option>
+                {/each}
+            </select>
         </label>
+        {#if selectedCharacter && !characterHasContractsScope(selectedCharacter)}
+            <p class="warn">
+                Add the contracts scope so JitaCart can auto-settle this for you.
+                <a href={upgradeUrl}>Upgrade →</a>
+            </p>
+        {/if}
 
         <div class="actions">
             <button class="primary" disabled={!canSubmit || busy} onclick={submit}>
@@ -231,7 +258,8 @@
         cursor: not-allowed;
     }
     input[type='text'],
-    input[type='number'] {
+    input[type='number'],
+    select {
         background: #0d1117;
         color: #e6edf3;
         border: 1px solid #30363d;

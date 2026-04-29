@@ -12,6 +12,22 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     return res.status === 204 ? (undefined as T) : res.json();
 }
 
+export type ViewerCharacter = {
+    id: string;
+    character_id: number;
+    character_name: string;
+    owner_hash: string;
+    scopes: string[];
+    access_token_expires_at: string | null;
+    created_at: string;
+    last_refreshed_at: string | null;
+};
+
+export type Me = {
+    user: { id: string; display_name: string; created_at: string };
+    characters: ViewerCharacter[];
+};
+
 export type Market = {
     id: string;
     kind: 'npc_hub' | 'public_structure';
@@ -117,6 +133,35 @@ export type Fulfillment = {
 
 export type ReimbursementStatus = 'pending' | 'settled' | 'cancelled';
 
+export type ContractStatus =
+    | 'outstanding'
+    | 'in_progress'
+    | 'finished_issuer'
+    | 'finished_contractor'
+    | 'finished'
+    | 'cancelled'
+    | 'rejected'
+    | 'failed'
+    | 'deleted'
+    | 'reversed';
+
+export function isContractTerminalSuccess(s: ContractStatus | null | undefined): boolean {
+    return s === 'finished' || s === 'finished_issuer' || s === 'finished_contractor';
+}
+
+export function isContractTerminalFailure(s: ContractStatus | null | undefined): boolean {
+    return s === 'cancelled' || s === 'rejected' || s === 'failed' || s === 'deleted' || s === 'reversed';
+}
+
+export type ContractSummary = {
+    esi_contract_id: number;
+    status: ContractStatus;
+    price_isk: string;
+    expected_total_isk: string | null;
+    settlement_delta_isk: string | null;
+    date_completed: string | null;
+};
+
 export type Reimbursement = {
     id: string;
     list_id: string;
@@ -131,8 +176,40 @@ export type Reimbursement = {
     settled_at: string | null;
     settled_by_user_id: string | null;
     contract_id: string | null;
+    contract: ContractSummary | null;
     created_at: string;
     updated_at: string;
+};
+
+export type ContractSuggestion = {
+    id: string;
+    contract_id: string;
+    esi_contract_id: number;
+    contract_status: ContractStatus;
+    contract_price_isk: string;
+    contract_expected_total_isk: string | null;
+    reimbursement_id: string;
+    list_id: string;
+    list_destination_label: string | null;
+    requester_display_name: string;
+    hauler_display_name: string;
+    reimbursement_total_isk: string;
+    score: string;
+    exact_match: boolean;
+    state: 'pending' | 'confirmed' | 'rejected' | 'superseded';
+    created_at: string;
+    decided_at: string | null;
+};
+
+export type BoundContract = {
+    contract_id: string;
+    esi_contract_id: number;
+    status: ContractStatus;
+    price_isk: string;
+    expected_total_isk: string | null;
+    settlement_delta_isk: string | null;
+    date_completed: string | null;
+    bound_reimbursement_count: number;
 };
 
 export type ListDetail = {
@@ -216,6 +293,14 @@ export function fmtPct(v: string | null | undefined): string {
     const n = Number(v) * 100;
     if (!isFinite(n)) return v;
     return n.toLocaleString('en-US', { maximumFractionDigits: 2 }) + '%';
+}
+
+export function deltaClass(d: string | null | undefined): '' | 'pos' | 'neg' {
+    if (!d) return '';
+    const n = Number(d);
+    if (n > 0) return 'pos';
+    if (n < 0) return 'neg';
+    return '';
 }
 
 export function findViewerClaim(detail: ListDetail): Claim | null {

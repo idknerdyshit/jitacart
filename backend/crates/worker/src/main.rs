@@ -55,6 +55,8 @@ pub struct EveSsoCfg {
 pub struct PollIntervals {
     #[serde(default = "default_market_prices_secs")]
     pub market_prices: u64,
+    #[serde(default = "default_contracts_secs")]
+    pub contracts: u64,
     #[serde(default = "default_citadel_discovery_secs")]
     pub citadel_discovery: u64,
     #[serde(default = "default_citadel_details_secs")]
@@ -69,6 +71,7 @@ impl Default for PollIntervals {
     fn default() -> Self {
         Self {
             market_prices: default_market_prices_secs(),
+            contracts: default_contracts_secs(),
             citadel_discovery: default_citadel_discovery_secs(),
             citadel_details: default_citadel_details_secs(),
             citadel_orders: default_citadel_orders_secs(),
@@ -78,6 +81,9 @@ impl Default for PollIntervals {
 }
 
 fn default_market_prices_secs() -> u64 {
+    300
+}
+fn default_contracts_secs() -> u64 {
     300
 }
 fn default_citadel_discovery_secs() -> u64 {
@@ -103,6 +109,8 @@ pub struct WorkerSection {
     pub citadel_details_concurrency: usize,
     #[serde(default = "default_citadel_orders_concurrency")]
     pub citadel_orders_concurrency: usize,
+    #[serde(default = "default_contracts_concurrency")]
+    pub contracts_concurrency: usize,
 }
 
 impl Default for WorkerSection {
@@ -112,6 +120,7 @@ impl Default for WorkerSection {
             citadel_discovery_missing_threshold: default_citadel_discovery_missing_threshold(),
             citadel_details_concurrency: default_citadel_details_concurrency(),
             citadel_orders_concurrency: default_citadel_orders_concurrency(),
+            contracts_concurrency: default_contracts_concurrency(),
         }
     }
 }
@@ -127,6 +136,9 @@ fn default_citadel_details_concurrency() -> usize {
 }
 fn default_citadel_orders_concurrency() -> usize {
     8
+}
+fn default_contracts_concurrency() -> usize {
+    4
 }
 
 pub struct Ctx {
@@ -192,11 +204,15 @@ async fn main() -> anyhow::Result<()> {
     let mut citadel_discovery = mk_interval(intervals.citadel_discovery);
     let mut citadel_details = mk_interval(intervals.citadel_details.min(300));
     let mut citadel_orders = mk_interval(intervals.citadel_orders);
+    // Contracts polls a per-character cursor, so we tick at the worker cadence
+    // and let the cursor's `next_poll_at` decide which characters are due.
+    let mut contracts = mk_interval(ctx.config.worker.tick_secs);
     let mut budget_reset = mk_interval(60);
     let hub_prices_running = Arc::new(AtomicBool::new(false));
     let citadel_discovery_running = Arc::new(AtomicBool::new(false));
     let citadel_details_running = Arc::new(AtomicBool::new(false));
     let citadel_orders_running = Arc::new(AtomicBool::new(false));
+    let contracts_running = Arc::new(AtomicBool::new(false));
 
     loop {
         tokio::select! {
@@ -211,6 +227,9 @@ async fn main() -> anyhow::Result<()> {
             }),
             _ = citadel_orders.tick() => spawn_guarded(&ctx, &citadel_orders_running, "citadel_orders", |c| async move {
                 jobs::citadel_orders::run(&c).await
+            }),
+            _ = contracts.tick() => spawn_guarded(&ctx, &contracts_running, "contracts", |c| async move {
+                jobs::contracts::run(&c).await
             }),
             _ = budget_reset.tick() => ctx.budget.reset(),
         }

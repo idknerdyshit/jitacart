@@ -1303,6 +1303,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "settlement",
  "sqlx",
  "thiserror 2.0.18",
  "time",
@@ -1329,8 +1330,12 @@ dependencies = [
  "futures-util",
  "market",
  "nea-esi",
+ "rand 0.8.6",
+ "rust_decimal",
  "secrecy",
  "serde",
+ "serde_json",
+ "settlement",
  "sqlx",
  "tokio",
  "tracing",
@@ -2465,6 +2470,22 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "settlement"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "domain",
+ "rust_decimal",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

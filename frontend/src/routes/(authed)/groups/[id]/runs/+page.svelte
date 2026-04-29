@@ -1,12 +1,18 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { page } from '$app/state';
-    import { api, fmtIsk, type RunSummary } from '$lib/api';
+    import {
+        api,
+        fmtIsk,
+        type RunSummary,
+        type ContractSuggestion
+    } from '$lib/api';
 
     const groupId = $derived(page.params.id);
 
     let runs = $state<RunSummary[] | null>(null);
     let error = $state<string | null>(null);
+    let pendingContracts = $state<number>(0);
 
     async function load() {
         error = null;
@@ -14,6 +20,14 @@
             runs = await api<RunSummary[]>(`/groups/${groupId}/runs`);
         } catch (e) {
             error = (e as Error).message;
+        }
+        try {
+            const s = await api<ContractSuggestion[]>(
+                `/groups/${groupId}/contracts/suggestions`
+            );
+            pendingContracts = s.filter((x) => x.state === 'pending').length;
+        } catch {
+            // non-fatal
         }
     }
 
@@ -33,7 +47,14 @@
 </script>
 
 <p><a href={`/groups/${groupId}`}>← Group</a></p>
-<h1>Available runs</h1>
+<div class="header">
+    <h1>Available runs</h1>
+    {#if pendingContracts > 0}
+        <a class="contracts-chip" href={`/groups/${groupId}/contracts`}>
+            {pendingContracts} pending contract match{pendingContracts === 1 ? '' : 'es'}
+        </a>
+    {/if}
+</div>
 
 {#if error}
     <p style="color: #f87171">{error}</p>
@@ -143,5 +164,20 @@
     }
     .muted {
         color: #8b949e;
+    }
+    .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 1rem;
+    }
+    .contracts-chip {
+        background: #1f2937;
+        border: 1px solid #2f6feb;
+        color: #79c0ff;
+        padding: 0.3rem 0.7rem;
+        border-radius: 999px;
+        text-decoration: none;
+        font-size: 0.85rem;
     }
 </style>

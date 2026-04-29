@@ -824,9 +824,9 @@ async fn settle_reimbursement(
     Path(reimb_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
 ) -> Result<Json<ListDetail>, FulfillmentError> {
-    // Load reimbursement
-    let row: Option<(Uuid, Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT list_id, requester_user_id, hauler_user_id, status \
+    // Load reimbursement (also for permission checks).
+    let row: Option<(Uuid, Uuid, Uuid, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT list_id, requester_user_id, hauler_user_id, status, contract_id \
          FROM reimbursements WHERE id = $1",
     )
     .bind(reimb_id)
@@ -834,7 +834,7 @@ async fn settle_reimbursement(
     .await
     .map_err(internal)?;
 
-    let (list_id, requester_user_id, hauler_user_id, status_str) =
+    let (list_id, requester_user_id, _hauler_user_id, status_str, contract_id) =
         row.ok_or(FulfillmentError::NotFound)?;
     let reimb_status: ReimbursementStatus = status_str
         .parse()
@@ -844,6 +844,14 @@ async fn settle_reimbursement(
         return Err(FulfillmentError::Conflict(format!(
             "reimbursement is already {status_str}"
         )));
+    }
+
+    // Bound to a contract: ESI is the source of truth, manual settle would
+    // race with the worker. Hauler must explicitly unlink first.
+    if contract_id.is_some() {
+        return Err(FulfillmentError::Conflict(
+            "this reimbursement is bound to a contract; unlink it before settling manually".into(),
+        ));
     }
 
     // Check group membership and permissions. Only the requester (whose debt
@@ -876,100 +884,18 @@ async fn settle_reimbursement(
     let mut tx = state.pool.begin().await.map_err(internal)?;
     lock_list(&mut tx, list_id).await?;
 
-    // Re-check status under lock
-    let locked_status_str: String =
-        sqlx::query_scalar("SELECT status FROM reimbursements WHERE id = $1 FOR UPDATE")
-            .bind(reimb_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(internal)?;
-    let locked_status: ReimbursementStatus = locked_status_str
-        .parse()
-        .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
-
-    if locked_status != ReimbursementStatus::Pending {
-        return Err(FulfillmentError::Conflict(format!(
-            "reimbursement is already {locked_status_str}"
-        )));
-    }
-
-    // Verify every item this hauler has touched for this requester is fully
-    // delivered (or already settled). This catches both `bought` items that
-    // haven't been marked delivered AND partial fulfillments where the item
-    // is still `open`/`claimed` because qty_fulfilled < qty_requested.
-    let not_delivered: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COUNT(DISTINCT li.id)
-        FROM list_items li
-        WHERE li.list_id = $1
-          AND li.requested_by_user_id = $2
-          AND li.status NOT IN ('delivered', 'settled')
-          AND EXISTS (
-              SELECT 1 FROM fulfillments f
-              WHERE f.list_item_id = li.id
-                AND f.hauler_user_id = $3
-                AND f.reversed_at IS NULL
-          )
-        "#,
-    )
-    .bind(list_id)
-    .bind(requester_user_id)
-    .bind(hauler_user_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(internal)?;
-
-    if not_delivered > 0 {
-        return Err(FulfillmentError::Conflict(format!(
-            "{not_delivered} item(s) must be fully bought and delivered before settling"
-        )));
-    }
-
-    // Mark reimbursement settled
-    sqlx::query(
-        "UPDATE reimbursements \
-         SET status = 'settled', settled_at = now(), settled_by_user_id = $1 \
-         WHERE id = $2",
-    )
-    .bind(user_id)
-    .bind(reimb_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal)?;
-
-    // Bulk-flip delivered items to settled — only if no other pending reimbursement covers them
-    sqlx::query(
-        r#"
-        UPDATE list_items li
-        SET status = 'settled'
-        WHERE li.list_id = $1
-          AND li.requested_by_user_id = $2
-          AND li.status = 'delivered'
-          AND EXISTS (
-              SELECT 1 FROM fulfillments f
-              WHERE f.list_item_id = li.id
-                AND f.hauler_user_id = $3
-                AND f.reversed_at IS NULL
-          )
-          AND NOT EXISTS (
-              SELECT 1 FROM reimbursements r
-              JOIN fulfillments f2
-                ON f2.list_item_id = li.id
-               AND f2.hauler_user_id = r.hauler_user_id
-               AND f2.reversed_at IS NULL
-              WHERE r.list_id = $1
-                AND r.requester_user_id = $2
-                AND r.hauler_user_id <> $3
-                AND r.status = 'pending'
-          )
-        "#,
-    )
-    .bind(list_id)
-    .bind(requester_user_id)
-    .bind(hauler_user_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal)?;
+    settlement::settle_manual(&mut tx, reimb_id, user_id)
+        .await
+        .map_err(|e| match e {
+            settlement::SettlementError::NotFound => FulfillmentError::NotFound,
+            settlement::SettlementError::NotPending(s) => {
+                FulfillmentError::Conflict(format!("reimbursement is already {s}"))
+            }
+            settlement::SettlementError::NotDelivered { count } => FulfillmentError::Conflict(
+                format!("{count} item(s) must be fully bought and delivered before settling"),
+            ),
+            settlement::SettlementError::Db(e) => internal(e),
+        })?;
 
     tx.commit().await.map_err(internal)?;
     let detail = load_list_detail(&state, list_id, user_id, role)

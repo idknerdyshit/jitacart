@@ -15,20 +15,12 @@ use tower_sessions::{Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::PostgresStore;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-mod auth;
-mod citadels;
-mod config;
-mod extract;
-mod fulfillment;
-mod groups;
-mod jwt;
-mod lists;
-mod markets;
-mod state;
-
 use auth_tokens::{CharacterTokenStore, EsiBudgetGuard, TokenCipher};
 
-use crate::{config::Config, jwt::JwksCache, state::AppState};
+use jitacart_api::{
+    auth, citadels, config::Config, contracts, fulfillment, groups, jwt::JwksCache, lists, markets,
+    state::AppState,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -118,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(lists::router())
         .merge(citadels::router())
         .merge(fulfillment::router())
+        .merge(contracts::router())
         .with_state(state)
         .layer(session_layer)
         .layer(TraceLayer::new_for_http());

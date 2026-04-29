@@ -421,8 +421,221 @@ pub struct Reimbursement {
     pub settled_at: Option<DateTime<Utc>>,
     pub settled_by_user_id: Option<Uuid>,
     pub contract_id: Option<Uuid>,
+    /// Aggregate snapshot of the bound contract, when one is linked.
+    pub contract: Option<ContractSummary>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractType {
+    ItemExchange,
+    Auction,
+    Courier,
+    Unknown,
+}
+
+impl ContractType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContractType::ItemExchange => "item_exchange",
+            ContractType::Auction => "auction",
+            ContractType::Courier => "courier",
+            ContractType::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for ContractType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ContractType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "item_exchange" => Ok(ContractType::ItemExchange),
+            "auction" => Ok(ContractType::Auction),
+            "courier" => Ok(ContractType::Courier),
+            "unknown" => Ok(ContractType::Unknown),
+            other => Err(format!("unknown contract type: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractStatus {
+    Outstanding,
+    InProgress,
+    FinishedIssuer,
+    FinishedContractor,
+    Finished,
+    Cancelled,
+    Rejected,
+    Failed,
+    Deleted,
+    Reversed,
+}
+
+impl ContractStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContractStatus::Outstanding => "outstanding",
+            ContractStatus::InProgress => "in_progress",
+            ContractStatus::FinishedIssuer => "finished_issuer",
+            ContractStatus::FinishedContractor => "finished_contractor",
+            ContractStatus::Finished => "finished",
+            ContractStatus::Cancelled => "cancelled",
+            ContractStatus::Rejected => "rejected",
+            ContractStatus::Failed => "failed",
+            ContractStatus::Deleted => "deleted",
+            ContractStatus::Reversed => "reversed",
+        }
+    }
+
+    pub fn is_terminal_success(self) -> bool {
+        matches!(
+            self,
+            ContractStatus::Finished
+                | ContractStatus::FinishedIssuer
+                | ContractStatus::FinishedContractor
+        )
+    }
+
+    pub fn is_terminal_failure(self) -> bool {
+        matches!(
+            self,
+            ContractStatus::Cancelled
+                | ContractStatus::Rejected
+                | ContractStatus::Failed
+                | ContractStatus::Deleted
+                | ContractStatus::Reversed
+        )
+    }
+}
+
+impl fmt::Display for ContractStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ContractStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "outstanding" => Ok(ContractStatus::Outstanding),
+            "in_progress" => Ok(ContractStatus::InProgress),
+            "finished_issuer" => Ok(ContractStatus::FinishedIssuer),
+            "finished_contractor" => Ok(ContractStatus::FinishedContractor),
+            "finished" => Ok(ContractStatus::Finished),
+            "cancelled" => Ok(ContractStatus::Cancelled),
+            "rejected" => Ok(ContractStatus::Rejected),
+            "failed" => Ok(ContractStatus::Failed),
+            "deleted" => Ok(ContractStatus::Deleted),
+            "reversed" => Ok(ContractStatus::Reversed),
+            other => Err(format!("unknown contract status: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractMatchState {
+    Pending,
+    Confirmed,
+    Rejected,
+    Superseded,
+}
+
+impl ContractMatchState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContractMatchState::Pending => "pending",
+            ContractMatchState::Confirmed => "confirmed",
+            ContractMatchState::Rejected => "rejected",
+            ContractMatchState::Superseded => "superseded",
+        }
+    }
+}
+
+impl fmt::Display for ContractMatchState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ContractMatchState {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(ContractMatchState::Pending),
+            "confirmed" => Ok(ContractMatchState::Confirmed),
+            "rejected" => Ok(ContractMatchState::Rejected),
+            "superseded" => Ok(ContractMatchState::Superseded),
+            other => Err(format!("unknown contract match state: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Contract {
+    pub id: Uuid,
+    pub esi_contract_id: i64,
+    pub issuer_character_id: i64,
+    pub issuer_user_id: Option<Uuid>,
+    pub assignee_character_id: Option<i64>,
+    pub assignee_user_id: Option<Uuid>,
+    pub contract_type: ContractType,
+    pub status: ContractStatus,
+    pub price_isk: Decimal,
+    pub reward_isk: Decimal,
+    pub collateral_isk: Decimal,
+    pub expected_total_isk: Option<Decimal>,
+    pub settlement_delta_isk: Option<Decimal>,
+    pub date_issued: DateTime<Utc>,
+    pub date_expired: Option<DateTime<Utc>>,
+    pub date_accepted: Option<DateTime<Utc>>,
+    pub date_completed: Option<DateTime<Utc>>,
+    pub start_location_id: Option<i64>,
+    pub end_location_id: Option<i64>,
+    pub items_synced_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractItem {
+    pub contract_id: Uuid,
+    pub record_id: i64,
+    pub type_id: i32,
+    pub quantity: i64,
+    pub is_included: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractSummary {
+    pub esi_contract_id: i64,
+    pub status: ContractStatus,
+    pub price_isk: Decimal,
+    pub expected_total_isk: Option<Decimal>,
+    pub settlement_delta_isk: Option<Decimal>,
+    pub date_completed: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractMatchSuggestion {
+    pub id: Uuid,
+    pub contract_id: Uuid,
+    pub reimbursement_id: Uuid,
+    pub score: Decimal,
+    pub exact_match: bool,
+    pub state: ContractMatchState,
+    pub created_at: DateTime<Utc>,
+    pub decided_at: Option<DateTime<Utc>>,
+    pub decided_by_user_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

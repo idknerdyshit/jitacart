@@ -13,10 +13,14 @@ path = "src/main.rs"
 domain = { workspace = true }
 market = { workspace = true }
 auth-tokens = { workspace = true }
+settlement = { workspace = true }
 
 tokio = { workspace = true }
 sqlx = { workspace = true }
 futures-util = "0.3"
+rand = { workspace = true }
+rust_decimal = { workspace = true }
+serde_json = { workspace = true }
 
 serde = { workspace = true }
 secrecy = { workspace = true }

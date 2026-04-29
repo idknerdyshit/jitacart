@@ -1302,7 +1302,6 @@ pub(crate) async fn load_list_detail(
         .collect::<anyhow::Result<Vec<_>>>()
         .map_err(internal)?;
 
-    // Phase 5: reimbursements
     let reimbursement_rows: Vec<ReimbursementRow> = sqlx::query_as(
         r#"
         SELECT r.id, r.list_id, r.requester_user_id, r.hauler_user_id,
@@ -1310,10 +1309,17 @@ pub(crate) async fn load_list_detail(
                r.settled_at, r.settled_by_user_id, r.contract_id,
                r.created_at, r.updated_at,
                ru.display_name AS requester_display_name,
-               hu.display_name AS hauler_display_name
+               hu.display_name AS hauler_display_name,
+               c.esi_contract_id      AS contract_esi_contract_id,
+               c.status               AS contract_status,
+               c.price_isk            AS contract_price_isk,
+               c.expected_total_isk   AS contract_expected_total_isk,
+               c.settlement_delta_isk AS contract_settlement_delta_isk,
+               c.date_completed       AS contract_date_completed
         FROM reimbursements r
         JOIN users ru ON ru.id = r.requester_user_id
         JOIN users hu ON hu.id = r.hauler_user_id
+        LEFT JOIN contracts c ON c.id = r.contract_id
         WHERE r.list_id = $1
         ORDER BY r.created_at
         "#,
@@ -1617,6 +1623,12 @@ pub(crate) struct ReimbursementRow {
     pub updated_at: DateTime<Utc>,
     pub requester_display_name: String,
     pub hauler_display_name: String,
+    pub contract_esi_contract_id: Option<i64>,
+    pub contract_status: Option<String>,
+    pub contract_price_isk: Option<Decimal>,
+    pub contract_expected_total_isk: Option<Decimal>,
+    pub contract_settlement_delta_isk: Option<Decimal>,
+    pub contract_date_completed: Option<DateTime<Utc>>,
 }
 
 impl ReimbursementRow {
@@ -1625,6 +1637,26 @@ impl ReimbursementRow {
             .status
             .parse::<ReimbursementStatus>()
             .map_err(anyhow::Error::msg)?;
+        let contract = match (
+            self.contract_esi_contract_id,
+            self.contract_status.as_deref(),
+            self.contract_price_isk,
+        ) {
+            (Some(esi_id), Some(status_str), Some(price)) => {
+                let cstatus = status_str
+                    .parse::<domain::ContractStatus>()
+                    .map_err(anyhow::Error::msg)?;
+                Some(domain::ContractSummary {
+                    esi_contract_id: esi_id,
+                    status: cstatus,
+                    price_isk: price,
+                    expected_total_isk: self.contract_expected_total_isk,
+                    settlement_delta_isk: self.contract_settlement_delta_isk,
+                    date_completed: self.contract_date_completed,
+                })
+            }
+            _ => None,
+        };
         Ok(Reimbursement {
             id: self.id,
             list_id: self.list_id,
@@ -1639,6 +1671,7 @@ impl ReimbursementRow {
             settled_at: self.settled_at,
             settled_by_user_id: self.settled_by_user_id,
             contract_id: self.contract_id,
+            contract,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })

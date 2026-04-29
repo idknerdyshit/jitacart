@@ -1,7 +1,8 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { page } from '$app/state';
-    import { api } from '$lib/api';
+    import { api, type ViewerCharacter } from '$lib/api';
+    import { viewerCharacters } from '$lib/stores/me';
     import CitadelSearchModal from '$lib/CitadelSearchModal.svelte';
 
     type Tracked = {
@@ -23,17 +24,6 @@
         role: 'owner' | 'member';
     };
 
-    type Character = {
-        id: string;
-        character_id: number;
-        character_name: string;
-        scopes: string[];
-    };
-    type Me = {
-        user: { id: string; display_name: string };
-        characters: Character[];
-    };
-
     const REQUIRED_SCOPES = [
         'esi-markets.structure_markets.v1',
         'esi-universe.read_structures.v1'
@@ -41,7 +31,7 @@
 
     const groupId = $derived(page.params.id ?? '');
     let detail = $state<GroupDetail | null>(null);
-    let me = $state<Me | null>(null);
+    const characters = $derived($viewerCharacters);
     let tracked = $state<Tracked[]>([]);
     let error = $state<string | null>(null);
     let modalOpen = $state(false);
@@ -50,7 +40,6 @@
         error = null;
         try {
             detail = await api<GroupDetail>(`/groups/${groupId}`);
-            me = await api<Me>(`/me`);
             if (detail.role === 'owner') {
                 tracked = await api<Tracked[]>(`/groups/${groupId}/tracked-markets`);
             }
@@ -73,11 +62,11 @@
         }
     }
 
-    function missingScopes(c: Character): string[] {
+    function missingScopes(c: ViewerCharacter): string[] {
         return REQUIRED_SCOPES.filter((s) => !c.scopes.includes(s));
     }
 
-    function upgradeUrl(c: Character): string {
+    function upgradeUrl(c: ViewerCharacter): string {
         return `/api/auth/eve/upgrade?character_id=${c.character_id}&scopes=${REQUIRED_SCOPES.join(
             ','
         )}&return_to=${encodeURIComponent(`/groups/${groupId}/tracked-markets`)}`;
@@ -99,7 +88,7 @@
     {#if detail.role !== 'owner'}
         <p>Only group owners can manage the tracked-citadel set.</p>
     {:else}
-        {#if me}
+        {#if characters.length > 0}
             <section>
                 <h2>Character access</h2>
                 <p class="muted">
@@ -107,7 +96,7 @@
                     scopes that can dock at it.
                 </p>
                 <ul>
-                    {#each me.characters as c (c.id)}
+                    {#each characters as c (c.id)}
                         {@const miss = missingScopes(c)}
                         <li>
                             <strong>{c.character_name}</strong>

@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { api, fmtIsk, fmtPct } from '$lib/api';
+    import { api, deltaClass, fmtIsk, fmtPct, isContractTerminalSuccess } from '$lib/api';
     import type { ListDetail, Reimbursement } from '$lib/api';
 
     interface Props {
@@ -17,7 +17,15 @@
     function canSettle(r: Reimbursement): boolean {
         const isRequester = detail.viewer_user_id === r.requester_user_id;
         const isOwner = detail.viewer_role === 'owner';
-        return (isRequester || isOwner) && r.status === 'pending';
+        return (
+            (isRequester || isOwner) &&
+            r.status === 'pending' &&
+            r.contract_id === null
+        );
+    }
+
+    function isFinishedContract(r: Reimbursement): boolean {
+        return isContractTerminalSuccess(r.contract?.status);
     }
 
     function hasUndelivered(r: Reimbursement): boolean {
@@ -79,6 +87,25 @@
                         <span class="muted">Total</span>
                         <span class="total">{fmtIsk(r.total_isk)}</span>
                     </div>
+                    {#if r.contract}
+                        <div class="contract-chip-row">
+                            {#if isFinishedContract(r)}
+                                <span class="pill pill-settled">
+                                    Settled via contract #{r.contract.esi_contract_id}
+                                </span>
+                                {#if r.contract.settlement_delta_isk}
+                                    <span class={`small ${deltaClass(r.contract.settlement_delta_isk)}`}>
+                                        Δ {fmtIsk(r.contract.settlement_delta_isk)}
+                                    </span>
+                                {/if}
+                            {:else}
+                                <span class="pill">
+                                    Bound to contract #{r.contract.esi_contract_id} ({r.contract.status.replace('_', ' ')})
+                                </span>
+                                <span class="muted small">awaiting in-game completion</span>
+                            {/if}
+                        </div>
+                    {/if}
                     {#if r.status === 'settled' && r.settled_at}
                         <p class="muted small">
                             Settled {new Date(r.settled_at).toLocaleString()}
@@ -188,5 +215,17 @@
     .warn {
         color: #fbbf24;
         margin: 0;
+    }
+    .contract-chip-row {
+        display: flex;
+        gap: 0.4rem;
+        align-items: center;
+        flex-wrap: wrap;
+    }
+    .pos {
+        color: #3fb950;
+    }
+    .neg {
+        color: #f87171;
     }
 </style>

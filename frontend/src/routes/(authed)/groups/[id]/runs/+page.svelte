@@ -63,9 +63,9 @@
 
 {#if runs !== null}
     {#if runs.length === 0}
-        <EmptyState message="All caught up!" hint="Create a list to get started." />
+        <EmptyState message="No buy runs yet." hint="Open lists with claimable items will show up here." />
     {:else}
-        <table>
+        <table class="responsive-table">
             <thead>
                 <tr>
                     <th>Destination</th>
@@ -180,30 +180,5 @@
         border-radius: 999px;
         text-decoration: none;
         font-size: 0.85rem;
-    }
-    @media (max-width: 768px) {
-        thead {
-            display: none;
-        }
-        tbody tr {
-            display: block;
-            background: #161b22;
-            border: 1px solid #30363d;
-            border-radius: 8px;
-            padding: 0.75rem;
-            margin-bottom: 0.75rem;
-        }
-        td {
-            display: flex;
-            justify-content: space-between;
-            border-bottom: none;
-            padding: 0.2rem 0;
-        }
-        td::before {
-            content: attr(data-label);
-            font-weight: 600;
-            color: #8b949e;
-            margin-right: 0.5rem;
-        }
     }
 </style>

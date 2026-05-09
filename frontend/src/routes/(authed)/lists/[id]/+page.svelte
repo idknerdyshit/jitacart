@@ -440,7 +440,7 @@
         {#if detail.items.length === 0}
             <EmptyState message="No items yet." hint="Paste a MultiBuy string." />
         {:else}
-            <table>
+            <table class="responsive-table">
                 <thead>
                     <tr>
                         <th>Item</th>
@@ -758,36 +758,5 @@
     .status-actions {
         display: flex;
         gap: 0.5rem;
-    }
-    @media (max-width: 768px) {
-        table thead {
-            display: none;
-        }
-        table tbody tr {
-            display: block;
-            background: #161b22;
-            border: 1px solid #30363d;
-            border-radius: 8px;
-            padding: 0.75rem;
-            margin-bottom: 0.75rem;
-        }
-        table td {
-            display: flex;
-            justify-content: space-between;
-            border-bottom: none;
-            padding: 0.2rem 0;
-        }
-        table td::before {
-            content: attr(data-label);
-            font-weight: 600;
-            color: #8b949e;
-            margin-right: 0.5rem;
-        }
-        .actions-cell {
-            justify-content: flex-end;
-        }
-        .actions-cell::before {
-            display: none;
-        }
     }
 </style>

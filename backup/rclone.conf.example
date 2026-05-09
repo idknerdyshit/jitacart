@@ -1,0 +1,30 @@
+# Copy to backup/rclone.conf and fill in. Mounted read-only into the
+# backup container. See https://rclone.org/s3/#configuration for the
+# full reference. Below: examples for Backblaze B2 and Cloudflare R2.
+
+# Backblaze B2 (recommended for low-budget setups: $0.005/GB/month).
+# [b2]
+# type = b2
+# account = <Application Key ID>
+# key = <Application Key>
+
+# Cloudflare R2.
+# [r2]
+# type = s3
+# provider = Cloudflare
+# access_key_id = <R2 access key>
+# secret_access_key = <R2 secret>
+# endpoint = https://<account>.r2.cloudflarestorage.com
+# region = auto
+
+# AWS S3.
+# [aws]
+# type = s3
+# provider = AWS
+# access_key_id = <key>
+# secret_access_key = <secret>
+# region = us-east-1
+
+# After picking one, set BACKUP_RCLONE_REMOTE in .env to e.g.
+#   BACKUP_RCLONE_REMOTE=b2:my-bucket-name/jitacart
+# (the path-suffix is optional but useful if the bucket isn't dedicated).

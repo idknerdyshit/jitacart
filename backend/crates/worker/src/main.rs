@@ -12,18 +12,13 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use auth_tokens::{CharacterTokenStore, EsiBudgetGuard, TokenCipher};
-use figment::{
-    providers::{Env, Format, Toml},
-    Figment,
-};
+use auth_tokens::{CharacterTokenStore, EsiBudgetGuard, TokenEncConfig};
 use nea_esi::EsiClient;
 use secrecy::SecretString;
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::time::{interval, MissedTickBehavior};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod jobs;
 
@@ -32,8 +27,14 @@ pub struct WorkerConfig {
     pub database_url: String,
     pub esi: EsiCfg,
     pub eve_sso: EveSsoCfg,
-    /// Base64-encoded 32-byte AES-GCM key. Same key the api crate uses.
-    pub token_enc_key: String,
+    /// Legacy single-key shim — same shape as the api crate. Loaded as kid
+    /// `"v1"` and made primary if `[token_enc]` is not set.
+    #[serde(default)]
+    pub token_enc_key: Option<String>,
+    /// Multi-key encryption config: a map of kid → base64 key plus a
+    /// `primary` kid. Same shape as the api crate's `[token_enc]`.
+    #[serde(default)]
+    pub token_enc: Option<TokenEncConfig>,
     #[serde(default)]
     pub worker: WorkerSection,
 }
@@ -122,6 +123,12 @@ fn default_corp_wallet_concurrency() -> usize {
 pub struct WorkerSection {
     #[serde(default = "default_tick_secs")]
     pub tick_secs: u64,
+    /// Bind address for the worker's `/healthz/esi` endpoint. Empty
+    /// string disables the server. Default `127.0.0.1:9091` exposes it
+    /// only on loopback — point an internal uptime probe at it (or
+    /// docker-compose service-to-service curl).
+    #[serde(default = "default_healthz_bind")]
+    pub healthz_bind: String,
     #[serde(default = "default_citadel_discovery_missing_threshold")]
     pub citadel_discovery_missing_threshold: i32,
     #[serde(default = "default_citadel_details_concurrency")]
@@ -141,6 +148,7 @@ impl Default for WorkerSection {
     fn default() -> Self {
         Self {
             tick_secs: default_tick_secs(),
+            healthz_bind: default_healthz_bind(),
             citadel_discovery_missing_threshold: default_citadel_discovery_missing_threshold(),
             citadel_details_concurrency: default_citadel_details_concurrency(),
             citadel_orders_concurrency: default_citadel_orders_concurrency(),
@@ -149,6 +157,10 @@ impl Default for WorkerSection {
             corp_wallet_concurrency: default_corp_wallet_concurrency(),
         }
     }
+}
+
+fn default_healthz_bind() -> String {
+    "127.0.0.1:9091".to_string()
 }
 
 fn default_tick_secs() -> u64 {
@@ -179,16 +191,8 @@ pub struct Ctx {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer())
-        .init();
-
-    let config: WorkerConfig = Figment::new()
-        .merge(Toml::file("config.toml"))
-        .merge(Env::raw().split("__"))
-        .extract()
-        .context("loading worker config")?;
+    bootstrap::init_tracing();
+    let config: WorkerConfig = bootstrap::load_config("loading worker config")?;
 
     tracing::info!(
         tick_secs = config.worker.tick_secs,
@@ -202,8 +206,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("connecting to postgres")?;
 
-    let cipher = TokenCipher::from_b64(&config.token_enc_key)
-        .context("building token cipher from TOKEN_ENC_KEY")?;
+    let cipher = auth_tokens::build_cipher(
+        config.token_enc.as_ref(),
+        config.token_enc_key.as_deref(),
+    )
+    .context("building token-at-rest cipher")?;
 
     let token_store = CharacterTokenStore::new(
         pool.clone(),
@@ -229,6 +236,8 @@ async fn main() -> anyhow::Result<()> {
             .expect("building webhook http client"),
     });
 
+    spawn_healthz(&ctx).await?;
+
     let intervals = &ctx.config.esi.poll_intervals_secs;
 
     let mut hub_prices = mk_interval(ctx.config.worker.tick_secs);
@@ -243,6 +252,8 @@ async fn main() -> anyhow::Result<()> {
     let mut corp_contracts = mk_interval(ctx.config.worker.tick_secs);
     let mut corp_wallet = mk_interval(ctx.config.worker.tick_secs);
     let mut budget_reset = mk_interval(60);
+    // Hourly drain of any character rows still encrypted with a non-primary kid.
+    let mut token_reencrypt = mk_interval(3600);
     let hub_prices_running = Arc::new(AtomicBool::new(false));
     let citadel_discovery_running = Arc::new(AtomicBool::new(false));
     let citadel_details_running = Arc::new(AtomicBool::new(false));
@@ -250,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
     let contracts_running = Arc::new(AtomicBool::new(false));
     let corp_contracts_running = Arc::new(AtomicBool::new(false));
     let corp_wallet_running = Arc::new(AtomicBool::new(false));
+    let token_reencrypt_running = Arc::new(AtomicBool::new(false));
 
     loop {
         tokio::select! {
@@ -273,6 +285,9 @@ async fn main() -> anyhow::Result<()> {
             }),
             _ = corp_wallet.tick() => spawn_guarded(&ctx, &corp_wallet_running, "corp_wallet", |c| async move {
                 jobs::corp_wallet::run(&c).await
+            }),
+            _ = token_reencrypt.tick() => spawn_guarded(&ctx, &token_reencrypt_running, "token_reencrypt", |c| async move {
+                jobs::token_reencrypt::run(&c).await
             }),
             _ = budget_reset.tick() => ctx.budget.reset(),
         }
@@ -302,6 +317,47 @@ fn mk_interval(secs: u64) -> tokio::time::Interval {
     let mut t = interval(Duration::from_secs(secs.max(1)));
     t.set_missed_tick_behavior(MissedTickBehavior::Delay);
     t
+}
+
+/// Tiny healthz server bound to a (typically loopback) port. Exposes
+/// `/healthz/esi` (budget snapshot) and `/healthz` (always-200). Empty
+/// `worker.healthz_bind` skips the server, so tests / one-shot tools
+/// don't pay the port-binding cost.
+async fn spawn_healthz(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
+    let bind = ctx.config.worker.healthz_bind.trim();
+    if bind.is_empty() {
+        tracing::info!("healthz disabled (worker.healthz_bind empty)");
+        return Ok(());
+    }
+    let addr: std::net::SocketAddr = bind.parse().context("parsing worker.healthz_bind")?;
+    let budget = ctx.budget.clone();
+    let app = axum::Router::new()
+        .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/healthz/esi",
+            axum::routing::get({
+                let budget = budget.clone();
+                move || {
+                    let budget = budget.clone();
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "remaining": budget.remaining(),
+                            "has_budget": budget.has_budget(),
+                        }))
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding healthz on {addr}"))?;
+    tracing::info!(%addr, "worker healthz listening");
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!(error = ?e, "healthz server stopped");
+        }
+    });
+    Ok(())
 }
 
 struct RunningGuard(Arc<AtomicBool>);

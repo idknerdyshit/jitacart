@@ -3,7 +3,6 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
     routing::{delete, get},
     Json, Router,
 };
@@ -12,7 +11,7 @@ use domain::{GroupRole, MarketKind};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{extract::CurrentGroup, state::AppState};
+use crate::{errors::ApiError, extract::CurrentGroup, state::AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -42,13 +41,13 @@ async fn search(
     State(state): State<AppState>,
     CurrentGroup { group_id, .. }: CurrentGroup,
     Query(q): Query<SearchQuery>,
-) -> Result<Json<Vec<CitadelSearchHit>>, CitadelError> {
+) -> Result<Json<Vec<CitadelSearchHit>>, ApiError> {
     let trimmed = q.q.trim();
     if trimmed.is_empty() {
         return Ok(Json(vec![]));
     }
     if trimmed.len() > 100 {
-        return Err(CitadelError::BadRequest("query too long".into()));
+        return Err(ApiError::BadRequest("query too long".into()));
     }
     let pattern = format!("%{}%", trimmed.replace(['%', '_'], ""));
 
@@ -72,7 +71,7 @@ async fn search(
     .bind(&pattern)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     Ok(Json(
         rows.into_iter()
@@ -111,7 +110,7 @@ async fn track(
     State(state): State<AppState>,
     cur: CurrentGroup,
     Json(body): Json<TrackBody>,
-) -> Result<StatusCode, CitadelError> {
+) -> Result<StatusCode, ApiError> {
     require_owner(&cur)?;
 
     // Confirm the target is a public, detail-resolved citadel.
@@ -121,14 +120,14 @@ async fn track(
     .bind(body.market_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
-    let (kind, is_public, detailed) = row.ok_or(CitadelError::NotFound)?;
+    let (kind, is_public, detailed) = row.ok_or_else(ApiError::not_found)?;
     let mk = kind
         .parse::<MarketKind>()
-        .map_err(|e| CitadelError::Internal(anyhow::anyhow!("bad kind: {e}")))?;
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("bad kind: {e}")))?;
     if mk != MarketKind::PublicStructure || !is_public || !detailed {
-        return Err(CitadelError::BadRequest(
+        return Err(ApiError::BadRequest(
             "market is not a tracked-eligible public citadel".into(),
         ));
     }
@@ -142,7 +141,7 @@ async fn track(
     .bind(cur.user_id)
     .execute(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     Ok(StatusCode::CREATED)
 }
@@ -151,16 +150,16 @@ async fn untrack(
     State(state): State<AppState>,
     cur: CurrentGroup,
     Path((_group_id, market_id)): Path<(Uuid, Uuid)>,
-) -> Result<StatusCode, CitadelError> {
+) -> Result<StatusCode, ApiError> {
     require_owner(&cur)?;
     let r = sqlx::query("DELETE FROM group_tracked_markets WHERE group_id = $1 AND market_id = $2")
         .bind(cur.group_id)
         .bind(market_id)
         .execute(&state.pool)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     if r.rows_affected() == 0 {
-        return Err(CitadelError::NotFound);
+        return Err(ApiError::not_found());
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -183,7 +182,7 @@ struct TrackedMarket {
 async fn list(
     State(state): State<AppState>,
     CurrentGroup { group_id, .. }: CurrentGroup,
-) -> Result<Json<Vec<TrackedMarket>>, CitadelError> {
+) -> Result<Json<Vec<TrackedMarket>>, ApiError> {
     let rows: Vec<TrackedRow> = sqlx::query_as(
         r#"
         SELECT m.id, m.name, m.short_label, m.region_id, m.solar_system_id,
@@ -209,7 +208,7 @@ async fn list(
     .bind(group_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     Ok(Json(
         rows.into_iter()
@@ -245,35 +244,11 @@ struct TrackedRow {
     accessing_character_name: Option<String>,
 }
 
-fn require_owner(cur: &CurrentGroup) -> Result<(), CitadelError> {
+fn require_owner(cur: &CurrentGroup) -> Result<(), ApiError> {
     if cur.role == GroupRole::Owner {
         Ok(())
     } else {
-        Err(CitadelError::Forbidden)
+        Err(ApiError::Forbidden("owner only".into()))
     }
 }
 
-pub enum CitadelError {
-    BadRequest(String),
-    Forbidden,
-    NotFound,
-    Internal(anyhow::Error),
-}
-
-fn internal<E: Into<anyhow::Error>>(e: E) -> CitadelError {
-    CitadelError::Internal(e.into())
-}
-
-impl IntoResponse for CitadelError {
-    fn into_response(self) -> Response {
-        match self {
-            CitadelError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
-            CitadelError::Forbidden => (StatusCode::FORBIDDEN, "owner only").into_response(),
-            CitadelError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
-            CitadelError::Internal(e) => {
-                tracing::error!(error = ?e, "citadels handler error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-            }
-        }
-    }
-}

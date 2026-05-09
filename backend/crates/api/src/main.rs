@@ -2,20 +2,19 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{anyhow, Context};
 use axum::{extract::State, routing::get, Json, Router};
-use figment::{
-    providers::{Env, Format, Toml},
-    Figment,
-};
 use nea_esi::EsiClient;
 use secrecy::SecretString;
 use sqlx::postgres::PgPoolOptions;
 use time::Duration as TimeDuration;
-use tower_http::trace::TraceLayer;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_http::{
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    trace::{DefaultMakeSpan, TraceLayer},
+};
 use tower_sessions::{Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::PostgresStore;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use auth_tokens::{CharacterTokenStore, EsiBudgetGuard, TokenCipher};
+use auth_tokens::{CharacterTokenStore, EsiBudgetGuard};
 
 use jitacart_api::{
     auth, citadels, config::Config, contracts, corps, fulfillment, groups, jwt::JwksCache, lists,
@@ -24,16 +23,8 @@ use jitacart_api::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer())
-        .init();
-
-    let config: Config = Figment::new()
-        .merge(Toml::file("config.toml"))
-        .merge(Env::raw().split("__"))
-        .extract()
-        .context("loading config")?;
+    bootstrap::init_tracing();
+    let config: Config = bootstrap::load_config("loading config")?;
 
     let pool = PgPoolOptions::new()
         .max_connections(8)
@@ -46,8 +37,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("running migrations")?;
 
-    let cipher = TokenCipher::from_b64(&config.token_enc_key)
-        .context("building token cipher from TOKEN_ENC_KEY")?;
+    let cipher = auth_tokens::build_cipher(
+        config.token_enc.as_ref(),
+        config.token_enc_key.as_deref(),
+    )
+    .context("building token-at-rest cipher")?;
 
     let http = reqwest::Client::builder()
         .user_agent(&config.esi.user_agent)
@@ -94,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         pool,
         config: Arc::new(config),
-        cipher,
+        cipher: Arc::new(cipher),
         jwks,
         esi: Arc::new(esi),
         token_store,
@@ -109,9 +103,30 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("parsing bind addr")?;
 
-    let app = Router::new()
-        .route("/healthz", get(healthz))
+    // Two-tier rate limiting: stricter bucket for SSO entry/exit, generous
+    // global bucket for everything else. Both keyed by client IP.
+    let rl = &state.config.rate_limit;
+    let mk_layer = |period_secs, burst, label: &str| {
+        GovernorConfigBuilder::default()
+            .per_second(period_secs)
+            .burst_size(burst)
+            .finish()
+            .map(GovernorLayer::new)
+            .ok_or_else(|| anyhow!("invalid {label} rate-limit config"))
+    };
+
+    let auth_routes = Router::new()
         .merge(auth::router())
+        .with_state(state.clone());
+    let auth_routes = if rl.disabled {
+        auth_routes
+    } else {
+        auth_routes.layer(mk_layer(rl.auth_period_secs, rl.auth_burst, "auth")?)
+    };
+
+    let other_routes = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .merge(groups::router())
         .merge(markets::router())
         .merge(lists::router())
@@ -120,9 +135,27 @@ async fn main() -> anyhow::Result<()> {
         .merge(contracts::router())
         .merge(corps::router())
         .merge(webhooks::router())
-        .with_state(state)
+        .with_state(state.clone());
+    let other_routes = if rl.disabled {
+        other_routes
+    } else {
+        other_routes.layer(mk_layer(rl.per_ip_period_secs, rl.per_ip_burst, "per-ip")?)
+    };
+
+    // Layer order (executes outer-first, propagates inner-first on the way back):
+    //   SetRequestId   — generates X-Request-Id if absent
+    //   TraceLayer     — opens a span with method, uri, request_id
+    //   session        — tower-sessions cookie session
+    //   PropagateRequestId — copies the id into the response header
+    let app = auth_routes
+        .merge(other_routes)
+        .layer(PropagateRequestIdLayer::x_request_id())
         .layer(session_layer)
-        .layer(TraceLayer::new_for_http());
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().include_headers(false)),
+        )
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
 
     tracing::info!("listening on {bind}");
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -140,4 +173,37 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
         "status": if db_ok { "ok" } else { "degraded" },
         "db": db_ok,
     }))
+}
+
+/// Readiness probe. Distinct from `/healthz` (always-200 liveness): this
+/// returns **503 Service Unavailable** if the API can't currently serve
+/// real traffic — DB unreachable, or pool exhausted such that the next
+/// request would block. Point uptime monitors at this, not /healthz.
+async fn readyz(
+    State(state): State<AppState>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.pool)
+        .await
+        .is_ok();
+    let pool_size = state.pool.size();
+    let pool_idle = state.pool.num_idle();
+    let pool_ok = pool_idle > 0 || pool_size < state.pool.options().get_max_connections();
+
+    let ready = db_ok && pool_ok;
+    let code = if ready {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(serde_json::json!({
+            "ready": ready,
+            "db": db_ok,
+            "pool_size": pool_size,
+            "pool_idle": pool_idle,
+            "pool_max": state.pool.options().get_max_connections(),
+        })),
+    )
 }

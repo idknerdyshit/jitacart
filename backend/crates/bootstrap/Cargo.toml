@@ -1,0 +1,17 @@
+[package]
+name = "bootstrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "bootstrap"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+figment = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

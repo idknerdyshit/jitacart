@@ -65,6 +65,27 @@ impl EsiBudgetGuard {
     }
 }
 
+/// Run an ESI future under budget accounting: on `Err`, decrement the
+/// guard before returning. New ESI call sites should always go through
+/// this rather than calling `record_non_2xx` by hand — that pattern was
+/// audited in Phase 9 / M4 and is now the convention.
+///
+/// ```ignore
+/// let row = budgeted(&ctx.budget, esi.get_contracts(char_id)).await?;
+/// ```
+pub async fn budgeted<T, E, F>(guard: &EsiBudgetGuard, fut: F) -> Result<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    match fut.await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            guard.record_non_2xx();
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +104,32 @@ mod tests {
         g.reset();
         assert!(g.has_budget());
         assert_eq!(g.remaining(), 10);
+    }
+
+    #[tokio::test]
+    async fn budgeted_passthrough_on_ok() {
+        let g = EsiBudgetGuard::new(10, 5);
+        let v: Result<i32, &str> = budgeted(&g, async { Ok(42) }).await;
+        assert_eq!(v.unwrap(), 42);
+        assert_eq!(g.remaining(), 10, "Ok path must not decrement");
+    }
+
+    #[tokio::test]
+    async fn budgeted_decrements_on_err() {
+        let g = EsiBudgetGuard::new(10, 5);
+        let v: Result<i32, &str> = budgeted(&g, async { Err("boom") }).await;
+        assert!(v.is_err());
+        assert_eq!(g.remaining(), 9);
+
+        // Each Err decrements by exactly one.
+        let _: Result<i32, &str> = budgeted(&g, async { Err("again") }).await;
+        assert_eq!(g.remaining(), 8);
+    }
+
+    #[tokio::test]
+    async fn budgeted_preserves_error_value() {
+        let g = EsiBudgetGuard::new(10, 5);
+        let v: Result<(), String> = budgeted(&g, async { Err("specific message".to_string()) }).await;
+        assert_eq!(v.unwrap_err(), "specific message");
     }
 }

@@ -6,4 +6,5 @@ pub mod corp_contracts;
 pub mod corp_wallet;
 pub(crate) mod csa;
 pub mod npc_hubs;
+pub mod token_reencrypt;
 pub(crate) mod webhooks;

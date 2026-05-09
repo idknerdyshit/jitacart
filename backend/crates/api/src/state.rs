@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use auth_tokens::{CharacterTokenStore, EsiBudgetGuard, TokenCipher};
+use auth_tokens::{CharacterTokenStore, EsiBudgetGuard, MultiKeyCipher};
 use nea_esi::EsiClient;
 use sqlx::PgPool;
 
@@ -11,7 +11,7 @@ use crate::{config::Config, jwt::JwksCache};
 pub struct AppState {
     pub pool: PgPool,
     pub config: Arc<Config>,
-    pub cipher: TokenCipher,
+    pub cipher: Arc<MultiKeyCipher>,
     pub jwks: JwksCache,
     /// Shared web-app client. Used for OAuth (authorize_url, exchange_code).
     /// Per-character ESI calls go through `token_store` instead.

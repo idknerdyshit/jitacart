@@ -3,7 +3,6 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -15,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    errors::ApiError,
     extract::{CurrentGroup, CurrentUser},
     state::AppState,
 };
@@ -56,15 +56,17 @@ async fn create(
     State(state): State<AppState>,
     CurrentUser(user_id): CurrentUser,
     Json(body): Json<CreateBody>,
-) -> Result<Json<Group>, GroupError> {
+) -> Result<Json<Group>, ApiError> {
     let name = body.name.trim();
     if name.is_empty() || name.len() > 80 {
-        return Err(GroupError::BadRequest(
+        return Err(ApiError::BadRequest(
             "name must be 1–80 characters".into(),
         ));
     }
 
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    require_group_quota(&state, user_id).await?;
+
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     let mut group_row: Option<GroupRow> = None;
     for _ in 0..MAX_INVITE_GEN_ATTEMPTS {
         let code = random_invite_code();
@@ -84,7 +86,7 @@ async fn create(
                 break;
             }
             Err(e) if is_invite_collision(&e) => continue,
-            Err(e) => return Err(internal(e)),
+            Err(e) => return Err(ApiError::internal(e)),
         }
     }
     let group = group_row.ok_or_else(invite_exhausted)?.into_group();
@@ -94,16 +96,16 @@ async fn create(
         .bind(group.id)
         .execute(&mut *tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     Ok(Json(group))
 }
 
 async fn list(
     State(state): State<AppState>,
     CurrentUser(user_id): CurrentUser,
-) -> Result<Json<Vec<GroupSummary>>, GroupError> {
+) -> Result<Json<Vec<GroupSummary>>, ApiError> {
     let rows = sqlx::query_as::<_, GroupListRow>(
         r#"
         SELECT g.id, g.name, g.invite_code, g.created_by_user_id, g.created_at,
@@ -119,19 +121,19 @@ async fn list(
     .bind(user_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     rows.into_iter()
         .map(GroupListRow::into_summary)
         .collect::<anyhow::Result<Vec<_>>>()
         .map(Json)
-        .map_err(internal)
+        .map_err(ApiError::internal)
 }
 
 async fn detail(
     State(state): State<AppState>,
     CurrentGroup { group_id, role, .. }: CurrentGroup,
-) -> Result<Json<GroupDetail>, GroupError> {
+) -> Result<Json<GroupDetail>, ApiError> {
     let group_q = sqlx::query_as::<_, GroupRow>(
         "SELECT id, name, invite_code, created_by_user_id, created_at, default_tip_pct \
          FROM groups WHERE id = $1",
@@ -151,14 +153,14 @@ async fn detail(
     .bind(group_id)
     .fetch_all(&state.pool);
 
-    let (group, member_rows) = tokio::try_join!(group_q, members_q).map_err(internal)?;
-    let group = group.ok_or(GroupError::NotFound)?.into_group();
+    let (group, member_rows) = tokio::try_join!(group_q, members_q).map_err(ApiError::internal)?;
+    let group = group.ok_or_else(ApiError::not_found)?.into_group();
 
     let members = member_rows
         .into_iter()
         .map(MemberRow::into_member)
         .collect::<anyhow::Result<Vec<_>>>()
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     Ok(Json(GroupDetail {
         group,
@@ -172,8 +174,8 @@ async fn leave(
     CurrentGroup {
         user_id, group_id, ..
     }: CurrentGroup,
-) -> Result<StatusCode, GroupError> {
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+) -> Result<StatusCode, ApiError> {
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
 
     let memberships = sqlx::query_as::<_, MembershipLockRow>(
         "SELECT user_id, role FROM group_memberships WHERE group_id = $1 FOR UPDATE",
@@ -181,15 +183,15 @@ async fn leave(
     .bind(group_id)
     .fetch_all(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     let role = memberships
         .iter()
         .find(|m| m.user_id == user_id)
         .map(|m| m.role.as_str())
-        .ok_or(GroupError::NotMember)?
+        .ok_or_else(|| ApiError::Forbidden("you are not a member of this group".into()))?
         .parse::<GroupRole>()
-        .map_err(|e| internal(anyhow::anyhow!(e)))?;
+        .map_err(|e| ApiError::internal(anyhow::anyhow!(e)))?;
 
     if role == GroupRole::Owner {
         let other_owners = memberships
@@ -197,7 +199,7 @@ async fn leave(
             .filter(|m| m.user_id != user_id && m.role == GroupRole::Owner.as_str())
             .count();
         if other_owners == 0 {
-            return Err(GroupError::BadRequest(
+            return Err(ApiError::BadRequest(
                 "you are the last owner; delete the group instead".into(),
             ));
         }
@@ -208,28 +210,28 @@ async fn leave(
         .bind(group_id)
         .execute(&mut *tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_group(
     State(state): State<AppState>,
     CurrentGroup { group_id, role, .. }: CurrentGroup,
-) -> Result<StatusCode, GroupError> {
+) -> Result<StatusCode, ApiError> {
     if role != GroupRole::Owner {
-        return Err(GroupError::Forbidden);
+        return Err(ApiError::Forbidden("owner role required".into()));
     }
 
     let result = sqlx::query("DELETE FROM groups WHERE id = $1")
         .bind(group_id)
         .execute(&state.pool)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     if result.rows_affected() == 0 {
-        return Err(GroupError::NotFound);
+        return Err(ApiError::NotFound("group not found".into()));
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -238,9 +240,9 @@ async fn delete_group(
 async fn rotate_invite(
     State(state): State<AppState>,
     CurrentGroup { group_id, role, .. }: CurrentGroup,
-) -> Result<Json<Group>, GroupError> {
+) -> Result<Json<Group>, ApiError> {
     if role != GroupRole::Owner {
-        return Err(GroupError::Forbidden);
+        return Err(ApiError::Forbidden("owner role required".into()));
     }
 
     let mut group_row: Option<GroupRow> = None;
@@ -260,7 +262,7 @@ async fn rotate_invite(
                 break;
             }
             Err(e) if is_invite_collision(&e) => continue,
-            Err(e) => return Err(internal(e)),
+            Err(e) => return Err(ApiError::internal(e)),
         }
     }
     let group = group_row.ok_or_else(invite_exhausted)?.into_group();
@@ -271,7 +273,8 @@ async fn join(
     State(state): State<AppState>,
     CurrentUser(user_id): CurrentUser,
     Path(code): Path<String>,
-) -> Result<Json<Group>, GroupError> {
+) -> Result<Json<Group>, ApiError> {
+    require_group_quota(&state, user_id).await?;
     let group = sqlx::query_as::<_, GroupRow>(
         r#"
         WITH g AS (
@@ -290,8 +293,8 @@ async fn join(
     .bind(user_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?
-    .ok_or(GroupError::InvalidInvite)?
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::NotFound("invite is invalid or expired".into()))?
     .into_group();
 
     Ok(Json(group))
@@ -301,12 +304,38 @@ fn random_invite_code() -> String {
     Alphanumeric.sample_string(&mut rand::thread_rng(), INVITE_CODE_LEN)
 }
 
+/// Enforce `limits.groups_per_user`. Counts memberships, not just owned
+/// groups — a user who joins 1000 groups via invite is just as much a
+/// problem as one who creates 1000.
+pub async fn check_group_quota(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    cap: i64,
+) -> Result<(), ApiError> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM group_memberships WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .map_err(ApiError::internal)?;
+    if count >= cap {
+        return Err(ApiError::QuotaExceeded(format!(
+            "you are already a member of {count} groups (limit {cap})"
+        )));
+    }
+    Ok(())
+}
+
+async fn require_group_quota(state: &AppState, user_id: Uuid) -> Result<(), ApiError> {
+    check_group_quota(&state.pool, user_id, state.config.limits.groups_per_user).await
+}
+
 fn is_invite_collision(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.constraint() == Some(INVITE_CODE_UNIQUE))
 }
 
-fn invite_exhausted() -> GroupError {
-    internal(anyhow::anyhow!(
+fn invite_exhausted() -> ApiError {
+    ApiError::internal(anyhow::anyhow!(
         "could not generate a unique invite code after {MAX_INVITE_GEN_ATTEMPTS} tries"
     ))
 }
@@ -390,35 +419,3 @@ impl MemberRow {
     }
 }
 
-pub enum GroupError {
-    BadRequest(String),
-    NotFound,
-    NotMember,
-    Forbidden,
-    InvalidInvite,
-    Internal(anyhow::Error),
-}
-
-fn internal<E: Into<anyhow::Error>>(e: E) -> GroupError {
-    GroupError::Internal(e.into())
-}
-
-impl IntoResponse for GroupError {
-    fn into_response(self) -> Response {
-        match self {
-            GroupError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
-            GroupError::NotFound => (StatusCode::NOT_FOUND, "group not found").into_response(),
-            GroupError::NotMember => {
-                (StatusCode::FORBIDDEN, "you are not a member of this group").into_response()
-            }
-            GroupError::Forbidden => (StatusCode::FORBIDDEN, "owner role required").into_response(),
-            GroupError::InvalidInvite => {
-                (StatusCode::NOT_FOUND, "invite code not found").into_response()
-            }
-            GroupError::Internal(e) => {
-                tracing::error!(error = ?e, "groups handler error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-            }
-        }
-    }
-}

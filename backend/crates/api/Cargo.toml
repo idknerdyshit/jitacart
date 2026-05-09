@@ -17,6 +17,7 @@ path = "src/main.rs"
 domain = { workspace = true }
 market = { workspace = true }
 auth-tokens = { workspace = true }
+bootstrap = { workspace = true }
 settlement = { workspace = true }
 webhook-dispatch = { workspace = true }
 rust_decimal = { workspace = true }
@@ -25,18 +26,16 @@ tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
+tower_governor = { workspace = true }
 
 sqlx = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-figment = { workspace = true }
-
 futures-util = "0.3"
 
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }

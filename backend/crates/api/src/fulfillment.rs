@@ -1,7 +1,5 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
 };
@@ -15,6 +13,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
+    errors::ApiError,
     extract::{CurrentClaim, CurrentGroup, CurrentList, CurrentUser},
     lists::load_list_detail,
     state::AppState,
@@ -101,7 +100,7 @@ async fn runs(
     CurrentGroup {
         user_id, group_id, ..
     }: CurrentGroup,
-) -> Result<Json<Vec<RunSummary>>, FulfillmentError> {
+) -> Result<Json<Vec<RunSummary>>, ApiError> {
     let rows: Vec<RunRow> = sqlx::query_as(
         r#"
         WITH item_agg AS (
@@ -152,7 +151,7 @@ async fn runs(
     .bind(user_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     if rows.is_empty() {
         return Ok(Json(vec![]));
@@ -171,7 +170,7 @@ async fn runs(
     .bind(&list_ids)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     let mut markets_by_list: std::collections::HashMap<Uuid, Vec<RunMarketRef>> =
         std::collections::HashMap::new();
@@ -192,7 +191,7 @@ async fn runs(
             let status = r
                 .status
                 .parse::<domain::ListStatus>()
-                .map_err(|e| internal(anyhow::anyhow!(e)))?;
+                .map_err(|e| ApiError::internal(anyhow::anyhow!(e)))?;
             Ok(RunSummary {
                 list_id: r.id,
                 destination_label: r.destination_label,
@@ -209,7 +208,7 @@ async fn runs(
                 my_active_claim_id: r.my_active_claim_id,
             })
         })
-        .collect::<Result<Vec<_>, FulfillmentError>>()?;
+        .collect::<Result<Vec<_>, ApiError>>()?;
 
     Ok(Json(summaries))
 }
@@ -220,9 +219,9 @@ async fn create_claim(
     State(state): State<AppState>,
     cur: CurrentList,
     Json(body): Json<CreateClaimBody>,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+) -> Result<Json<ListDetail>, ApiError> {
     cur.require_open().map_err(|_| {
-        FulfillmentError::Conflict(format!(
+        ApiError::Conflict(format!(
             "list is {}; claims can only be created on open lists",
             cur.status
         ))
@@ -234,12 +233,12 @@ async fn create_claim(
         ..
     } = cur;
     if body.item_ids.is_empty() {
-        return Err(FulfillmentError::BadRequest(
+        return Err(ApiError::BadRequest(
             "item_ids must not be empty".into(),
         ));
     }
 
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     lock_list(&mut tx, list_id).await?;
 
     validate_claimable_items(&mut tx, list_id, &body.item_ids).await?;
@@ -252,7 +251,7 @@ async fn create_claim(
     .bind(body.note.as_deref())
     .fetch_one(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     insert_claim_items(&mut tx, claim_id, &body.item_ids).await?;
 
@@ -260,15 +259,15 @@ async fn create_claim(
         .bind(user_id)
         .fetch_one(&mut *tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     let (list_dest, group_id_for_wh): (Option<String>, Uuid) =
         sqlx::query_as("SELECT destination_label, group_id FROM lists WHERE id = $1")
             .bind(list_id)
             .fetch_one(&mut *tx)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
 
     fire_webhook(
         &state,
@@ -282,7 +281,7 @@ async fn create_claim(
 
     let detail = load_list_detail(&state, list_id, user_id, role)
         .await
-        .map_err(list_err)?;
+        ?;
     Ok(Json(detail))
 }
 
@@ -290,9 +289,9 @@ async fn add_claim_items(
     State(state): State<AppState>,
     cur: CurrentClaim,
     Json(body): Json<AddClaimItemsBody>,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+) -> Result<Json<ListDetail>, ApiError> {
     cur.require_list_mutable().map_err(|_| {
-        FulfillmentError::Conflict("list is archived; no changes can be made".into())
+        ApiError::Conflict("list is archived; no changes can be made".into())
     })?;
     let CurrentClaim {
         claim_id,
@@ -305,22 +304,22 @@ async fn add_claim_items(
     } = cur;
     ensure_claim_writable(user_id, hauler_user_id, role, status)?;
     if body.item_ids.is_empty() {
-        return Err(FulfillmentError::BadRequest(
+        return Err(ApiError::BadRequest(
             "item_ids must not be empty".into(),
         ));
     }
 
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     lock_list(&mut tx, list_id).await?;
 
     validate_claimable_items(&mut tx, list_id, &body.item_ids).await?;
 
     insert_claim_items(&mut tx, claim_id, &body.item_ids).await?;
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     let detail = load_list_detail(&state, list_id, user_id, role)
         .await
-        .map_err(list_err)?;
+        ?;
     Ok(Json(detail))
 }
 
@@ -328,9 +327,9 @@ async fn remove_claim_item(
     State(state): State<AppState>,
     Path((_claim_id, item_id)): Path<(Uuid, Uuid)>,
     cur: CurrentClaim,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+) -> Result<Json<ListDetail>, ApiError> {
     cur.require_list_mutable().map_err(|_| {
-        FulfillmentError::Conflict("list is archived; no changes can be made".into())
+        ApiError::Conflict("list is archived; no changes can be made".into())
     })?;
     let CurrentClaim {
         claim_id,
@@ -343,7 +342,7 @@ async fn remove_claim_item(
     } = cur;
     ensure_claim_writable(user_id, hauler_user_id, role, status)?;
 
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     lock_list(&mut tx, list_id).await?;
 
     let r = sqlx::query("DELETE FROM claim_items WHERE claim_id = $1 AND list_item_id = $2")
@@ -351,27 +350,27 @@ async fn remove_claim_item(
         .bind(item_id)
         .execute(&mut *tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     if r.rows_affected() == 0 {
-        return Err(FulfillmentError::NotFound);
+        return Err(ApiError::not_found());
     }
 
     recompute_item_status(&mut tx, item_id, DeliveredDemotion::Forbid).await?;
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
 
     let detail = load_list_detail(&state, list_id, user_id, role)
         .await
-        .map_err(list_err)?;
+        ?;
     Ok(Json(detail))
 }
 
 async fn release_claim(
     State(state): State<AppState>,
     cur: CurrentClaim,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+) -> Result<Json<ListDetail>, ApiError> {
     cur.require_list_mutable().map_err(|_| {
-        FulfillmentError::Conflict("list is archived; no changes can be made".into())
+        ApiError::Conflict("list is archived; no changes can be made".into())
     })?;
     let CurrentClaim {
         claim_id,
@@ -384,7 +383,7 @@ async fn release_claim(
     } = cur;
     ensure_claim_writable(user_id, hauler_user_id, role, status)?;
 
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     lock_list(&mut tx, list_id).await?;
 
     // Load items before releasing so we can recompute them
@@ -393,21 +392,21 @@ async fn release_claim(
             .bind(claim_id)
             .fetch_all(&mut *tx)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
 
     sqlx::query("UPDATE claims SET status = 'released', released_at = now() WHERE id = $1")
         .bind(claim_id)
         .execute(&mut *tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     // Trigger fires and flips claim_items.active = false
 
     recompute_item_statuses_bulk(&mut tx, &item_ids).await?;
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     let detail = load_list_detail(&state, list_id, user_id, role)
         .await
-        .map_err(list_err)?;
+        ?;
     Ok(Json(detail))
 }
 
@@ -418,9 +417,9 @@ async fn record_fulfillment(
     Path((_list_id, item_id)): Path<(Uuid, Uuid)>,
     cur: CurrentList,
     Json(body): Json<RecordFulfillmentBody>,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+) -> Result<Json<ListDetail>, ApiError> {
     cur.require_mutable().map_err(|_| {
-        FulfillmentError::Conflict("list is archived; no changes can be made".into())
+        ApiError::Conflict("list is archived; no changes can be made".into())
     })?;
     let CurrentList {
         list_id,
@@ -429,10 +428,10 @@ async fn record_fulfillment(
         ..
     } = cur;
     if body.qty <= 0 {
-        return Err(FulfillmentError::BadRequest("qty must be positive".into()));
+        return Err(ApiError::BadRequest("qty must be positive".into()));
     }
     if body.unit_price_isk < Decimal::ZERO {
-        return Err(FulfillmentError::BadRequest(
+        return Err(ApiError::BadRequest(
             "unit_price_isk must be >= 0".into(),
         ));
     }
@@ -440,12 +439,12 @@ async fn record_fulfillment(
     if body.bought_at_market_id.is_none() {
         match &body.bought_at_note {
             None => {
-                return Err(FulfillmentError::BadRequest(
+                return Err(ApiError::BadRequest(
                     "bought_at_note is required when no market is specified".into(),
                 ))
             }
             Some(n) if n.trim().is_empty() => {
-                return Err(FulfillmentError::BadRequest(
+                return Err(ApiError::BadRequest(
                     "bought_at_note must not be blank".into(),
                 ))
             }
@@ -453,7 +452,7 @@ async fn record_fulfillment(
         }
     }
 
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     lock_list(&mut tx, list_id).await?;
 
     // Load the item
@@ -465,13 +464,13 @@ async fn record_fulfillment(
     .bind(list_id)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     let (qty_requested, qty_fulfilled, requested_by_user_id) =
-        item_row.ok_or(FulfillmentError::NotFound)?;
+        item_row.ok_or_else(ApiError::not_found)?;
 
     if body.qty + qty_fulfilled > qty_requested {
-        return Err(FulfillmentError::Conflict(format!(
+        return Err(ApiError::Conflict(format!(
             "fulfillment qty {} would exceed requested {} (already fulfilled: {})",
             body.qty, qty_requested, qty_fulfilled
         )));
@@ -505,14 +504,14 @@ async fn record_fulfillment(
     .bind(user_id)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     if let Some(s) = existing_reimb_status {
         let rs: ReimbursementStatus = s
             .parse()
-            .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
+            .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
         if rs != ReimbursementStatus::Pending {
-            return Err(FulfillmentError::Conflict(format!(
+            return Err(ApiError::Conflict(format!(
                 "reimbursement for this requester is already {s}; \
                  cannot record additional fulfillments"
             )));
@@ -535,15 +534,15 @@ async fn record_fulfillment(
         .bind(user_id)
         .fetch_one(&mut *tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
         if !market_exists {
-            return Err(FulfillmentError::BadRequest(
+            return Err(ApiError::BadRequest(
                 "bought_at_market_id does not exist".into(),
             ));
         }
         if !char_owned {
-            return Err(FulfillmentError::BadRequest(
+            return Err(ApiError::BadRequest(
                 "hauler_character_id does not belong to you".into(),
             ));
         }
@@ -560,16 +559,16 @@ async fn record_fulfillment(
     .bind(item_id)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     if let Some((active_claim_id, active_hauler_user_id)) = active_claim {
         if user_id != active_hauler_user_id && role != GroupRole::Owner {
-            return Err(FulfillmentError::Forbidden);
+            return Err(ApiError::forbidden());
         }
         // Validate explicit claim_id if provided
         if let Some(explicit_claim_id) = body.claim_id {
             if explicit_claim_id != active_claim_id {
-                return Err(FulfillmentError::BadRequest(
+                return Err(ApiError::BadRequest(
                     "claim_id does not match the active claim for this item".into(),
                 ));
             }
@@ -597,7 +596,7 @@ async fn record_fulfillment(
     .bind(body.bought_at_note.as_deref())
     .execute(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     let new_status = recompute_item_status(&mut tx, item_id, DeliveredDemotion::Forbid).await?;
 
@@ -617,7 +616,7 @@ async fn record_fulfillment(
             .bind(claim_id)
             .fetch_one(&mut *tx)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
 
             if all_done {
                 sqlx::query(
@@ -626,17 +625,17 @@ async fn record_fulfillment(
                 .bind(claim_id)
                 .execute(&mut *tx)
                 .await
-                .map_err(internal)?;
+                .map_err(ApiError::internal)?;
             }
         }
     }
 
     upsert_reimbursement(&mut tx, list_id, requested_by_user_id, user_id).await?;
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     let detail = load_list_detail(&state, list_id, user_id, role)
         .await
-        .map_err(list_err)?;
+        ?;
     Ok(Json(detail))
 }
 
@@ -644,7 +643,7 @@ async fn reverse_fulfillment(
     State(state): State<AppState>,
     Path(fulfillment_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+) -> Result<Json<ListDetail>, ApiError> {
     // Load fulfillment + its list context to get the group membership
     type ReverseRow = (Uuid, Uuid, Uuid, Option<DateTime<Utc>>, String);
     let row: Option<ReverseRow> = sqlx::query_as(
@@ -657,22 +656,22 @@ async fn reverse_fulfillment(
     .bind(fulfillment_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     let (hauler_user_id, list_id, requested_by_user_id, reversed_at, list_status_str) =
-        row.ok_or(FulfillmentError::NotFound)?;
+        row.ok_or_else(ApiError::not_found)?;
 
     let list_status: ListStatus = list_status_str
         .parse()
-        .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
+        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
     if list_status == ListStatus::Archived {
-        return Err(FulfillmentError::Conflict(
+        return Err(ApiError::Conflict(
             "list is archived; no changes can be made".into(),
         ));
     }
 
     if reversed_at.is_some() {
-        return Err(FulfillmentError::BadRequest(
+        return Err(ApiError::BadRequest(
             "fulfillment is already reversed".into(),
         ));
     }
@@ -687,18 +686,18 @@ async fn reverse_fulfillment(
     .bind(list_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     let role: GroupRole = role_str
-        .ok_or(FulfillmentError::Forbidden)?
+        .ok_or_else(ApiError::forbidden)?
         .parse()
-        .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
+        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
 
     if user_id != hauler_user_id && role != GroupRole::Owner {
-        return Err(FulfillmentError::Forbidden);
+        return Err(ApiError::forbidden());
     }
 
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     lock_list(&mut tx, list_id).await?;
 
     // Check reimbursement is not settled; resolve principals from the list's
@@ -726,14 +725,14 @@ async fn reverse_fulfillment(
     .bind(hauler_user_id)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     if let Some(s) = reimb_status {
         let rs: ReimbursementStatus = s
             .parse()
-            .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
+            .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
         if rs != ReimbursementStatus::Pending {
-            return Err(FulfillmentError::Conflict(
+            return Err(ApiError::Conflict(
                 "cannot reverse a fulfillment whose reimbursement is already settled".into(),
             ));
         }
@@ -745,15 +744,15 @@ async fn reverse_fulfillment(
     .bind(fulfillment_id)
     .fetch_one(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     recompute_item_status(&mut tx, item_id, DeliveredDemotion::Allow).await?;
     upsert_reimbursement(&mut tx, list_id, requested_by_user_id, hauler_user_id).await?;
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     let detail = load_list_detail(&state, list_id, user_id, role)
         .await
-        .map_err(list_err)?;
+        ?;
     Ok(Json(detail))
 }
 
@@ -761,9 +760,9 @@ async fn mark_delivered(
     State(state): State<AppState>,
     Path((_list_id, item_id)): Path<(Uuid, Uuid)>,
     cur: CurrentList,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+) -> Result<Json<ListDetail>, ApiError> {
     cur.require_mutable().map_err(|_| {
-        FulfillmentError::Conflict("list is archived; no changes can be made".into())
+        ApiError::Conflict("list is archived; no changes can be made".into())
     })?;
     let CurrentList {
         list_id,
@@ -771,7 +770,7 @@ async fn mark_delivered(
         role,
         ..
     } = cur;
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     lock_list(&mut tx, list_id).await?;
 
     // Check current status and last hauler
@@ -786,28 +785,28 @@ async fn mark_delivered(
     .bind(list_id)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
-    let (status_str, last_hauler) = row.ok_or(FulfillmentError::NotFound)?;
+    let (status_str, last_hauler) = row.ok_or_else(ApiError::not_found)?;
     let item_status: ListItemStatus = status_str
         .parse()
-        .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
+        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
 
     if item_status != ListItemStatus::Bought {
-        return Err(FulfillmentError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "item must be in 'bought' status to mark delivered (currently: {status_str})"
         )));
     }
 
     if user_id != last_hauler.unwrap_or(Uuid::nil()) && role != GroupRole::Owner {
-        return Err(FulfillmentError::Forbidden);
+        return Err(ApiError::forbidden());
     }
 
     sqlx::query("UPDATE list_items SET status = 'delivered' WHERE id = $1")
         .bind(item_id)
         .execute(&mut *tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     let all_done: bool = sqlx::query_scalar(
         "SELECT NOT EXISTS(\
@@ -818,21 +817,21 @@ async fn mark_delivered(
     .bind(list_id)
     .fetch_one(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     let hauler_name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_one(&mut *tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     let (list_dest, group_id_for_wh): (Option<String>, Uuid) =
         sqlx::query_as("SELECT destination_label, group_id FROM lists WHERE id = $1")
             .bind(list_id)
             .fetch_one(&mut *tx)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
 
     if all_done {
         fire_webhook(
@@ -847,7 +846,7 @@ async fn mark_delivered(
 
     let detail = load_list_detail(&state, list_id, user_id, role)
         .await
-        .map_err(list_err)?;
+        ?;
     Ok(Json(detail))
 }
 
@@ -857,9 +856,9 @@ async fn set_list_tip(
     State(state): State<AppState>,
     cur: CurrentList,
     Json(body): Json<SetTipBody>,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+) -> Result<Json<ListDetail>, ApiError> {
     cur.require_mutable().map_err(|_| {
-        FulfillmentError::Conflict("list is archived; no changes can be made".into())
+        ApiError::Conflict("list is archived; no changes can be made".into())
     })?;
     let CurrentList {
         list_id,
@@ -872,7 +871,7 @@ async fn set_list_tip(
 
     let is_creator = user_id == created_by_user_id;
     if !is_creator && role != GroupRole::Owner {
-        return Err(FulfillmentError::Forbidden);
+        return Err(ApiError::forbidden());
     }
 
     // Creator is locked out once any fulfillment exists; owner can always edit
@@ -887,13 +886,13 @@ async fn set_list_tip(
         .bind(list_id)
         .fetch_one(&state.pool)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
         if has_fulfillments {
-            return Err(FulfillmentError::Forbidden);
+            return Err(ApiError::forbidden());
         }
     }
 
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     lock_list(&mut tx, list_id).await?;
 
     sqlx::query("UPDATE lists SET tip_pct = $1 WHERE id = $2")
@@ -901,7 +900,7 @@ async fn set_list_tip(
         .bind(list_id)
         .execute(&mut *tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     // Recompute all pending reimbursements for this list
     sqlx::query(
@@ -915,12 +914,12 @@ async fn set_list_tip(
     .bind(list_id)
     .execute(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     let detail = load_list_detail(&state, list_id, user_id, role)
         .await
-        .map_err(list_err)?;
+        ?;
     Ok(Json(detail))
 }
 
@@ -928,9 +927,9 @@ async fn set_group_default_tip(
     State(state): State<AppState>,
     CurrentGroup { group_id, role, .. }: CurrentGroup,
     Json(body): Json<SetTipBody>,
-) -> Result<Json<domain::Group>, FulfillmentError> {
+) -> Result<Json<domain::Group>, ApiError> {
     if role != GroupRole::Owner {
-        return Err(FulfillmentError::Forbidden);
+        return Err(ApiError::forbidden());
     }
     validate_tip_pct(body.tip_pct)?;
 
@@ -942,9 +941,9 @@ async fn set_group_default_tip(
     .bind(group_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
-    let group = row.ok_or(FulfillmentError::NotFound)?.into_group();
+    let group = row.ok_or_else(ApiError::not_found)?.into_group();
     Ok(Json(group))
 }
 
@@ -954,7 +953,7 @@ async fn settle_reimbursement(
     State(state): State<AppState>,
     Path(reimb_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+) -> Result<Json<ListDetail>, ApiError> {
     // Load reimbursement (also for permission checks).
     // requester_user_id is nullable for corp-funded rows.
     #[derive(sqlx::FromRow)]
@@ -971,17 +970,17 @@ async fn settle_reimbursement(
     .bind(reimb_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
-    let r = row.ok_or(FulfillmentError::NotFound)?;
+    let r = row.ok_or_else(ApiError::not_found)?;
     let (list_id, requester_user_id, contract_id) = (r.list_id, r.requester_user_id, r.contract_id);
     let reimb_status: ReimbursementStatus = r
         .status
         .parse()
-        .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
+        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
 
     if reimb_status != ReimbursementStatus::Pending {
-        return Err(FulfillmentError::Conflict(format!(
+        return Err(ApiError::Conflict(format!(
             "reimbursement is already {}",
             r.status
         )));
@@ -990,7 +989,7 @@ async fn settle_reimbursement(
     // Bound to a contract: ESI is the source of truth, manual settle would
     // race with the worker. Hauler must explicitly unlink first.
     if contract_id.is_some() {
-        return Err(FulfillmentError::Conflict(
+        return Err(ApiError::Conflict(
             "this reimbursement is bound to a contract; unlink it before settling manually".into(),
         ));
     }
@@ -1008,35 +1007,35 @@ async fn settle_reimbursement(
     .bind(list_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     let role: GroupRole = role_str
-        .ok_or(FulfillmentError::Forbidden)?
+        .ok_or_else(ApiError::forbidden)?
         .parse()
-        .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
+        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
 
     // Corp-funded reimbursements have no user requester; only owners can settle.
     let is_requester = requester_user_id == Some(user_id);
     let is_owner = role == GroupRole::Owner;
 
     if !is_requester && !is_owner {
-        return Err(FulfillmentError::Forbidden);
+        return Err(ApiError::forbidden());
     }
 
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     lock_list(&mut tx, list_id).await?;
 
     settlement::settle_manual(&mut tx, reimb_id, user_id)
         .await
         .map_err(|e| match e {
-            settlement::SettlementError::NotFound => FulfillmentError::NotFound,
+            settlement::SettlementError::NotFound => ApiError::not_found(),
             settlement::SettlementError::NotPending(s) => {
-                FulfillmentError::Conflict(format!("reimbursement is already {s}"))
+                ApiError::Conflict(format!("reimbursement is already {s}"))
             }
-            settlement::SettlementError::NotDelivered { count } => FulfillmentError::Conflict(
+            settlement::SettlementError::NotDelivered { count } => ApiError::Conflict(
                 format!("{count} item(s) must be fully bought and delivered before settling"),
             ),
-            settlement::SettlementError::Db(e) => internal(e),
+            settlement::SettlementError::Db(e) => ApiError::internal(e),
         })?;
 
     let (list_dest, group_id_for_wh): (Option<String>, Uuid) =
@@ -1044,14 +1043,14 @@ async fn settle_reimbursement(
             .bind(list_id)
             .fetch_one(&mut *tx)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
 
     let req_name: String = match requester_user_id {
         Some(uid) => sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
             .bind(uid)
             .fetch_one(&mut *tx)
             .await
-            .map_err(internal)?,
+            .map_err(ApiError::internal)?,
         None => "Corp".into(),
     };
     let (hauler_name, total_isk): (String, rust_decimal::Decimal) = sqlx::query_as(
@@ -1062,9 +1061,9 @@ async fn settle_reimbursement(
     .bind(reimb_id)
     .fetch_one(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
 
     fire_webhook(
         &state,
@@ -1079,7 +1078,7 @@ async fn settle_reimbursement(
 
     let detail = load_list_detail(&state, list_id, user_id, role)
         .await
-        .map_err(list_err)?;
+        ?;
     Ok(Json(detail))
 }
 
@@ -1096,21 +1095,21 @@ fn ensure_claim_writable(
     hauler_user_id: Uuid,
     role: GroupRole,
     status: ClaimStatus,
-) -> Result<(), FulfillmentError> {
+) -> Result<(), ApiError> {
     if user_id != hauler_user_id && role != GroupRole::Owner {
-        return Err(FulfillmentError::Forbidden);
+        return Err(ApiError::forbidden());
     }
     if status != ClaimStatus::Active {
-        return Err(FulfillmentError::Conflict(format!(
+        return Err(ApiError::Conflict(format!(
             "claim is {status}, not active"
         )));
     }
     Ok(())
 }
 
-fn validate_tip_pct(v: Decimal) -> Result<(), FulfillmentError> {
+fn validate_tip_pct(v: Decimal) -> Result<(), ApiError> {
     if v < Decimal::ZERO || v > Decimal::ONE {
-        return Err(FulfillmentError::BadRequest(
+        return Err(ApiError::BadRequest(
             "tip_pct must be between 0 and 1".into(),
         ));
     }
@@ -1125,7 +1124,7 @@ async fn validate_claimable_items(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     list_id: Uuid,
     item_ids: &[Uuid],
-) -> Result<(), FulfillmentError> {
+) -> Result<(), ApiError> {
     let rows: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT id, status FROM list_items \
          WHERE id = ANY($1::uuid[]) AND list_id = $2",
@@ -1134,16 +1133,16 @@ async fn validate_claimable_items(
     .bind(list_id)
     .fetch_all(&mut **tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     if rows.len() != item_ids.len() {
-        return Err(FulfillmentError::BadRequest(
+        return Err(ApiError::BadRequest(
             "one or more item_ids do not belong to this list".into(),
         ));
     }
 
     if let Some((_, bad)) = rows.iter().find(|(_, s)| s != "open") {
-        return Err(FulfillmentError::Conflict(format!(
+        return Err(ApiError::Conflict(format!(
             "cannot claim item with status '{bad}'; only open items may be claimed"
         )));
     }
@@ -1155,7 +1154,7 @@ async fn insert_claim_items(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     claim_id: Uuid,
     item_ids: &[Uuid],
-) -> Result<(), FulfillmentError> {
+) -> Result<(), ApiError> {
     if item_ids.is_empty() {
         return Ok(());
     }
@@ -1170,11 +1169,11 @@ async fn insert_claim_items(
     {
         Ok(_) => {}
         Err(e) if is_claim_conflict(&e) => {
-            return Err(FulfillmentError::Conflict(
+            return Err(ApiError::Conflict(
                 "one or more items are already claimed".into(),
             ));
         }
-        Err(e) => return Err(internal(e)),
+        Err(e) => return Err(ApiError::internal(e)),
     }
     recompute_item_statuses_bulk(tx, item_ids).await?;
     Ok(())
@@ -1183,13 +1182,13 @@ async fn insert_claim_items(
 async fn lock_list(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     list_id: Uuid,
-) -> Result<(), FulfillmentError> {
+) -> Result<(), ApiError> {
     let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM lists WHERE id = $1 FOR UPDATE")
         .bind(list_id)
         .fetch_optional(&mut **tx)
         .await
-        .map_err(internal)?;
-    exists.ok_or(FulfillmentError::NotFound).map(|_| ())
+        .map_err(ApiError::internal)?;
+    exists.ok_or_else(ApiError::not_found).map(|_| ())
 }
 
 /// Recompute open/claimed/bought status for an item based on current fulfillments and claims.
@@ -1199,16 +1198,16 @@ async fn recompute_item_status(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     item_id: Uuid,
     demotion: DeliveredDemotion,
-) -> Result<ListItemStatus, FulfillmentError> {
+) -> Result<ListItemStatus, ApiError> {
     let current: String = sqlx::query_scalar("SELECT status FROM list_items WHERE id = $1")
         .bind(item_id)
         .fetch_one(&mut **tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     let current_status: ListItemStatus = current
         .parse()
-        .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
+        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
 
     if current_status == ListItemStatus::Settled {
         return Ok(current_status);
@@ -1228,7 +1227,7 @@ async fn recompute_item_status(
     .bind(item_id)
     .fetch_one(&mut **tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     let base_status = if qty_fulfilled >= qty_requested {
         ListItemStatus::Bought
@@ -1252,7 +1251,7 @@ async fn recompute_item_status(
         .bind(item_id)
         .execute(&mut **tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     Ok(new_status)
 }
@@ -1262,7 +1261,7 @@ async fn recompute_item_status(
 async fn recompute_item_statuses_bulk(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     item_ids: &[Uuid],
-) -> Result<(), FulfillmentError> {
+) -> Result<(), ApiError> {
     if item_ids.is_empty() {
         return Ok(());
     }
@@ -1297,7 +1296,7 @@ async fn recompute_item_statuses_bulk(
     .bind(item_ids)
     .execute(&mut **tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -1310,7 +1309,7 @@ async fn upsert_reimbursement(
     list_id: Uuid,
     requester_user_id: Uuid,
     hauler_user_id: Uuid,
-) -> Result<(), FulfillmentError> {
+) -> Result<(), ApiError> {
     sqlx::query(
         r#"
         WITH meta AS (
@@ -1363,7 +1362,7 @@ async fn upsert_reimbursement(
     .bind(hauler_user_id)
     .execute(&mut **tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -1396,43 +1395,3 @@ impl GroupRow {
     }
 }
 
-// ── Error type ────────────────────────────────────────────────────────────────
-
-pub enum FulfillmentError {
-    BadRequest(String),
-    NotFound,
-    Forbidden,
-    Conflict(String),
-    Internal(anyhow::Error),
-}
-
-fn internal<E: Into<anyhow::Error>>(e: E) -> FulfillmentError {
-    FulfillmentError::Internal(e.into())
-}
-
-fn list_err(e: crate::lists::ListError) -> FulfillmentError {
-    match e {
-        crate::lists::ListError::NotFound => FulfillmentError::NotFound,
-        crate::lists::ListError::Forbidden => FulfillmentError::Forbidden,
-        crate::lists::ListError::Conflict(msg) => FulfillmentError::Conflict(msg),
-        crate::lists::ListError::BadRequest(m) => FulfillmentError::BadRequest(m),
-        crate::lists::ListError::Internal(e) => FulfillmentError::Internal(e),
-    }
-}
-
-impl IntoResponse for FulfillmentError {
-    fn into_response(self) -> Response {
-        match self {
-            FulfillmentError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
-            FulfillmentError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
-            FulfillmentError::Forbidden => {
-                (StatusCode::FORBIDDEN, "you cannot perform this action").into_response()
-            }
-            FulfillmentError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
-            FulfillmentError::Internal(e) => {
-                tracing::error!(error = ?e, "fulfillment handler error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-            }
-        }
-    }
-}

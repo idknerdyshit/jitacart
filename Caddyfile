@@ -1,0 +1,37 @@
+# JitaCart reverse proxy.
+#
+# - $JC_DOMAIN is the public hostname; Caddy obtains a Let's Encrypt
+#   certificate automatically on first start (HTTP-01 over :80).
+# - /api/* is rewritten and forwarded to the Rust API; Caddy strips the
+#   prefix because the API routes are NOT prefixed with /api.
+# - Everything else hits the SvelteKit Node server.
+#
+# For local docker-compose testing without a real domain, set
+# $JC_DOMAIN=:80 and Caddy will serve plain HTTP on port 80 only.
+
+{$JC_DOMAIN} {
+    encode zstd gzip
+
+    # Trust the proxy chain in front of us, if any (none by default).
+    # For real internet exposure, leave this commented; Caddy is the edge.
+
+    @api path /api/*
+    handle @api {
+        # Strip the /api prefix before forwarding.
+        uri strip_prefix /api
+        reverse_proxy api:8080 {
+            # Forward original client info; the API doesn't currently
+            # consume these but tower-governor's IP extractor benefits.
+            header_up X-Real-IP {http.request.remote.host}
+        }
+    }
+
+    handle {
+        reverse_proxy frontend:3000
+    }
+
+    log {
+        output stdout
+        format json
+    }
+}

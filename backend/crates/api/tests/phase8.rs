@@ -11,9 +11,10 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use common::*;
 use domain::{GroupRole, ListStatus};
-use jitacart_api::auth::{do_set_active_character, AuthError};
+use jitacart_api::auth::do_set_active_character;
+use jitacart_api::errors::ApiError;
 use jitacart_api::extract::CurrentList;
-use jitacart_api::lists::{do_patch_list_status, ListError};
+use jitacart_api::lists::do_patch_list_status;
 use jitacart_api::webhooks::{
     build_payload, dispatch_webhook, do_delete_webhook, do_get_webhook, do_upsert_webhook,
     WebhookConfig, WebhookEvent, WebhookSender,
@@ -94,7 +95,7 @@ async fn set_active_character_rejects_other_users_character(pool: PgPool) {
     let err = do_set_active_character(&pool, alice, Some(bobs_char))
         .await
         .unwrap_err();
-    assert!(matches!(err, AuthError::Unauthorized));
+    assert!(matches!(err, ApiError::Unauthorized));
 
     assert_eq!(get_active_character_id(&pool, alice).await, None);
 }
@@ -323,5 +324,5 @@ async fn patch_list_status_forbidden_for_non_creator_member(pool: PgPool) {
     let err = do_patch_list_status(&pool, ids.list_id, hauler, ListStatus::Archived)
         .await
         .unwrap_err();
-    assert!(matches!(err, ListError::Forbidden));
+    assert!(matches!(err, ApiError::Forbidden(_)));
 }

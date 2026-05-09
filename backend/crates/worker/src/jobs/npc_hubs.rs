@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use anyhow::anyhow;
+use auth_tokens::budgeted;
 use domain::{Market, MarketKind};
 use uuid::Uuid;
 
@@ -84,12 +85,14 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
         let label = m.short_label.clone().unwrap_or_else(|| "(unnamed)".into());
         let inner = type_ids.into_iter().map(|type_id| {
             let m = m.clone();
-            async move { (type_id, market::refresh_one(pool, esi, &m, type_id).await) }
+            async move {
+                let r = budgeted(budget, market::refresh_one(pool, esi, &m, type_id)).await;
+                (type_id, r)
+            }
         });
         let results = futures_util::future::join_all(inner).await;
         for (type_id, res) in results {
             if let Err(e) = res {
-                budget.record_non_2xx();
                 tracing::warn!(error = ?e, market = %label, type_id, "market refresh failed");
             }
         }

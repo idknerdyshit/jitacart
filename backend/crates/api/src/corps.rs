@@ -6,7 +6,6 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
 };
@@ -18,8 +17,9 @@ use uuid::Uuid;
 use domain::{GroupRole, ListDetail};
 
 use crate::{
+    errors::ApiError,
     extract::{CurrentGroup, CurrentUser},
-    lists::{load_list_detail, ListError},
+    lists::load_list_detail,
     state::AppState,
 };
 
@@ -112,10 +112,10 @@ async fn list_corps(
         user_id,
         role,
     }: CurrentGroup,
-) -> Result<Json<CorpsResponse>, CorpError> {
+) -> Result<Json<CorpsResponse>, ApiError> {
     let corps = list_corps_inner(&state.pool, group_id, user_id, role)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     Ok(Json(CorpsResponse { corps, role }))
 }
 
@@ -133,9 +133,9 @@ async fn link_corp(
         role,
     }: CurrentGroup,
     Json(body): Json<LinkCorpBody>,
-) -> Result<Json<CorpDto>, CorpError> {
+) -> Result<Json<CorpDto>, ApiError> {
     if role != domain::GroupRole::Owner {
-        return Err(CorpError::Forbidden);
+        return Err(ApiError::forbidden());
     }
 
     // Verify the character belongs to this user and has corp scopes.
@@ -147,9 +147,9 @@ async fn link_corp(
     .bind(user_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
-    let (char_uuid, granted_scopes) = char_row.ok_or(CorpError::BadRequest(
+    let (char_uuid, granted_scopes) = char_row.ok_or(ApiError::BadRequest(
         "character not found or not yours".into(),
     ))?;
 
@@ -158,25 +158,25 @@ async fn link_corp(
         .token_store
         .authed_client_for(char_uuid)
         .await
-        .map_err(CorpError::Internal)?;
+        .map_err(ApiError::Internal)?;
 
     let affiliations = client
         .character_affiliation(&[body.character_id])
         .await
-        .map_err(|e| CorpError::Internal(e.into()))?;
+        .map_err(|e| ApiError::Internal(e.into()))?;
 
     let esi_corp_id = affiliations
         .into_iter()
         .find(|a| a.character_id == body.character_id)
         .map(|a| a.corporation_id)
-        .ok_or_else(|| CorpError::Internal(anyhow::anyhow!("affiliation not found")))?;
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("affiliation not found")))?;
 
     let corp_info = client
         .get_corporation(esi_corp_id)
         .await
-        .map_err(|e| CorpError::Internal(e.into()))?;
+        .map_err(|e| ApiError::Internal(e.into()))?;
 
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
 
     // Upsert corp row.
     let corp_id: Uuid = sqlx::query_scalar(
@@ -196,7 +196,7 @@ async fn link_corp(
     .bind(&corp_info.ticker)
     .fetch_one(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     // Upsert corp principal.
     sqlx::query(
@@ -209,7 +209,7 @@ async fn link_corp(
     .bind(corp_id)
     .execute(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     // Link corp to group. One row per pair: activate (clear unlinked_at) on relink.
     sqlx::query(
@@ -230,7 +230,7 @@ async fn link_corp(
     .bind(user_id)
     .execute(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     // Upsert ambassador.
     sqlx::query(
@@ -248,18 +248,18 @@ async fn link_corp(
     .bind(&granted_scopes)
     .execute(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
 
     // Return updated corp dto.
     let corps = list_corps_inner(&state.pool, group_id, user_id, role)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     let dto = corps
         .into_iter()
         .find(|c| c.id == corp_id)
-        .ok_or_else(|| internal(anyhow::anyhow!("corp not found after link")))?;
+        .ok_or_else(|| ApiError::internal(anyhow::anyhow!("corp not found after link")))?;
 
     Ok(Json(dto))
 }
@@ -274,9 +274,9 @@ async fn add_ambassador(
     Path((group_id, corp_id)): Path<(Uuid, Uuid)>,
     CurrentGroup { user_id, role, .. }: CurrentGroup,
     Json(body): Json<AddAmbassadorBody>,
-) -> Result<StatusCode, CorpError> {
+) -> Result<StatusCode, ApiError> {
     if role != domain::GroupRole::Owner {
-        return Err(CorpError::Forbidden);
+        return Err(ApiError::forbidden());
     }
     require_corp_in_group(&state.pool, group_id, corp_id).await?;
 
@@ -288,9 +288,9 @@ async fn add_ambassador(
     .bind(user_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
-    let (char_uuid, granted_scopes) = char_row.ok_or(CorpError::BadRequest(
+    let (char_uuid, granted_scopes) = char_row.ok_or(ApiError::BadRequest(
         "character not found or not yours".into(),
     ))?;
 
@@ -311,7 +311,7 @@ async fn add_ambassador(
     .bind(group_id)
     .execute(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -320,9 +320,9 @@ async fn remove_ambassador(
     State(state): State<AppState>,
     Path((group_id, corp_id, character_id)): Path<(Uuid, Uuid, Uuid)>,
     CurrentGroup { role, .. }: CurrentGroup,
-) -> Result<StatusCode, CorpError> {
+) -> Result<StatusCode, ApiError> {
     if role != domain::GroupRole::Owner {
-        return Err(CorpError::Forbidden);
+        return Err(ApiError::forbidden());
     }
     require_corp_in_group(&state.pool, group_id, corp_id).await?;
 
@@ -334,7 +334,7 @@ async fn remove_ambassador(
     .bind(character_id)
     .execute(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -343,13 +343,13 @@ async fn unlink_corp(
     State(state): State<AppState>,
     Path((group_id, corp_id)): Path<(Uuid, Uuid)>,
     CurrentGroup { role, .. }: CurrentGroup,
-) -> Result<StatusCode, CorpError> {
+) -> Result<StatusCode, ApiError> {
     if role != domain::GroupRole::Owner {
-        return Err(CorpError::Forbidden);
+        return Err(ApiError::forbidden());
     }
     require_corp_in_group(&state.pool, group_id, corp_id).await?;
 
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
 
     sqlx::query(
         "UPDATE group_corps SET unlinked_at = now() \
@@ -359,7 +359,7 @@ async fn unlink_corp(
     .bind(corp_id)
     .execute(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     // Disable ambassadors contributed through this group.
     sqlx::query(
@@ -370,7 +370,7 @@ async fn unlink_corp(
     .bind(group_id)
     .execute(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     // If no other group links this corp, disable it (stop polling).
     let other_links: i64 = sqlx::query_scalar(
@@ -380,17 +380,17 @@ async fn unlink_corp(
     .bind(corp_id)
     .fetch_one(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     if other_links == 0 {
         sqlx::query("UPDATE corps SET disabled_at = now() WHERE id = $1")
             .bind(corp_id)
             .execute(&mut *tx)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
     }
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -415,7 +415,7 @@ async fn list_journal(
         ..
     }: CurrentGroup,
     Query(q): Query<JournalQuery>,
-) -> Result<Json<Vec<JournalEntryDto>>, CorpError> {
+) -> Result<Json<Vec<JournalEntryDto>>, ApiError> {
     require_corp_in_group(&state.pool, group_id, corp_id).await?;
 
     // Determine visibility: ambassador or group owner sees raw_json.
@@ -430,7 +430,7 @@ async fn list_journal(
     .bind(user_id)
     .fetch_one(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     let is_owner: bool = sqlx::query_scalar(
         "SELECT EXISTS(
@@ -442,11 +442,11 @@ async fn list_journal(
     .bind(user_id)
     .fetch_one(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     let full_visibility = is_ambassador || is_owner;
     if !full_visibility {
-        return Err(CorpError::Forbidden);
+        return Err(ApiError::forbidden());
     }
 
     #[derive(sqlx::FromRow)]
@@ -485,7 +485,7 @@ async fn list_journal(
     .bind(q.division)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     let entries = rows
         .into_iter()
@@ -524,11 +524,11 @@ async fn patch_list_payer(
     Path(list_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
     Json(body): Json<PatchListPayerBody>,
-) -> Result<Json<ListDetail>, CorpError> {
+) -> Result<Json<ListDetail>, ApiError> {
     // Verify both or neither.
     match (&body.payer_corp_id, body.payer_division) {
         (Some(_), None) | (None, Some(_)) => {
-            return Err(CorpError::BadRequest(
+            return Err(ApiError::BadRequest(
                 "payer_corp_id and payer_division must both be set or both be null".into(),
             ));
         }
@@ -546,9 +546,9 @@ async fn patch_list_payer(
     .bind(user_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
-    let group_id = row.ok_or(CorpError::Forbidden)?.0;
+    let group_id = row.ok_or_else(ApiError::forbidden)?.0;
 
     // Determine the caller's actual role for the response payload.
     let role_str: Option<String> = sqlx::query_scalar(
@@ -558,7 +558,7 @@ async fn patch_list_payer(
     .bind(user_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
     let actual_role: GroupRole = role_str
         .as_deref()
         .and_then(|s| s.parse().ok())
@@ -570,10 +570,10 @@ async fn patch_list_payer(
             .bind(list_id)
             .fetch_one(&state.pool)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
 
     if has_reimbs {
-        return Err(CorpError::Conflict(
+        return Err(ApiError::Conflict(
             "payer cannot be changed after reimbursements have been generated".into(),
         ));
     }
@@ -589,17 +589,9 @@ async fn patch_list_payer(
         .bind(body.payer_division)
         .execute(&state.pool)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
-    let detail = load_list_detail(&state, list_id, user_id, actual_role)
-        .await
-        .map_err(|e| match e {
-            ListError::NotFound => CorpError::NotFound,
-            ListError::Forbidden => CorpError::Forbidden,
-            ListError::Internal(e) => internal(e),
-            ListError::BadRequest(m) => CorpError::BadRequest(m),
-            ListError::Conflict(m) => CorpError::Conflict(m),
-        })?;
+    let detail = load_list_detail(&state, list_id, user_id, actual_role).await?;
     Ok(Json(detail))
 }
 
@@ -609,7 +601,7 @@ async fn require_corp_in_group(
     pool: &sqlx::PgPool,
     group_id: Uuid,
     corp_id: Uuid,
-) -> Result<(), CorpError> {
+) -> Result<(), ApiError> {
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM group_corps \
          WHERE group_id = $1 AND corp_id = $2 AND unlinked_at IS NULL)",
@@ -618,10 +610,10 @@ async fn require_corp_in_group(
     .bind(corp_id)
     .fetch_one(pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     if !exists {
-        return Err(CorpError::NotFound);
+        return Err(ApiError::not_found());
     }
     Ok(())
 }
@@ -757,34 +749,3 @@ async fn list_corps_inner(
     Ok(result)
 }
 
-// ── Error ─────────────────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-pub enum CorpError {
-    NotFound,
-    Forbidden,
-    BadRequest(String),
-    Conflict(String),
-    Internal(anyhow::Error),
-}
-
-fn internal<E: Into<anyhow::Error>>(e: E) -> CorpError {
-    CorpError::Internal(e.into())
-}
-
-impl IntoResponse for CorpError {
-    fn into_response(self) -> Response {
-        match self {
-            CorpError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
-            CorpError::Forbidden => {
-                (StatusCode::FORBIDDEN, "you cannot perform this action").into_response()
-            }
-            CorpError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
-            CorpError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
-            CorpError::Internal(e) => {
-                tracing::error!(error = ?e, "corps handler error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-            }
-        }
-    }
-}

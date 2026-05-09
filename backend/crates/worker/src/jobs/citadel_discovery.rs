@@ -6,6 +6,7 @@
 //! threshold, `is_public=false` flips and the chip picker greys them out.
 
 use anyhow::anyhow;
+use auth_tokens::budgeted;
 use uuid::Uuid;
 
 use crate::Ctx;
@@ -19,13 +20,9 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let ids: Vec<i64> = match ctx.esi_anon.list_public_structure_ids().await {
-        Ok(v) => v,
-        Err(e) => {
-            ctx.budget.record_non_2xx();
-            return Err(anyhow!("list_public_structure_ids: {e}"));
-        }
-    };
+    let ids: Vec<i64> = budgeted(&ctx.budget, ctx.esi_anon.list_public_structure_ids())
+        .await
+        .map_err(|e| anyhow!("list_public_structure_ids: {e}"))?;
     tracing::info!(count = ids.len(), "discovered public structures");
 
     let mut tx = ctx.pool.begin().await?;

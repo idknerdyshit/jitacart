@@ -3,19 +3,14 @@
 //! `GET /markets` — global, NPC hubs only (any logged-in user).
 //! `GET /groups/:id/markets` — NPC hubs ∪ that group's tracked citadels.
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::get,
-    Json, Router,
-};
+use axum::{extract::State, routing::get, Json, Router};
 use chrono::{DateTime, Utc};
 use domain::{Market, MarketKind};
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
+    errors::ApiError,
     extract::{CurrentGroup, CurrentUser},
     state::AppState,
 };
@@ -29,7 +24,7 @@ pub fn router() -> Router<AppState> {
 async fn list_global(
     State(state): State<AppState>,
     _user: CurrentUser,
-) -> Result<Json<Vec<Market>>, MarketError> {
+) -> Result<Json<Vec<Market>>, ApiError> {
     let rows: Vec<MarketRow> = sqlx::query_as(
         "SELECT id, kind, esi_location_id, region_id, name, short_label, is_hub, is_public \
          FROM markets WHERE is_public AND kind = 'npc_hub' \
@@ -37,13 +32,13 @@ async fn list_global(
     )
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     rows.into_iter()
         .map(MarketRow::into_market)
         .collect::<anyhow::Result<Vec<_>>>()
         .map(Json)
-        .map_err(internal)
+        .map_err(ApiError::internal)
 }
 
 #[derive(Serialize)]
@@ -59,7 +54,7 @@ pub struct GroupMarket {
 async fn list_for_group(
     State(state): State<AppState>,
     CurrentGroup { group_id, .. }: CurrentGroup,
-) -> Result<Json<Vec<GroupMarket>>, MarketError> {
+) -> Result<Json<Vec<GroupMarket>>, ApiError> {
     let rows: Vec<GroupMarketRow> = sqlx::query_as(
         r#"
         SELECT m.id, m.kind, m.esi_location_id, m.region_id, m.name, m.short_label,
@@ -91,13 +86,13 @@ async fn list_for_group(
     .bind(group_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     rows.into_iter()
         .map(GroupMarketRow::into_group_market)
         .collect::<anyhow::Result<Vec<_>>>()
         .map(Json)
-        .map_err(internal)
+        .map_err(ApiError::internal)
 }
 
 #[derive(sqlx::FromRow)]
@@ -172,21 +167,3 @@ impl GroupMarketRow {
     }
 }
 
-pub enum MarketError {
-    Internal(anyhow::Error),
-}
-
-fn internal<E: Into<anyhow::Error>>(e: E) -> MarketError {
-    MarketError::Internal(e.into())
-}
-
-impl IntoResponse for MarketError {
-    fn into_response(self) -> Response {
-        match self {
-            MarketError::Internal(e) => {
-                tracing::error!(error = ?e, "markets handler error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-            }
-        }
-    }
-}

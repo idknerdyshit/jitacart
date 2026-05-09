@@ -3,6 +3,7 @@ pub mod citadels;
 pub mod config;
 pub mod contracts;
 pub mod corps;
+pub mod errors;
 pub mod extract;
 pub mod fulfillment;
 pub mod groups;
@@ -10,4 +11,7 @@ pub mod jwt;
 pub mod lists;
 pub mod markets;
 pub mod state;
+pub mod turnstile;
 pub mod webhooks;
+
+pub use errors::ApiError;

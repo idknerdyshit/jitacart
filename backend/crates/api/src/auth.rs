@@ -3,8 +3,7 @@
 use anyhow::{anyhow, Context};
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Redirect, Response},
+    response::Redirect,
     routing::{get, patch, post},
     Json, Router,
 };
@@ -16,9 +15,10 @@ use sqlx::PgPool;
 use tower_sessions::Session;
 use uuid::Uuid;
 
-use auth_tokens::TokenCipher;
+use auth_tokens::MultiKeyCipher;
 
 use crate::{
+    errors::ApiError,
     extract::{CurrentUser, SESSION_KEY_USER},
     jwt::EveClaims,
     state::AppState,
@@ -34,6 +34,7 @@ pub fn router() -> Router<AppState> {
         .route("/auth/logout", post(logout))
         .route("/me", get(me))
         .route("/me/active-character", patch(set_active_character))
+        .route("/me/export", get(export_me))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -58,17 +59,40 @@ struct LoginQuery {
     #[serde(default)]
     attach: bool,
     return_to: Option<String>,
+    /// Cloudflare Turnstile token. Required for first-time logins (no
+    /// existing session, not attaching). Frontend renders the widget,
+    /// captures the token, and forwards it on the redirect to /auth/eve/login.
+    cf: Option<String>,
 }
 
 async fn login(
     State(state): State<AppState>,
     session: Session,
     Query(q): Query<LoginQuery>,
-) -> Result<Redirect, AuthError> {
+) -> Result<Redirect, ApiError> {
+    let session_user: Option<Uuid> = session.get(SESSION_KEY_USER).await?;
     if q.attach {
-        let user: Option<Uuid> = session.get(SESSION_KEY_USER).await.map_err(internal)?;
-        if user.is_none() {
-            return Err(AuthError::Unauthorized);
+        if session_user.is_none() {
+            return Err(ApiError::Unauthorized);
+        }
+    } else if session_user.is_none() && !state.config.turnstile.disabled {
+        // First-time login: require a Turnstile token. Existing-user
+        // re-logins pass through here too, but the captcha cost is
+        // one-per-fresh-browser, not one-per-session-cookie-expiry.
+        let token = q.cf.as_deref().ok_or(ApiError::Forbidden("captcha verification required for new accounts".into()))?;
+        let result = crate::turnstile::verify(
+            &state.webhook_http,
+            &state.config.turnstile.secret_key,
+            token,
+            None,
+        )
+        .await?;
+        if !result.success {
+            tracing::warn!(
+                error_codes = ?result.error_codes,
+                "turnstile verification failed"
+            );
+            return Err(ApiError::Forbidden("captcha verification required for new accounts".into()));
         }
     }
 
@@ -78,7 +102,7 @@ async fn login(
     let challenge: PkceChallenge = state
         .esi
         .authorize_url(&cfg.callback_url, &scopes)
-        .map_err(|e| AuthError::Internal(anyhow!("authorize_url: {e}")))?;
+        .map_err(|e| ApiError::Internal(anyhow!("authorize_url: {e}")))?;
 
     let pending = PendingAuth {
         code_verifier: challenge.code_verifier.expose_secret().to_string(),
@@ -88,10 +112,7 @@ async fn login(
         target_character_id: None,
         requested_scopes: cfg.login_scopes.clone(),
     };
-    session
-        .insert(SESSION_KEY_PENDING, &pending)
-        .await
-        .map_err(internal)?;
+    session.insert(SESSION_KEY_PENDING, &pending).await?;
 
     Ok(Redirect::to(&challenge.authorize_url))
 }
@@ -109,19 +130,7 @@ async fn upgrade(
     session: Session,
     CurrentUser(user_id): CurrentUser,
     Query(q): Query<UpgradeQuery>,
-) -> Result<Redirect, AuthError> {
-    // Confirm the character belongs to this user.
-    let owns: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM characters WHERE character_id = $1 AND user_id = $2")
-            .bind(q.character_id)
-            .bind(user_id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(internal)?;
-    if owns.is_none() {
-        return Err(AuthError::Unauthorized);
-    }
-
+) -> Result<Redirect, ApiError> {
     let cfg = &state.config.eve_sso;
     let requested: Vec<String> = q
         .scopes
@@ -130,7 +139,7 @@ async fn upgrade(
         .filter(|s| !s.is_empty())
         .collect();
     if requested.is_empty() {
-        return Err(AuthError::Internal(anyhow!("no scopes requested")));
+        return Err(ApiError::Internal(anyhow!("no scopes requested")));
     }
     let allowed: std::collections::HashSet<&str> = cfg
         .login_scopes
@@ -140,23 +149,23 @@ async fn upgrade(
         .collect();
     for s in &requested {
         if !allowed.contains(s.as_str()) {
-            return Err(AuthError::Internal(anyhow!("scope not allowed: {s}")));
+            return Err(ApiError::Internal(anyhow!("scope not allowed: {s}")));
         }
     }
 
-    // EVE SSO replaces the granted set on each consent — always include:
-    //   (a) base login_scopes so we don't drop `publicData`,
-    //   (b) any scopes the character already holds so a corp-scope upgrade
-    //       doesn't silently revoke e.g. `esi-markets.structure_markets.v1`.
+    // Single query that both confirms ownership and reads existing scopes.
+    // EVE SSO replaces the granted set on each consent — we merge base
+    // login_scopes (so we don't drop `publicData`) and the character's
+    // already-granted scopes (so a corp-scope upgrade doesn't silently
+    // revoke e.g. `esi-markets.structure_markets.v1`).
     let existing_scopes: Vec<String> = sqlx::query_scalar(
         "SELECT scopes FROM characters WHERE character_id = $1 AND user_id = $2",
     )
     .bind(q.character_id)
     .bind(user_id)
     .fetch_optional(&state.pool)
-    .await
-    .map_err(internal)?
-    .unwrap_or_default();
+    .await?
+    .ok_or(ApiError::Unauthorized)?;
 
     let all = merge_upgrade_scopes(&cfg.login_scopes, &existing_scopes, &requested);
     let scopes_vec: Vec<&str> = all.iter().map(String::as_str).collect();
@@ -164,7 +173,7 @@ async fn upgrade(
     let challenge: PkceChallenge = state
         .esi
         .authorize_url(&cfg.callback_url, &scopes_vec)
-        .map_err(|e| AuthError::Internal(anyhow!("authorize_url: {e}")))?;
+        .map_err(|e| ApiError::Internal(anyhow!("authorize_url: {e}")))?;
 
     let pending = PendingAuth {
         code_verifier: challenge.code_verifier.expose_secret().to_string(),
@@ -174,10 +183,7 @@ async fn upgrade(
         target_character_id: Some(q.character_id),
         requested_scopes: all,
     };
-    session
-        .insert(SESSION_KEY_PENDING, &pending)
-        .await
-        .map_err(internal)?;
+    session.insert(SESSION_KEY_PENDING, &pending).await?;
 
     Ok(Redirect::to(&challenge.authorize_url))
 }
@@ -192,15 +198,14 @@ async fn callback(
     State(state): State<AppState>,
     session: Session,
     Query(q): Query<CallbackQuery>,
-) -> Result<Redirect, AuthError> {
+) -> Result<Redirect, ApiError> {
     let pending: PendingAuth = session
         .remove(SESSION_KEY_PENDING)
-        .await
-        .map_err(internal)?
-        .ok_or(AuthError::NoPending)?;
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("no pending auth in session".into()))?;
 
     if pending.state != q.state {
-        return Err(AuthError::StateMismatch);
+        return Err(ApiError::BadRequest("state mismatch".into()));
     }
 
     let cfg = &state.config.eve_sso;
@@ -210,22 +215,20 @@ async fn callback(
         .esi
         .exchange_code(&q.code, &verifier, &cfg.callback_url)
         .await
-        .map_err(|e| AuthError::Internal(anyhow!("exchange_code: {e}")))?;
+        .map_err(|e| ApiError::Internal(anyhow!("exchange_code: {e}")))?;
 
-    let claims = state
-        .jwks
-        .verify(tokens.access_token.expose_secret())
-        .await
-        .map_err(AuthError::Internal)?;
+    let claims = state.jwks.verify(tokens.access_token.expose_secret()).await?;
 
     if let Some(target) = pending.target_character_id {
-        let returned = claims.character_id().map_err(AuthError::Internal)?;
+        let returned = claims.character_id()?;
         if returned != target {
-            return Err(AuthError::WrongCharacter);
+            return Err(ApiError::BadRequest(
+                "consent returned a different character than the one requested".into(),
+            ));
         }
     }
 
-    let session_user: Option<Uuid> = session.get(SESSION_KEY_USER).await.map_err(internal)?;
+    let session_user: Option<Uuid> = session.get(SESSION_KEY_USER).await?;
 
     let user_id = upsert_character(
         &state.pool,
@@ -234,20 +237,17 @@ async fn callback(
         &tokens,
         session_user,
         pending.attach,
+        state.config.limits.characters_per_user,
     )
-    .await
-    .map_err(AuthError::Internal)?;
+    .await?;
 
-    session
-        .insert(SESSION_KEY_USER, user_id)
-        .await
-        .map_err(internal)?;
+    session.insert(SESSION_KEY_USER, user_id).await?;
 
     Ok(Redirect::to(pending.return_to.as_deref().unwrap_or("/me")))
 }
 
-async fn logout(session: Session) -> Result<Redirect, AuthError> {
-    session.flush().await.map_err(internal)?;
+async fn logout(session: Session) -> Result<Redirect, ApiError> {
+    session.flush().await?;
     Ok(Redirect::to("/"))
 }
 
@@ -261,7 +261,7 @@ struct MeResponse {
 async fn me(
     State(state): State<AppState>,
     CurrentUser(user_id): CurrentUser,
-) -> Result<Json<MeResponse>, AuthError> {
+) -> Result<Json<MeResponse>, ApiError> {
     let user_q = sqlx::query_as::<_, UserRow>(
         "SELECT id, display_name, active_character_id, created_at FROM users WHERE id = $1",
     )
@@ -276,8 +276,8 @@ async fn me(
     .bind(user_id)
     .fetch_all(&state.pool);
 
-    let (user, characters) = tokio::try_join!(user_q, chars_q).map_err(internal)?;
-    let user = user.ok_or(AuthError::Unauthorized)?;
+    let (user, characters) = tokio::try_join!(user_q, chars_q)?;
+    let user = user.ok_or(ApiError::Unauthorized)?;
 
     let active_character_id = user.active_character_id;
     Ok(Json(MeResponse {
@@ -343,53 +343,143 @@ async fn set_active_character(
     State(state): State<AppState>,
     CurrentUser(user_id): CurrentUser,
     Json(body): Json<SetActiveCharacterBody>,
-) -> Result<Json<MeResponse>, AuthError> {
+) -> Result<Json<MeResponse>, ApiError> {
     do_set_active_character(&state.pool, user_id, body.character_id).await?;
     me(State(state), CurrentUser(user_id)).await
 }
 
-/// Update the user's `active_character_id`, validating that the supplied
-/// character (if any) belongs to the user. The DB-level trigger in
-/// `20261101000000_phase8_polish.sql` is the authoritative ownership check
-/// — this helper short-circuits with `Unauthorized` so callers see a 401
-/// rather than a 500 when the trigger would have rejected the write.
+/// Update the user's `active_character_id`. Ownership is enforced by
+/// constraining the UPDATE to rows where the character (if supplied)
+/// belongs to the same user; if no row matches we return `Unauthorized`
+/// so callers see a 401 rather than a silent no-op.
 pub async fn do_set_active_character(
     pool: &PgPool,
     user_id: Uuid,
     character_id: Option<Uuid>,
-) -> Result<(), AuthError> {
-    if let Some(char_id) = character_id {
-        let owned: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM characters WHERE id = $1 AND user_id = $2)",
-        )
-        .bind(char_id)
-        .bind(user_id)
-        .fetch_one(pool)
-        .await
-        .map_err(internal)?;
-        if !owned {
-            return Err(AuthError::Unauthorized);
-        }
+) -> Result<(), ApiError> {
+    let result = sqlx::query(
+        "UPDATE users SET active_character_id = $1 WHERE id = $2 \
+         AND ($1::uuid IS NULL OR EXISTS \
+              (SELECT 1 FROM characters WHERE id = $1 AND user_id = $2))",
+    )
+    .bind(character_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::Unauthorized);
     }
-
-    sqlx::query("UPDATE users SET active_character_id = $1 WHERE id = $2")
-        .bind(character_id)
-        .bind(user_id)
-        .execute(pool)
-        .await
-        .map_err(internal)?;
-
     Ok(())
+}
+
+/// User-data export. Returns a JSON document of everything keyed to
+/// the caller's `users.id` — for personal-data review or self-service
+/// off-boarding. Token plaintext is *never* included; only metadata
+/// like character names, scopes, and expiry timestamps.
+pub async fn do_export_me(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> anyhow::Result<serde_json::Value> {
+    let user: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(u) - 'active_character_id' \
+         FROM (SELECT id, display_name, created_at, active_character_id FROM users \
+               WHERE id = $1) u",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow!("user {user_id} not found"))?;
+
+    // Characters: metadata only. Token columns explicitly excluded.
+    let characters: serde_json::Value = sqlx::query_scalar(
+        "SELECT coalesce(jsonb_agg(c ORDER BY c.created_at), '[]'::jsonb) FROM ( \
+            SELECT id, character_id, character_name, owner_hash, scopes, \
+                   access_token_expires_at, created_at, last_refreshed_at, \
+                   token_key_id \
+            FROM characters WHERE user_id = $1 \
+         ) c",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    let memberships: serde_json::Value = sqlx::query_scalar(
+        "SELECT coalesce(jsonb_agg(m ORDER BY m.joined_at), '[]'::jsonb) FROM ( \
+            SELECT g.id AS group_id, g.name AS group_name, gm.role, gm.joined_at \
+            FROM group_memberships gm \
+            JOIN groups g ON g.id = gm.group_id \
+            WHERE gm.user_id = $1 \
+         ) m",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    let lists: serde_json::Value = sqlx::query_scalar(
+        "SELECT coalesce(jsonb_agg(l ORDER BY l.created_at DESC), '[]'::jsonb) FROM ( \
+            SELECT id, group_id, destination_label, status, total_estimate_isk, \
+                   created_at, updated_at \
+            FROM lists WHERE created_by_user_id = $1 \
+         ) l",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    let fulfillments: serde_json::Value = sqlx::query_scalar(
+        "SELECT coalesce(jsonb_agg(f ORDER BY f.bought_at DESC), '[]'::jsonb) FROM ( \
+            SELECT f.id, f.list_item_id, f.qty, f.unit_price_isk, \
+                   f.bought_at_market_id, f.bought_at, f.reversed_at \
+            FROM fulfillments f \
+            WHERE f.hauler_user_id = $1 \
+         ) f",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    let reimbursements: serde_json::Value = sqlx::query_scalar(
+        "SELECT coalesce(jsonb_agg(r ORDER BY r.id), '[]'::jsonb) FROM ( \
+            SELECT id, list_id, status, total_isk, contract_id, settled_at \
+            FROM reimbursements \
+            WHERE requester_user_id = $1 OR hauler_user_id = $1 \
+         ) r",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(serde_json::json!({
+        "exported_at": chrono::Utc::now(),
+        "user": user,
+        "characters": characters,
+        "group_memberships": memberships,
+        "lists_created": lists,
+        "fulfillments_as_hauler": fulfillments,
+        "reimbursements_involving_me": reimbursements,
+    }))
+}
+
+async fn export_me(
+    State(state): State<AppState>,
+    CurrentUser(user_id): CurrentUser,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    do_export_me(&state.pool, user_id)
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
 }
 
 async fn upsert_character(
     pool: &PgPool,
-    cipher: &TokenCipher,
+    cipher: &MultiKeyCipher,
     claims: &EveClaims,
     tokens: &EsiTokens,
     session_user: Option<Uuid>,
     attach: bool,
-) -> anyhow::Result<Uuid> {
+    characters_cap: i64,
+) -> Result<Uuid, ApiError> {
     let character_id = claims.character_id()?;
     let scopes = claims.scopes();
 
@@ -404,7 +494,7 @@ async fn upsert_character(
     .context("looking up existing character")?;
 
     let target_user_id = if attach {
-        session_user.ok_or_else(|| anyhow!("attach without session"))?
+        session_user.ok_or_else(|| ApiError::internal(anyhow!("attach without session")))?
     } else if let Some((_, uid, hash)) = &existing {
         if hash == &claims.owner {
             *uid
@@ -419,8 +509,28 @@ async fn upsert_character(
         create_user(&mut tx, &claims.name).await?
     };
 
-    let (rt_ct, rt_nonce) = cipher.encrypt(tokens.refresh_token.expose_secret().as_bytes())?;
-    let (at_ct, at_nonce) = cipher.encrypt(tokens.access_token.expose_secret().as_bytes())?;
+    // Enforce characters_per_user when this insert would add a NEW row under
+    // target_user_id. An owner-hash transfer (existing.user_id != target) is
+    // also "moving in," so it counts. Re-login on the same row is exempt.
+    let would_add_new = match &existing {
+        None => true,
+        Some((_, uid, _)) => *uid != target_user_id,
+    };
+    if would_add_new {
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM characters WHERE user_id = $1")
+                .bind(target_user_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if count >= characters_cap {
+            return Err(ApiError::QuotaExceeded(format!(
+                "you already have {count} linked characters (cap {characters_cap})"
+            )));
+        }
+    }
+
+    let (rt_ct, rt_nonce, kid) = cipher.encrypt(tokens.refresh_token.expose_secret().as_bytes())?;
+    let (at_ct, at_nonce, _) = cipher.encrypt(tokens.access_token.expose_secret().as_bytes())?;
 
     sqlx::query(
         r#"
@@ -428,9 +538,9 @@ async fn upsert_character(
             user_id, character_id, character_name, owner_hash, scopes,
             refresh_token_ciphertext, refresh_token_nonce,
             access_token_ciphertext, access_token_nonce, access_token_expires_at,
-            last_refreshed_at
+            token_key_id, last_refreshed_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
         ON CONFLICT (character_id) DO UPDATE SET
             user_id = EXCLUDED.user_id,
             character_name = EXCLUDED.character_name,
@@ -441,6 +551,7 @@ async fn upsert_character(
             access_token_ciphertext = EXCLUDED.access_token_ciphertext,
             access_token_nonce = EXCLUDED.access_token_nonce,
             access_token_expires_at = EXCLUDED.access_token_expires_at,
+            token_key_id = EXCLUDED.token_key_id,
             last_refreshed_at = now()
         "#,
     )
@@ -454,6 +565,7 @@ async fn upsert_character(
     .bind(&at_ct)
     .bind(&at_nonce)
     .bind(tokens.expires_at)
+    .bind(&kid)
     .execute(&mut *tx)
     .await
     .context("upserting character")?;
@@ -509,40 +621,6 @@ fn safe_return_to(return_to: Option<String>) -> Option<String> {
         Some(path)
     } else {
         None
-    }
-}
-
-#[derive(Debug)]
-pub enum AuthError {
-    Unauthorized,
-    StateMismatch,
-    NoPending,
-    WrongCharacter,
-    Internal(anyhow::Error),
-}
-
-fn internal<E: Into<anyhow::Error>>(e: E) -> AuthError {
-    AuthError::Internal(e.into())
-}
-
-impl IntoResponse for AuthError {
-    fn into_response(self) -> Response {
-        match self {
-            AuthError::Unauthorized => (StatusCode::UNAUTHORIZED, "not logged in").into_response(),
-            AuthError::StateMismatch => (StatusCode::BAD_REQUEST, "state mismatch").into_response(),
-            AuthError::NoPending => {
-                (StatusCode::BAD_REQUEST, "no pending auth in session").into_response()
-            }
-            AuthError::WrongCharacter => (
-                StatusCode::BAD_REQUEST,
-                "consent returned a different character than the one requested",
-            )
-                .into_response(),
-            AuthError::Internal(e) => {
-                tracing::error!(error = ?e, "auth handler error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-            }
-        }
     }
 }
 

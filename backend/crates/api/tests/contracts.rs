@@ -6,7 +6,8 @@
 mod common;
 
 use common::*;
-use jitacart_api::contracts::{do_confirm, do_manual_link, do_reject, do_unlink, ContractError};
+use jitacart_api::contracts::{do_confirm, do_manual_link, do_reject, do_unlink};
+use jitacart_api::errors::ApiError;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -100,7 +101,7 @@ async fn confirm_by_non_issuer_is_forbidden(pool: PgPool) {
         insert_suggestion(&pool, contract.contract_id, ids.reimbursement_id, "pending").await;
 
     let err = do_confirm(&pool, other, sugg_id).await.unwrap_err();
-    assert!(matches!(err, ContractError::Forbidden));
+    assert!(matches!(err, ApiError::Forbidden(_)));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -140,7 +141,7 @@ async fn confirm_when_reimbursement_already_bound(pool: PgPool) {
     .await;
 
     let err = do_confirm(&pool, hauler, sugg_b).await.unwrap_err();
-    assert!(matches!(err, ContractError::Conflict(_)));
+    assert!(matches!(err, ApiError::Conflict(_)));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -196,7 +197,7 @@ async fn double_confirm_hits_partial_unique_index(pool: PgPool) {
 
     let err = do_confirm(&pool, hauler, sugg_b).await.unwrap_err();
     match err {
-        ContractError::Conflict(msg) => assert!(msg.contains("already confirmed")),
+        ApiError::Conflict(msg) => assert!(msg.contains("already confirmed")),
         other => panic!("unexpected: {other:?}"),
     }
 }
@@ -221,7 +222,7 @@ async fn reject_by_non_issuer_is_forbidden(pool: PgPool) {
         insert_suggestion(&pool, contract.contract_id, ids.reimbursement_id, "pending").await;
 
     let err = do_reject(&pool, other, sugg).await.unwrap_err();
-    assert!(matches!(err, ContractError::Forbidden));
+    assert!(matches!(err, ApiError::Forbidden(_)));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -248,7 +249,7 @@ async fn reject_already_decided_is_conflict(pool: PgPool) {
     .await;
 
     let err = do_reject(&pool, hauler, sugg).await.unwrap_err();
-    assert!(matches!(err, ContractError::Conflict(_)));
+    assert!(matches!(err, ApiError::Conflict(_)));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -273,7 +274,7 @@ async fn manual_link_with_mismatched_assignee_is_conflict(pool: PgPool) {
     let err = do_manual_link(&pool, hauler, contract.contract_id, ids.reimbursement_id)
         .await
         .unwrap_err();
-    assert!(matches!(err, ContractError::Conflict(_)));
+    assert!(matches!(err, ApiError::Conflict(_)));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -306,7 +307,7 @@ async fn manual_link_by_non_member_is_forbidden(pool: PgPool) {
     let err = do_manual_link(&pool, hauler, contract.contract_id, ids.reimbursement_id)
         .await
         .unwrap_err();
-    assert!(matches!(err, ContractError::Forbidden));
+    assert!(matches!(err, ApiError::Forbidden(_)));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -329,7 +330,7 @@ async fn unlink_finished_contract_is_conflict(pool: PgPool) {
         .await
         .unwrap_err();
     match err {
-        ContractError::Conflict(msg) => assert!(msg.contains("unwind")),
+        ApiError::Conflict(msg) => assert!(msg.contains("unwind")),
         other => panic!("unexpected: {other:?}"),
     }
 }

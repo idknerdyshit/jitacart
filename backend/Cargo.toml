@@ -6,6 +6,7 @@ members = [
     "crates/domain",
     "crates/market",
     "crates/auth-tokens",
+    "crates/bootstrap",
     "crates/settlement",
     "crates/webhook-dispatch",
 ]
@@ -23,7 +24,8 @@ tokio = { version = "1", features = ["full"] }
 # web
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "request-id", "util"] }
+tower_governor = "0.8"
 
 # db
 sqlx = { version = "0.8", default-features = false, features = [
@@ -50,7 +52,7 @@ figment = { version = "0.10", features = ["toml", "env"] }
 
 # observability
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # errors
 anyhow = "1"
@@ -78,6 +80,7 @@ time = "0.3"
 domain = { path = "crates/domain" }
 market = { path = "crates/market" }
 auth-tokens = { path = "crates/auth-tokens" }
+bootstrap = { path = "crates/bootstrap" }
 settlement = { path = "crates/settlement" }
 webhook-dispatch = { path = "crates/webhook-dispatch" }
 

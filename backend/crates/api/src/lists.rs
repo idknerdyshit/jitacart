@@ -15,7 +15,6 @@ use std::collections::{HashMap, HashSet};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
     routing::{get, patch, post},
     Json, Router,
 };
@@ -31,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    errors::ApiError,
     extract::{CurrentGroup, CurrentList},
     markets::MarketRow,
     state::AppState,
@@ -132,13 +132,13 @@ async fn preview(
     State(state): State<AppState>,
     CurrentGroup { group_id, .. }: CurrentGroup,
     Json(body): Json<PreviewBody>,
-) -> Result<Json<PreviewResponse>, ListError> {
+) -> Result<Json<PreviewResponse>, ApiError> {
     validate_multibuy_size(&body.multibuy)?;
     validate_market_ids_size(&body.market_ids)?;
 
     let parsed = parse_multibuy(&body.multibuy);
     if parsed.lines.len() > MAX_PARSED_LINES {
-        return Err(ListError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "too many parsed lines ({}); max {}",
             parsed.lines.len(),
             MAX_PARSED_LINES
@@ -146,7 +146,7 @@ async fn preview(
     }
     let distinct_names: Vec<String> = parsed.lines.iter().map(|l| l.name.clone()).collect();
     if distinct_names.len() > MAX_DISTINCT_NAMES {
-        return Err(ListError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "too many distinct items ({}); max {}",
             distinct_names.len(),
             MAX_DISTINCT_NAMES
@@ -158,7 +158,7 @@ async fn preview(
 
     let (resolved, unresolved) = market::resolve_type_ids(&state.pool, &state.esi, &distinct_names)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     let type_ids = dedup_type_ids(resolved.values().map(|r| r.type_id));
     let prices_by_market = fetch_prices_for_markets(&state, group_id, &markets, &type_ids).await?;
@@ -219,27 +219,27 @@ async fn create(
         role,
     }: CurrentGroup,
     Json(body): Json<CreateBody>,
-) -> Result<Json<ListDetail>, ListError> {
+) -> Result<Json<ListDetail>, ApiError> {
     validate_multibuy_size(&body.multibuy)?;
     validate_market_ids_size(&body.market_ids)?;
     if !body.market_ids.contains(&body.primary_market_id) {
-        return Err(ListError::BadRequest(
+        return Err(ApiError::BadRequest(
             "primary_market_id must be in market_ids".into(),
         ));
     }
 
     let parsed = parse_multibuy(&body.multibuy);
     if !parsed.errors.is_empty() {
-        return Err(ListError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "{} multibuy line(s) failed to parse",
             parsed.errors.len()
         )));
     }
     if parsed.lines.is_empty() {
-        return Err(ListError::BadRequest("multibuy is empty".into()));
+        return Err(ApiError::BadRequest("multibuy is empty".into()));
     }
     if parsed.lines.len() > MAX_PARSED_LINES {
-        return Err(ListError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "too many parsed lines ({}); max {}",
             parsed.lines.len(),
             MAX_PARSED_LINES
@@ -247,21 +247,30 @@ async fn create(
     }
     let distinct_names: Vec<String> = parsed.lines.iter().map(|l| l.name.clone()).collect();
     if distinct_names.len() > MAX_DISTINCT_NAMES {
-        return Err(ListError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "too many distinct items ({}); max {}",
             distinct_names.len(),
             MAX_DISTINCT_NAMES
         )));
     }
+    let items_cap = state.config.limits.items_per_list;
+    if (parsed.lines.len() as i64) > items_cap {
+        return Err(ApiError::QuotaExceeded(format!(
+            "list has {} items; per-list cap is {}",
+            parsed.lines.len(),
+            items_cap
+        )));
+    }
+    require_lists_quota(&state, group_id).await?;
 
     let markets = load_markets(&state, &body.market_ids).await?;
     validate_markets_for_group(&state.pool, group_id, &markets).await?;
 
     let (resolved, unresolved) = market::resolve_type_ids(&state.pool, &state.esi, &distinct_names)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     if !unresolved.is_empty() {
-        return Err(ListError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "unknown item(s): {}",
             unresolved.join(", ")
         )));
@@ -284,7 +293,7 @@ async fn create(
         let key = market::types::normalize_key(&p.name);
         let r = resolved
             .get(&key)
-            .ok_or_else(|| internal(anyhow::anyhow!("resolved missing for {}", p.name)))?;
+            .ok_or_else(|| ApiError::internal(anyhow::anyhow!("resolved missing for {}", p.name)))?;
         let (est_unit, est_market) = pick_cheapest(&markets, &prices_by_market, r.type_id);
         if let Some(u) = est_unit {
             total += u * Decimal::from(p.qty);
@@ -299,7 +308,7 @@ async fn create(
         });
     }
 
-    let mut tx = state.pool.begin().await.map_err(internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
 
     let list_id: Uuid = sqlx::query_scalar(
         "INSERT INTO lists \
@@ -316,7 +325,7 @@ async fn create(
     .bind(total)
     .fetch_one(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     for m in &markets {
         sqlx::query(
@@ -327,7 +336,7 @@ async fn create(
         .bind(m.id == body.primary_market_id)
         .execute(&mut *tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     }
 
     for it in &items_to_insert {
@@ -347,16 +356,16 @@ async fn create(
         .bind(it.line_no)
         .execute(&mut *tx)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     }
 
-    tx.commit().await.map_err(internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
 
     let creator_name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_one(&state.pool)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     fire_webhook(
         &state,
         group_id,
@@ -382,7 +391,7 @@ async fn list_for_group(
     State(state): State<AppState>,
     CurrentGroup { group_id, .. }: CurrentGroup,
     Query(q): Query<ListForGroupQuery>,
-) -> Result<Json<Vec<ListSummary>>, ListError> {
+) -> Result<Json<Vec<ListSummary>>, ApiError> {
     let rows: Vec<ListSummaryRow> = sqlx::query_as(
         r#"
         SELECT l.id,
@@ -404,13 +413,13 @@ async fn list_for_group(
     .bind(q.include_archived)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     rows.into_iter()
         .map(ListSummaryRow::into_summary)
         .collect::<anyhow::Result<Vec<_>>>()
         .map(Json)
-        .map_err(internal)
+        .map_err(ApiError::internal)
 }
 
 async fn detail(
@@ -421,7 +430,7 @@ async fn detail(
         role,
         ..
     }: CurrentList,
-) -> Result<Json<ListDetail>, ListError> {
+) -> Result<Json<ListDetail>, ApiError> {
     let detail = load_list_detail(&state, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
@@ -430,16 +439,16 @@ async fn patch_list(
     State(state): State<AppState>,
     cur: CurrentList,
     Json(body): Json<PatchListBody>,
-) -> Result<Json<ListDetail>, ListError> {
+) -> Result<Json<ListDetail>, ApiError> {
     if body.destination_label.is_none() && body.notes.is_none() && body.status.is_none() {
-        return Err(ListError::BadRequest("nothing to update".into()));
+        return Err(ApiError::BadRequest("nothing to update".into()));
     }
     if body.status.is_none() {
         cur.require_mutable()
-            .map_err(|_| ListError::Conflict("list is archived; no changes can be made".into()))?;
+            .map_err(|_| ApiError::Conflict("list is archived; no changes can be made".into()))?;
     }
     if body.status.is_some() {
-        cur.require_can_manage().map_err(|_| ListError::Forbidden)?;
+        cur.require_can_manage().map_err(|_| ApiError::forbidden())?;
     }
     let CurrentList {
         list_id,
@@ -463,7 +472,7 @@ async fn patch_list(
     }
     q.push(" WHERE id = ");
     q.push_bind(list_id);
-    q.build().execute(&state.pool).await.map_err(internal)?;
+    q.build().execute(&state.pool).await.map_err(ApiError::internal)?;
 
     let detail = load_list_detail(&state, list_id, user_id, role).await?;
     Ok(Json(detail))
@@ -477,7 +486,7 @@ pub async fn do_patch_list_status(
     list_id: Uuid,
     user_id: Uuid,
     new_status: ListStatus,
-) -> Result<(), ListError> {
+) -> Result<(), ApiError> {
     let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
         "SELECT l.created_by_user_id, gm.role \
          FROM lists l \
@@ -489,15 +498,15 @@ pub async fn do_patch_list_status(
     .bind(list_id)
     .fetch_optional(pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
-    let (created_by, role_raw) = row.ok_or(ListError::NotFound)?;
-    let role_raw = role_raw.ok_or(ListError::Forbidden)?;
+    let (created_by, role_raw) = row.ok_or_else(ApiError::not_found)?;
+    let role_raw = role_raw.ok_or_else(ApiError::forbidden)?;
     let role: GroupRole = role_raw
         .parse()
-        .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
+        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
     if user_id != created_by && role != GroupRole::Owner {
-        return Err(ListError::Forbidden);
+        return Err(ApiError::forbidden());
     }
 
     sqlx::query("UPDATE lists SET status = $1, updated_at = now() WHERE id = $2")
@@ -505,24 +514,24 @@ pub async fn do_patch_list_status(
         .bind(list_id)
         .execute(pool)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     Ok(())
 }
 
 async fn delete_list(
     State(state): State<AppState>,
     cur: CurrentList,
-) -> Result<StatusCode, ListError> {
+) -> Result<StatusCode, ApiError> {
     if cur.created_by_user_id != cur.user_id && cur.role != domain::GroupRole::Owner {
-        return Err(ListError::Forbidden);
+        return Err(ApiError::forbidden());
     }
     let r = sqlx::query("DELETE FROM lists WHERE id = $1")
         .bind(cur.list_id)
         .execute(&state.pool)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     if r.rows_affected() == 0 {
-        return Err(ListError::NotFound);
+        return Err(ApiError::not_found());
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -531,9 +540,9 @@ async fn replace_markets(
     State(state): State<AppState>,
     cur: CurrentList,
     Json(body): Json<ReplaceMarketsBody>,
-) -> Result<Json<ListDetail>, ListError> {
+) -> Result<Json<ListDetail>, ApiError> {
     cur.require_mutable()
-        .map_err(|_| ListError::Conflict("list is archived; no changes can be made".into()))?;
+        .map_err(|_| ApiError::Conflict("list is archived; no changes can be made".into()))?;
     let CurrentList {
         list_id,
         group_id,
@@ -543,7 +552,7 @@ async fn replace_markets(
     } = cur;
     validate_market_ids_size(&body.market_ids)?;
     if !body.market_ids.contains(&body.primary_market_id) {
-        return Err(ListError::BadRequest(
+        return Err(ApiError::BadRequest(
             "primary_market_id must be in market_ids".into(),
         ));
     }
@@ -551,19 +560,19 @@ async fn replace_markets(
     validate_markets_for_group(&state.pool, group_id, &markets).await?;
 
     let updated_after = {
-        let mut tx = state.pool.begin().await.map_err(internal)?;
+        let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
         let _: (Uuid,) = sqlx::query_as("SELECT id FROM lists WHERE id = $1 FOR UPDATE")
             .bind(list_id)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(internal)?
-            .ok_or(ListError::NotFound)?;
+            .map_err(ApiError::internal)?
+            .ok_or_else(ApiError::not_found)?;
 
         sqlx::query("DELETE FROM list_markets WHERE list_id = $1")
             .bind(list_id)
             .execute(&mut *tx)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
         for m in &markets {
             sqlx::query(
                 "INSERT INTO list_markets (list_id, market_id, is_primary) VALUES ($1, $2, $3)",
@@ -573,7 +582,7 @@ async fn replace_markets(
             .bind(m.id == body.primary_market_id)
             .execute(&mut *tx)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
         }
         let updated_after: DateTime<Utc> = sqlx::query_scalar(
             "UPDATE lists SET updated_at = now() WHERE id = $1 RETURNING updated_at",
@@ -581,8 +590,8 @@ async fn replace_markets(
         .bind(list_id)
         .fetch_one(&mut *tx)
         .await
-        .map_err(internal)?;
-        tx.commit().await.map_err(internal)?;
+        .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
         updated_after
     };
 
@@ -595,9 +604,9 @@ async fn add_items(
     State(state): State<AppState>,
     cur: CurrentList,
     Json(body): Json<AddItemsBody>,
-) -> Result<Json<ListDetail>, ListError> {
+) -> Result<Json<ListDetail>, ApiError> {
     cur.require_open().map_err(|_| {
-        ListError::Conflict(format!(
+        ApiError::Conflict(format!(
             "list is {}; items can only be added to open lists",
             cur.status
         ))
@@ -613,16 +622,16 @@ async fn add_items(
             validate_multibuy_size(&mb)?;
             let parsed = parse_multibuy(&mb);
             if !parsed.errors.is_empty() {
-                return Err(ListError::BadRequest(format!(
+                return Err(ApiError::BadRequest(format!(
                     "{} multibuy line(s) failed to parse",
                     parsed.errors.len()
                 )));
             }
             if parsed.lines.is_empty() {
-                return Err(ListError::BadRequest("multibuy is empty".into()));
+                return Err(ApiError::BadRequest("multibuy is empty".into()));
             }
             if parsed.lines.len() > MAX_PARSED_LINES {
-                return Err(ListError::BadRequest(format!(
+                return Err(ApiError::BadRequest(format!(
                     "too many parsed lines ({}); max {}",
                     parsed.lines.len(),
                     MAX_PARSED_LINES
@@ -636,12 +645,12 @@ async fn add_items(
         }
         (None, Some(name), Some(qty)) => {
             if qty <= 0 {
-                return Err(ListError::BadRequest("qty must be positive".into()));
+                return Err(ApiError::BadRequest("qty must be positive".into()));
             }
             vec![(name, qty, 0)]
         }
         _ => {
-            return Err(ListError::BadRequest(
+            return Err(ApiError::BadRequest(
                 "provide either {multibuy} or {type_name, qty}".into(),
             ))
         }
@@ -649,7 +658,7 @@ async fn add_items(
 
     let names: Vec<String> = new_lines.iter().map(|(n, _, _)| n.clone()).collect();
     if names.len() > MAX_DISTINCT_NAMES {
-        return Err(ListError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "too many distinct items ({}); max {}",
             names.len(),
             MAX_DISTINCT_NAMES
@@ -657,27 +666,44 @@ async fn add_items(
     }
     let (resolved, unresolved) = market::resolve_type_ids(&state.pool, &state.esi, &names)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     if !unresolved.is_empty() {
-        return Err(ListError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "unknown item(s): {}",
             unresolved.join(", ")
         )));
     }
 
     let updated_after = {
-        let mut tx = state.pool.begin().await.map_err(internal)?;
+        let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
         let _: (Uuid,) = sqlx::query_as("SELECT id FROM lists WHERE id = $1 FOR UPDATE")
             .bind(list_id)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(internal)?
-            .ok_or(ListError::NotFound)?;
+            .map_err(ApiError::internal)?
+            .ok_or_else(ApiError::not_found)?;
+        // Enforce items-per-list cap against the locked row, so concurrent
+        // add_items calls can't both squeak past it.
+        let cur_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM list_items WHERE list_id = $1")
+                .bind(list_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(ApiError::internal)?;
+        let cap = state.config.limits.items_per_list;
+        if cur_count + (new_lines.len() as i64) > cap {
+            return Err(ApiError::QuotaExceeded(format!(
+                "adding {} items would push the list past its per-list cap ({} of {})",
+                new_lines.len(),
+                cur_count,
+                cap
+            )));
+        }
         for (name, qty, line_no) in &new_lines {
             let key = market::types::normalize_key(name);
             let r = resolved
                 .get(&key)
-                .ok_or_else(|| internal(anyhow::anyhow!("resolved missing for {}", name)))?;
+                .ok_or_else(|| ApiError::internal(anyhow::anyhow!("resolved missing for {}", name)))?;
             sqlx::query(
                 "INSERT INTO list_items \
                  (list_id, type_id, type_name, qty_requested, requested_by_user_id, source_line_no) \
@@ -691,7 +717,7 @@ async fn add_items(
             .bind(*line_no)
             .execute(&mut *tx)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
         }
         let updated_after: DateTime<Utc> = sqlx::query_scalar(
             "UPDATE lists SET updated_at = now() WHERE id = $1 RETURNING updated_at",
@@ -699,8 +725,8 @@ async fn add_items(
         .bind(list_id)
         .fetch_one(&mut *tx)
         .await
-        .map_err(internal)?;
-        tx.commit().await.map_err(internal)?;
+        .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
         updated_after
     };
 
@@ -714,28 +740,28 @@ async fn patch_item(
     Path((list_id, item_id)): Path<(Uuid, Uuid)>,
     cur: CurrentList,
     Json(body): Json<PatchItemBody>,
-) -> Result<Json<ListDetail>, ListError> {
+) -> Result<Json<ListDetail>, ApiError> {
     debug_assert_eq!(cur.list_id, list_id);
     cur.require_mutable()
-        .map_err(|_| ListError::Conflict("list is archived; no changes can be made".into()))?;
+        .map_err(|_| ApiError::Conflict("list is archived; no changes can be made".into()))?;
     if body.qty_requested.is_none() && body.type_name.is_none() {
-        return Err(ListError::BadRequest("nothing to update".into()));
+        return Err(ApiError::BadRequest("nothing to update".into()));
     }
 
     let resolved_type: Option<ResolvedType> = if let Some(name) = &body.type_name {
         let (resolved, unresolved) =
             market::resolve_type_ids(&state.pool, &state.esi, std::slice::from_ref(name))
                 .await
-                .map_err(internal)?;
+                .map_err(ApiError::internal)?;
         if !unresolved.is_empty() {
-            return Err(ListError::BadRequest(format!("unknown item: {name}")));
+            return Err(ApiError::BadRequest(format!("unknown item: {name}")));
         }
         let key = market::types::normalize_key(name);
         Some(
             resolved
                 .get(&key)
                 .cloned()
-                .ok_or_else(|| internal(anyhow::anyhow!("resolved missing for {name}")))?,
+                .ok_or_else(|| ApiError::internal(anyhow::anyhow!("resolved missing for {name}")))?,
         )
     } else {
         None
@@ -743,20 +769,20 @@ async fn patch_item(
 
     if let Some(qty) = body.qty_requested {
         if qty <= 0 {
-            return Err(ListError::BadRequest(
+            return Err(ApiError::BadRequest(
                 "qty_requested must be positive".into(),
             ));
         }
     }
 
     let updated_after = {
-        let mut tx = state.pool.begin().await.map_err(internal)?;
+        let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
         let _: (Uuid,) = sqlx::query_as("SELECT id FROM lists WHERE id = $1 FOR UPDATE")
             .bind(list_id)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(internal)?
-            .ok_or(ListError::NotFound)?;
+            .map_err(ApiError::internal)?
+            .ok_or_else(ApiError::not_found)?;
         let item_status: String = sqlx::query_scalar(
             "SELECT status FROM list_items WHERE id = $1 AND list_id = $2 FOR UPDATE",
         )
@@ -764,13 +790,13 @@ async fn patch_item(
         .bind(list_id)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(internal)?
-        .ok_or(ListError::NotFound)?;
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
         // Once a hauler has claimed or fulfilled this item, qty/type edits would
         // make status, qty_fulfilled, and reimbursement totals inconsistent.
         // The hauler must release the claim or reverse fulfillments first.
         if item_status != "open" {
-            return Err(ListError::Conflict(format!(
+            return Err(ApiError::Conflict(format!(
                 "cannot edit item with status '{item_status}'; \
                  release the claim or reverse fulfillments first"
             )));
@@ -782,7 +808,7 @@ async fn patch_item(
                 .bind(list_id)
                 .execute(&mut *tx)
                 .await
-                .map_err(internal)?;
+                .map_err(ApiError::internal)?;
         }
         if let Some(rt) = &resolved_type {
             sqlx::query(
@@ -795,7 +821,7 @@ async fn patch_item(
             .bind(list_id)
             .execute(&mut *tx)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
         }
         let updated_after: DateTime<Utc> = sqlx::query_scalar(
             "UPDATE lists SET updated_at = now() WHERE id = $1 RETURNING updated_at",
@@ -803,8 +829,8 @@ async fn patch_item(
         .bind(list_id)
         .fetch_one(&mut *tx)
         .await
-        .map_err(internal)?;
-        tx.commit().await.map_err(internal)?;
+        .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
         updated_after
     };
 
@@ -817,18 +843,18 @@ async fn delete_item(
     State(state): State<AppState>,
     Path((list_id, item_id)): Path<(Uuid, Uuid)>,
     cur: CurrentList,
-) -> Result<Json<ListDetail>, ListError> {
+) -> Result<Json<ListDetail>, ApiError> {
     debug_assert_eq!(cur.list_id, list_id);
     cur.require_mutable()
-        .map_err(|_| ListError::Conflict("list is archived; no changes can be made".into()))?;
+        .map_err(|_| ApiError::Conflict("list is archived; no changes can be made".into()))?;
     let updated_after = {
-        let mut tx = state.pool.begin().await.map_err(internal)?;
+        let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
         let _: (Uuid,) = sqlx::query_as("SELECT id FROM lists WHERE id = $1 FOR UPDATE")
             .bind(list_id)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(internal)?
-            .ok_or(ListError::NotFound)?;
+            .map_err(ApiError::internal)?
+            .ok_or_else(ApiError::not_found)?;
         let item_status: Option<String> = sqlx::query_scalar(
             "SELECT status FROM list_items WHERE id = $1 AND list_id = $2 FOR UPDATE",
         )
@@ -836,14 +862,14 @@ async fn delete_item(
         .bind(list_id)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(internal)?;
-        let item_status = item_status.ok_or(ListError::NotFound)?;
+        .map_err(ApiError::internal)?;
+        let item_status = item_status.ok_or_else(ApiError::not_found)?;
         // Deleting cascades fulfillments and claim_items, but leaves
         // reimbursements with stale totals (and still settleable). Block
         // until the item is back to 'open' — i.e. no active claim and no
         // non-reversed fulfillments.
         if item_status != "open" {
-            return Err(ListError::Conflict(format!(
+            return Err(ApiError::Conflict(format!(
                 "cannot delete item with status '{item_status}'; \
                  release the claim or reverse fulfillments first"
             )));
@@ -853,9 +879,9 @@ async fn delete_item(
             .bind(list_id)
             .execute(&mut *tx)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
         if r.rows_affected() == 0 {
-            return Err(ListError::NotFound);
+            return Err(ApiError::not_found());
         }
         let updated_after: DateTime<Utc> = sqlx::query_scalar(
             "UPDATE lists SET updated_at = now() WHERE id = $1 RETURNING updated_at",
@@ -863,8 +889,8 @@ async fn delete_item(
         .bind(list_id)
         .fetch_one(&mut *tx)
         .await
-        .map_err(internal)?;
-        tx.commit().await.map_err(internal)?;
+        .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
         updated_after
     };
 
@@ -891,7 +917,7 @@ async fn fetch_prices_for_markets(
     group_id: Uuid,
     markets: &[Market],
     type_ids: &[i64],
-) -> Result<HashMap<Uuid, HashMap<i64, market::PriceAggregate>>, ListError> {
+) -> Result<HashMap<Uuid, HashMap<i64, market::PriceAggregate>>, ApiError> {
     let npc_ttl = state.config.esi.poll_intervals_secs.market_prices as i64;
     let citadel_ttl = state
         .config
@@ -912,7 +938,7 @@ async fn fetch_prices_for_markets(
     });
     let results = futures_util::future::try_join_all(futs)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
     Ok(results.into_iter().collect())
 }
 
@@ -1018,9 +1044,9 @@ impl From<CachedPriceRow> for market::PriceAggregate {
     }
 }
 
-fn validate_multibuy_size(mb: &str) -> Result<(), ListError> {
+fn validate_multibuy_size(mb: &str) -> Result<(), ApiError> {
     if mb.len() > MAX_MULTIBUY_BYTES {
-        return Err(ListError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "multibuy too large ({} bytes); max {}",
             mb.len(),
             MAX_MULTIBUY_BYTES
@@ -1029,12 +1055,12 @@ fn validate_multibuy_size(mb: &str) -> Result<(), ListError> {
     Ok(())
 }
 
-fn validate_market_ids_size(ids: &[Uuid]) -> Result<(), ListError> {
+fn validate_market_ids_size(ids: &[Uuid]) -> Result<(), ApiError> {
     if ids.is_empty() {
-        return Err(ListError::BadRequest("market_ids must not be empty".into()));
+        return Err(ApiError::BadRequest("market_ids must not be empty".into()));
     }
     if ids.len() > MAX_MARKET_IDS {
-        return Err(ListError::BadRequest(format!(
+        return Err(ApiError::BadRequest(format!(
             "too many market_ids ({}); max {}",
             ids.len(),
             MAX_MARKET_IDS
@@ -1042,14 +1068,14 @@ fn validate_market_ids_size(ids: &[Uuid]) -> Result<(), ListError> {
     }
     let dedup: HashSet<Uuid> = ids.iter().copied().collect();
     if dedup.len() != ids.len() {
-        return Err(ListError::BadRequest(
+        return Err(ApiError::BadRequest(
             "market_ids contains duplicates".into(),
         ));
     }
     Ok(())
 }
 
-pub(crate) async fn load_markets(state: &AppState, ids: &[Uuid]) -> Result<Vec<Market>, ListError> {
+pub(crate) async fn load_markets(state: &AppState, ids: &[Uuid]) -> Result<Vec<Market>, ApiError> {
     let rows: Vec<MarketRow> = sqlx::query_as(
         "SELECT id, kind, esi_location_id, region_id, name, short_label, is_hub, is_public \
          FROM markets WHERE id = ANY($1::uuid[])",
@@ -1057,17 +1083,17 @@ pub(crate) async fn load_markets(state: &AppState, ids: &[Uuid]) -> Result<Vec<M
     .bind(ids)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
 
     if rows.len() != ids.len() {
-        return Err(ListError::BadRequest(
+        return Err(ApiError::BadRequest(
             "one or more market_ids do not exist".into(),
         ));
     }
     rows.into_iter()
         .map(MarketRow::into_market)
         .collect::<anyhow::Result<Vec<_>>>()
-        .map_err(internal)
+        .map_err(ApiError::internal)
 }
 
 /// Allow if every market is either an NPC hub or present in
@@ -1076,7 +1102,7 @@ pub(crate) async fn validate_markets_for_group(
     pool: &sqlx::PgPool,
     group_id: Uuid,
     markets: &[Market],
-) -> Result<(), ListError> {
+) -> Result<(), ApiError> {
     if markets.is_empty() {
         return Ok(());
     }
@@ -1097,7 +1123,7 @@ pub(crate) async fn validate_markets_for_group(
         .bind(&citadel_ids)
         .fetch_all(pool)
         .await
-        .map_err(internal)?
+        .map_err(ApiError::internal)?
         .into_iter()
         .collect()
     };
@@ -1105,21 +1131,21 @@ pub(crate) async fn validate_markets_for_group(
     for m in markets {
         let label = m.short_label.as_deref().unwrap_or("(unnamed)");
         if !m.is_public {
-            return Err(ListError::BadRequest(format!(
+            return Err(ApiError::BadRequest(format!(
                 "market {label} is not public"
             )));
         }
         match m.kind {
             MarketKind::NpcHub => {
                 if !m.is_hub {
-                    return Err(ListError::BadRequest(format!(
+                    return Err(ApiError::BadRequest(format!(
                         "market {label} is marked as NPC hub but is_hub=false"
                     )));
                 }
             }
             MarketKind::PublicStructure => {
                 if !tracked.contains(&m.id) {
-                    return Err(ListError::BadRequest(format!(
+                    return Err(ApiError::BadRequest(format!(
                         "citadel '{label}' is not tracked by this group"
                     )));
                 }
@@ -1157,14 +1183,14 @@ async fn recompute_estimates(
     state: &AppState,
     list_id: Uuid,
     mut updated_after: DateTime<Utc>,
-) -> Result<(), ListError> {
+) -> Result<(), ApiError> {
     for _ in 0..RECOMPUTE_RETRY_LIMIT {
         let group_id: Uuid = sqlx::query_scalar("SELECT group_id FROM lists WHERE id = $1")
             .bind(list_id)
             .fetch_optional(&state.pool)
             .await
-            .map_err(internal)?
-            .ok_or(ListError::NotFound)?;
+            .map_err(ApiError::internal)?
+            .ok_or_else(ApiError::not_found)?;
 
         let market_rows: Vec<MarketRow> = sqlx::query_as(
             "SELECT m.id, m.kind, m.esi_location_id, m.region_id, m.name, m.short_label, \
@@ -1175,36 +1201,36 @@ async fn recompute_estimates(
         .bind(list_id)
         .fetch_all(&state.pool)
         .await
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
         let markets: Vec<Market> = market_rows
             .into_iter()
             .map(MarketRow::into_market)
             .collect::<anyhow::Result<Vec<_>>>()
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
 
         let items: Vec<(Uuid, i64)> =
             sqlx::query_as("SELECT id, type_id FROM list_items WHERE list_id = $1")
                 .bind(list_id)
                 .fetch_all(&state.pool)
                 .await
-                .map_err(internal)?;
+                .map_err(ApiError::internal)?;
 
         let type_ids = dedup_type_ids(items.iter().map(|(_, t)| *t));
         let prices_by_market =
             fetch_prices_for_markets(state, group_id, &markets, &type_ids).await?;
 
-        let mut tx = state.pool.begin().await.map_err(internal)?;
+        let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
         let current_updated: DateTime<Utc> =
             sqlx::query_scalar("SELECT updated_at FROM lists WHERE id = $1 FOR UPDATE")
                 .bind(list_id)
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(internal)?
-                .ok_or(ListError::NotFound)?;
+                .map_err(ApiError::internal)?
+                .ok_or_else(ApiError::not_found)?;
 
         if current_updated != updated_after {
             updated_after = current_updated;
-            tx.rollback().await.map_err(internal)?;
+            tx.rollback().await.map_err(ApiError::internal)?;
             continue;
         }
 
@@ -1221,7 +1247,7 @@ async fn recompute_estimates(
             .bind(item_id)
             .fetch_one(&mut *tx)
             .await
-            .map_err(internal)?;
+            .map_err(ApiError::internal)?;
             if let Some(u) = est_unit {
                 total += u * Decimal::from(qty);
             }
@@ -1238,11 +1264,11 @@ async fn recompute_estimates(
         .bind(list_id)
         .execute(&mut *tx)
         .await
-        .map_err(internal)?;
-        tx.commit().await.map_err(internal)?;
+        .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
         return Ok(());
     }
-    Err(ListError::Conflict(
+    Err(ApiError::Conflict(
         "list was concurrently modified; please retry".into(),
     ))
 }
@@ -1252,7 +1278,7 @@ pub(crate) async fn load_list_detail(
     list_id: Uuid,
     viewer_user_id: Uuid,
     viewer_role: GroupRole,
-) -> Result<ListDetail, ListError> {
+) -> Result<ListDetail, ApiError> {
     let list_row: ListRow = sqlx::query_as(
         "SELECT id, group_id, created_by_user_id, destination_label, notes, status, \
                 total_estimate_isk, tip_pct, created_at, updated_at, \
@@ -1262,10 +1288,10 @@ pub(crate) async fn load_list_detail(
     .bind(list_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?
-    .ok_or(ListError::NotFound)?;
+    .map_err(ApiError::internal)?
+    .ok_or_else(ApiError::not_found)?;
     let group_id = list_row.group_id;
-    let list = list_row.into_list().map_err(internal)?;
+    let list = list_row.into_list().map_err(ApiError::internal)?;
 
     let item_rows: Vec<ListItemRow> = sqlx::query_as(
         "SELECT id, list_id, type_id, type_name, qty_requested, qty_fulfilled, \
@@ -1276,12 +1302,12 @@ pub(crate) async fn load_list_detail(
     .bind(list_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
     let items = item_rows
         .into_iter()
         .map(ListItemRow::into_item)
         .collect::<anyhow::Result<Vec<_>>>()
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     let market_rows: Vec<MarketWithPrimaryRow> = sqlx::query_as(
         "SELECT m.id, m.kind, m.esi_location_id, m.region_id, m.name, m.short_label, \
@@ -1292,21 +1318,21 @@ pub(crate) async fn load_list_detail(
     .bind(list_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
     let primary_market_id = market_rows
         .iter()
         .find_map(|r| if r.is_primary { Some(r.id) } else { None })
-        .ok_or_else(|| internal(anyhow::anyhow!("list has no primary market")))?;
+        .ok_or_else(|| ApiError::internal(anyhow::anyhow!("list has no primary market")))?;
     let markets = market_rows
         .into_iter()
         .map(MarketWithPrimaryRow::into_market)
         .collect::<anyhow::Result<Vec<_>>>()
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     let market_ids: Vec<Uuid> = markets.iter().map(|m| m.id).collect();
     let accessible: Vec<Uuid> = accessible_market_ids(&state.pool, group_id, &market_ids)
         .await
-        .map_err(internal)?
+        .map_err(ApiError::internal)?
         .into_iter()
         .collect();
 
@@ -1333,7 +1359,7 @@ pub(crate) async fn load_list_detail(
     .bind(&accessible)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
     let live_prices: Vec<LiveItemPrice> =
         live_rows.into_iter().map(LivePriceRow::into_live).collect();
 
@@ -1356,12 +1382,12 @@ pub(crate) async fn load_list_detail(
     .bind(list_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
     let claims = claim_rows
         .into_iter()
         .map(ClaimRow::into_claim)
         .collect::<anyhow::Result<Vec<_>>>()
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     // Phase 5: fulfillments (non-reversed only)
     let fulfillment_rows: Vec<FulfillmentRow> = sqlx::query_as(
@@ -1383,12 +1409,12 @@ pub(crate) async fn load_list_detail(
     .bind(list_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
     let fulfillments = fulfillment_rows
         .into_iter()
         .map(FulfillmentRow::into_fulfillment)
         .collect::<anyhow::Result<Vec<_>>>()
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     let reimbursement_rows: Vec<ReimbursementRow> = sqlx::query_as(
         r#"
@@ -1420,12 +1446,12 @@ pub(crate) async fn load_list_detail(
     .bind(list_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(ApiError::internal)?;
     let reimbursements = reimbursement_rows
         .into_iter()
         .map(ReimbursementRow::into_reimbursement)
         .collect::<anyhow::Result<Vec<_>>>()
-        .map_err(internal)?;
+        .map_err(ApiError::internal)?;
 
     let last_hauler_character_id: Option<Uuid> = sqlx::query_scalar(
         r#"
@@ -1447,7 +1473,7 @@ pub(crate) async fn load_list_detail(
     .bind(viewer_user_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?
+    .map_err(ApiError::internal)?
     .flatten();
 
     Ok(ListDetail {
@@ -1787,32 +1813,28 @@ impl ReimbursementRow {
     }
 }
 
-#[derive(Debug)]
-pub enum ListError {
-    BadRequest(String),
-    NotFound,
-    Forbidden,
-    Conflict(String),
-    Internal(anyhow::Error),
-}
-
-pub(crate) fn internal<E: Into<anyhow::Error>>(e: E) -> ListError {
-    ListError::Internal(e.into())
-}
-
-impl IntoResponse for ListError {
-    fn into_response(self) -> Response {
-        match self {
-            ListError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
-            ListError::NotFound => (StatusCode::NOT_FOUND, "list not found").into_response(),
-            ListError::Forbidden => {
-                (StatusCode::FORBIDDEN, "you cannot perform this action").into_response()
-            }
-            ListError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
-            ListError::Internal(e) => {
-                tracing::error!(error = ?e, "lists handler error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-            }
-        }
+/// Enforce `limits.lists_per_group`. Counts non-archived lists; archive
+/// is the existing escape hatch for groups that hit the ceiling.
+pub async fn check_lists_quota(
+    pool: &sqlx::PgPool,
+    group_id: Uuid,
+    cap: i64,
+) -> Result<(), ApiError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM lists WHERE group_id = $1 AND status != 'archived'",
+    )
+    .bind(group_id)
+    .fetch_one(pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if count >= cap {
+        return Err(ApiError::QuotaExceeded(format!(
+            "this group already has {count} active lists (cap {cap}); archive some before adding more"
+        )));
     }
+    Ok(())
+}
+
+async fn require_lists_quota(state: &AppState, group_id: Uuid) -> Result<(), ApiError> {
+    check_lists_quota(&state.pool, group_id, state.config.limits.lists_per_group).await
 }

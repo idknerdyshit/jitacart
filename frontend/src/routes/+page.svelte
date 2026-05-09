@@ -63,7 +63,24 @@
     {/if}
 </section>
 
+<footer>
+    <a href="/privacy">Privacy &amp; data handling</a>
+</footer>
+
 <style>
+    footer {
+        margin-top: 3rem;
+        padding-top: 1rem;
+        border-top: 1px solid #30363d;
+        font-size: 0.9rem;
+        color: #8b949e;
+    }
+    footer a {
+        color: #8b949e;
+    }
+    footer a:hover {
+        color: #58a6ff;
+    }
     h1 {
         margin-bottom: 0.25rem;
     }

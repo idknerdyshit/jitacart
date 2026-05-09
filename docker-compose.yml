@@ -1,21 +1,157 @@
+# Production stack: postgres + api + worker + frontend + caddy.
+#
+# For local Postgres-only development, use the dev override:
+#     docker compose -f docker-compose.dev.yml up
+#
+# For prod:
+#     cp .env.example .env  # then fill in real secrets
+#     docker compose up -d --build
+#
+# All services restart unless stopped, log via the json-file driver
+# with rotation, and the app processes run as non-root.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: jitacart-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: jitacart
-      POSTGRES_PASSWORD: jitacart
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: jitacart
-    ports:
-      - "5432:5432"
     volumes:
       - jitacart-pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U jitacart -d jitacart"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
       retries: 10
+    logging: *default-logging
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: jitacart/backend:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://jitacart:${POSTGRES_PASSWORD}@postgres:5432/jitacart
+      SERVER__BIND: 0.0.0.0:8080
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+  worker:
+    image: jitacart/backend:latest
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["jitacart-worker"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://jitacart:${POSTGRES_PASSWORD}@postgres:5432/jitacart
+      WORKER__HEALTHZ_BIND: 0.0.0.0:9091
+    expose:
+      - "9091"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: jitacart/frontend:latest
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    environment:
+      JC_DOMAIN: ${JC_DOMAIN:?set JC_DOMAIN in .env (e.g. jitacart.example.com or :80 for HTTP-only testing)}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    logging: *default-logging
+
+  # Nightly Postgres → age → S3 backup runner. Profile-gated so dev
+  # stacks don't pay the cost of pulling alpine + postgresql-client.
+  # Bring it up alongside the rest with `docker compose --profile backup up -d`.
+  backup:
+    profiles: [backup]
+    build:
+      context: ./backup
+      dockerfile: Dockerfile
+    image: jitacart/backup:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: jitacart
+      POSTGRES_DB: jitacart
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      RCLONE_CONFIG: /config/rclone.conf
+    volumes:
+      - ./backup/rclone.conf:/config/rclone.conf:ro
+    logging: *default-logging
 
 volumes:
   jitacart-pgdata:
+  caddy-data:
+  caddy-config:

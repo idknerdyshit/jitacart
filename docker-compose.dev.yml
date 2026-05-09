@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: jitacart-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: jitacart
+      POSTGRES_PASSWORD: jitacart
+      POSTGRES_DB: jitacart
+    ports:
+      - "5432:5432"
+    volumes:
+      - jitacart-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jitacart -d jitacart"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  jitacart-pgdata:

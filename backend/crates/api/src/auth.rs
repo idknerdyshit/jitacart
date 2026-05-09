@@ -5,7 +5,7 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -33,6 +33,7 @@ pub fn router() -> Router<AppState> {
         .route("/auth/eve/upgrade", get(upgrade))
         .route("/auth/logout", post(logout))
         .route("/me", get(me))
+        .route("/me/active-character", patch(set_active_character))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -254,6 +255,7 @@ async fn logout(session: Session) -> Result<Redirect, AuthError> {
 struct MeResponse {
     user: domain::User,
     characters: Vec<domain::Character>,
+    active_character_id: Option<Uuid>,
 }
 
 async fn me(
@@ -261,7 +263,7 @@ async fn me(
     CurrentUser(user_id): CurrentUser,
 ) -> Result<Json<MeResponse>, AuthError> {
     let user_q = sqlx::query_as::<_, UserRow>(
-        "SELECT id, display_name, created_at FROM users WHERE id = $1",
+        "SELECT id, display_name, active_character_id, created_at FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_optional(&state.pool);
@@ -277,9 +279,11 @@ async fn me(
     let (user, characters) = tokio::try_join!(user_q, chars_q).map_err(internal)?;
     let user = user.ok_or(AuthError::Unauthorized)?;
 
+    let active_character_id = user.active_character_id;
     Ok(Json(MeResponse {
         user: user.into(),
         characters: characters.into_iter().map(Into::into).collect(),
+        active_character_id,
     }))
 }
 
@@ -287,6 +291,7 @@ async fn me(
 struct UserRow {
     id: Uuid,
     display_name: String,
+    active_character_id: Option<Uuid>,
     created_at: DateTime<Utc>,
 }
 
@@ -327,6 +332,54 @@ impl From<CharacterRow> for domain::Character {
             last_refreshed_at: r.last_refreshed_at,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct SetActiveCharacterBody {
+    character_id: Option<Uuid>,
+}
+
+async fn set_active_character(
+    State(state): State<AppState>,
+    CurrentUser(user_id): CurrentUser,
+    Json(body): Json<SetActiveCharacterBody>,
+) -> Result<Json<MeResponse>, AuthError> {
+    do_set_active_character(&state.pool, user_id, body.character_id).await?;
+    me(State(state), CurrentUser(user_id)).await
+}
+
+/// Update the user's `active_character_id`, validating that the supplied
+/// character (if any) belongs to the user. The DB-level trigger in
+/// `20261101000000_phase8_polish.sql` is the authoritative ownership check
+/// — this helper short-circuits with `Unauthorized` so callers see a 401
+/// rather than a 500 when the trigger would have rejected the write.
+pub async fn do_set_active_character(
+    pool: &PgPool,
+    user_id: Uuid,
+    character_id: Option<Uuid>,
+) -> Result<(), AuthError> {
+    if let Some(char_id) = character_id {
+        let owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM characters WHERE id = $1 AND user_id = $2)",
+        )
+        .bind(char_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .map_err(internal)?;
+        if !owned {
+            return Err(AuthError::Unauthorized);
+        }
+    }
+
+    sqlx::query("UPDATE users SET active_character_id = $1 WHERE id = $2")
+        .bind(character_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .map_err(internal)?;
+
+    Ok(())
 }
 
 async fn upsert_character(
@@ -440,8 +493,7 @@ pub fn merge_upgrade_scopes(
     existing_character_scopes: &[String],
     requested: &[String],
 ) -> Vec<String> {
-    let mut all: std::collections::BTreeSet<String> =
-        login_scopes.iter().cloned().collect();
+    let mut all: std::collections::BTreeSet<String> = login_scopes.iter().cloned().collect();
     for s in existing_character_scopes {
         all.insert(s.clone());
     }
@@ -460,6 +512,7 @@ fn safe_return_to(return_to: Option<String>) -> Option<String> {
     }
 }
 
+#[derive(Debug)]
 pub enum AuthError {
     Unauthorized,
     StateMismatch,

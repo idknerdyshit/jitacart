@@ -26,6 +26,7 @@ export type ViewerCharacter = {
 export type Me = {
     user: { id: string; display_name: string; created_at: string };
     characters: ViewerCharacter[];
+    active_character_id: string | null;
 };
 
 export type Market = {
@@ -372,3 +373,11 @@ export function findViewerClaim(detail: ListDetail): Claim | null {
         ) ?? null
     );
 }
+
+export type WebhookConfig = {
+    webhook_url: string;
+    notify_list_created: boolean;
+    notify_list_claimed: boolean;
+    notify_list_delivered: boolean;
+    notify_reimbursement_settled: boolean;
+};

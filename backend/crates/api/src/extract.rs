@@ -5,7 +5,7 @@ use axum::{
     http::{request::Parts, StatusCode},
     response::{IntoResponse, Response},
 };
-use domain::{ClaimStatus, GroupRole};
+use domain::{ClaimStatus, GroupRole, ListStatus};
 use serde::Deserialize;
 use tower_sessions::Session;
 use uuid::Uuid;
@@ -113,6 +113,7 @@ pub struct CurrentClaim {
     pub hauler_user_id: Uuid,
     pub role: GroupRole,
     pub status: ClaimStatus,
+    pub list_status: ListStatus,
 }
 
 #[derive(Deserialize)]
@@ -136,8 +137,8 @@ impl FromRequestParts<AppState> for CurrentClaim {
             (StatusCode::BAD_REQUEST, "missing claim id in route").into_response()
         })?;
 
-        let row: Option<(Uuid, Uuid, Uuid, String, Option<String>)> = sqlx::query_as(
-            "SELECT c.list_id, l.group_id, c.hauler_user_id, c.status, gm.role \
+        let row: Option<(Uuid, Uuid, Uuid, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT c.list_id, l.group_id, c.hauler_user_id, c.status, gm.role, l.status \
              FROM claims c \
              JOIN lists l ON l.id = c.list_id \
              LEFT JOIN group_memberships gm \
@@ -150,7 +151,7 @@ impl FromRequestParts<AppState> for CurrentClaim {
         .await
         .map_err(|e| db_error("claim lookup failed", e))?;
 
-        let (list_id, group_id, hauler_user_id, status_raw, role_opt) =
+        let (list_id, group_id, hauler_user_id, status_raw, role_opt, list_status_raw) =
             row.ok_or_else(|| (StatusCode::NOT_FOUND, "claim not found").into_response())?;
 
         let role = parse_role(role_opt.ok_or_else(|| {
@@ -167,6 +168,11 @@ impl FromRequestParts<AppState> for CurrentClaim {
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         })?;
 
+        let list_status: ListStatus = list_status_raw.parse().map_err(|e: String| {
+            tracing::error!(error = %e, "invalid list status in database");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        })?;
+
         Ok(CurrentClaim {
             user_id,
             group_id,
@@ -175,6 +181,7 @@ impl FromRequestParts<AppState> for CurrentClaim {
             hauler_user_id,
             role,
             status,
+            list_status,
         })
     }
 }
@@ -189,6 +196,43 @@ pub struct CurrentList {
     pub list_id: Uuid,
     pub role: GroupRole,
     pub created_by_user_id: Uuid,
+    pub status: ListStatus,
+}
+
+#[allow(clippy::result_large_err)] // Response is the standard axum error type.
+impl CurrentList {
+    pub fn require_open(&self) -> Result<(), Response> {
+        if self.status != ListStatus::Open {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("list is {}; this action requires an open list", self.status),
+            )
+                .into_response());
+        }
+        Ok(())
+    }
+
+    pub fn require_mutable(&self) -> Result<(), Response> {
+        if self.status == ListStatus::Archived {
+            return Err((
+                StatusCode::CONFLICT,
+                "list is archived; no changes can be made",
+            )
+                .into_response());
+        }
+        Ok(())
+    }
+
+    pub fn require_can_manage(&self) -> Result<(), Response> {
+        if self.user_id != self.created_by_user_id && self.role != GroupRole::Owner {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "only the list creator or a group owner can change list status",
+            )
+                .into_response());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -215,8 +259,8 @@ impl FromRequestParts<AppState> for CurrentList {
 
         // Outer-join membership so a missing list returns 404 while a non-member
         // on an existing list returns 403 (role IS NULL).
-        let row: Option<(Uuid, Uuid, Option<String>)> = sqlx::query_as(
-            "SELECT l.group_id, l.created_by_user_id, gm.role \
+        let row: Option<(Uuid, Uuid, String, Option<String>)> = sqlx::query_as(
+            "SELECT l.group_id, l.created_by_user_id, l.status, gm.role \
              FROM lists l \
              LEFT JOIN group_memberships gm \
                ON gm.group_id = l.group_id AND gm.user_id = $1 \
@@ -228,7 +272,7 @@ impl FromRequestParts<AppState> for CurrentList {
         .await
         .map_err(|e| db_error("list lookup failed", e))?;
 
-        let (group_id, created_by_user_id, role) =
+        let (group_id, created_by_user_id, status_raw, role) =
             row.ok_or_else(|| (StatusCode::NOT_FOUND, "list not found").into_response())?;
 
         let role = parse_role(role.ok_or_else(|| {
@@ -240,12 +284,18 @@ impl FromRequestParts<AppState> for CurrentList {
         })?)
         .map_err(IntoResponse::into_response)?;
 
+        let status: ListStatus = status_raw.parse().map_err(|e: String| {
+            tracing::error!(error = %e, "invalid list status in database");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        })?;
+
         Ok(CurrentList {
             user_id,
             group_id,
             list_id,
             role,
             created_by_user_id,
+            status,
         })
     }
 }

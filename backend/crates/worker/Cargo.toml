@@ -36,3 +36,4 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 nea-esi = { workspace = true }
+reqwest = { workspace = true }

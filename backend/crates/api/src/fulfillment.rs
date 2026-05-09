@@ -18,6 +18,7 @@ use crate::{
     extract::{CurrentClaim, CurrentGroup, CurrentList, CurrentUser},
     lists::load_list_detail,
     state::AppState,
+    webhooks::{fire_webhook, WebhookEvent},
 };
 
 pub fn router() -> Router<AppState> {
@@ -217,14 +218,21 @@ async fn runs(
 
 async fn create_claim(
     State(state): State<AppState>,
-    CurrentList {
+    cur: CurrentList,
+    Json(body): Json<CreateClaimBody>,
+) -> Result<Json<ListDetail>, FulfillmentError> {
+    cur.require_open().map_err(|_| {
+        FulfillmentError::Conflict(format!(
+            "list is {}; claims can only be created on open lists",
+            cur.status
+        ))
+    })?;
+    let CurrentList {
         list_id,
         user_id,
         role,
         ..
-    }: CurrentList,
-    Json(body): Json<CreateClaimBody>,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+    } = cur;
     if body.item_ids.is_empty() {
         return Err(FulfillmentError::BadRequest(
             "item_ids must not be empty".into(),
@@ -248,7 +256,30 @@ async fn create_claim(
 
     insert_claim_items(&mut tx, claim_id, &body.item_ids).await?;
 
+    let hauler_name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal)?;
+    let (list_dest, group_id_for_wh): (Option<String>, Uuid) =
+        sqlx::query_as("SELECT destination_label, group_id FROM lists WHERE id = $1")
+            .bind(list_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal)?;
+
     tx.commit().await.map_err(internal)?;
+
+    fire_webhook(
+        &state,
+        group_id_for_wh,
+        WebhookEvent::ListClaimed {
+            list_destination: list_dest.unwrap_or_else(|| "(unnamed)".into()),
+            hauler_name,
+            item_count: body.item_ids.len(),
+        },
+    );
+
     let detail = load_list_detail(&state, list_id, user_id, role)
         .await
         .map_err(list_err)?;
@@ -264,10 +295,16 @@ async fn add_claim_items(
         hauler_user_id,
         role,
         status,
+        list_status,
         ..
     }: CurrentClaim,
     Json(body): Json<AddClaimItemsBody>,
 ) -> Result<Json<ListDetail>, FulfillmentError> {
+    if list_status == domain::ListStatus::Archived {
+        return Err(FulfillmentError::Conflict(
+            "list is archived; no changes can be made".into(),
+        ));
+    }
     ensure_claim_writable(user_id, hauler_user_id, role, status)?;
     if body.item_ids.is_empty() {
         return Err(FulfillmentError::BadRequest(
@@ -299,9 +336,15 @@ async fn remove_claim_item(
         hauler_user_id,
         role,
         status,
+        list_status,
         ..
     }: CurrentClaim,
 ) -> Result<Json<ListDetail>, FulfillmentError> {
+    if list_status == domain::ListStatus::Archived {
+        return Err(FulfillmentError::Conflict(
+            "list is archived; no changes can be made".into(),
+        ));
+    }
     ensure_claim_writable(user_id, hauler_user_id, role, status)?;
 
     let mut tx = state.pool.begin().await.map_err(internal)?;
@@ -336,9 +379,15 @@ async fn release_claim(
         hauler_user_id,
         role,
         status,
+        list_status,
         ..
     }: CurrentClaim,
 ) -> Result<Json<ListDetail>, FulfillmentError> {
+    if list_status == domain::ListStatus::Archived {
+        return Err(FulfillmentError::Conflict(
+            "list is archived; no changes can be made".into(),
+        ));
+    }
     ensure_claim_writable(user_id, hauler_user_id, role, status)?;
 
     let mut tx = state.pool.begin().await.map_err(internal)?;
@@ -373,14 +422,18 @@ async fn release_claim(
 async fn record_fulfillment(
     State(state): State<AppState>,
     Path((_list_id, item_id)): Path<(Uuid, Uuid)>,
-    CurrentList {
+    cur: CurrentList,
+    Json(body): Json<RecordFulfillmentBody>,
+) -> Result<Json<ListDetail>, FulfillmentError> {
+    cur.require_mutable().map_err(|_| {
+        FulfillmentError::Conflict("list is archived; no changes can be made".into())
+    })?;
+    let CurrentList {
         list_id,
         user_id,
         role,
         ..
-    }: CurrentList,
-    Json(body): Json<RecordFulfillmentBody>,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+    } = cur;
     if body.qty <= 0 {
         return Err(FulfillmentError::BadRequest("qty must be positive".into()));
     }
@@ -599,10 +652,12 @@ async fn reverse_fulfillment(
     CurrentUser(user_id): CurrentUser,
 ) -> Result<Json<ListDetail>, FulfillmentError> {
     // Load fulfillment + its list context to get the group membership
-    let row: Option<(Uuid, Uuid, Uuid, Option<DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT f.hauler_user_id, li.list_id, li.requested_by_user_id, f.reversed_at \
+    type ReverseRow = (Uuid, Uuid, Uuid, Option<DateTime<Utc>>, String);
+    let row: Option<ReverseRow> = sqlx::query_as(
+        "SELECT f.hauler_user_id, li.list_id, li.requested_by_user_id, f.reversed_at, l.status \
          FROM fulfillments f \
          JOIN list_items li ON li.id = f.list_item_id \
+         JOIN lists l ON l.id = li.list_id \
          WHERE f.id = $1",
     )
     .bind(fulfillment_id)
@@ -610,8 +665,14 @@ async fn reverse_fulfillment(
     .await
     .map_err(internal)?;
 
-    let (hauler_user_id, list_id, requested_by_user_id, reversed_at) =
+    let (hauler_user_id, list_id, requested_by_user_id, reversed_at, list_status_str) =
         row.ok_or(FulfillmentError::NotFound)?;
+
+    if list_status_str == "archived" {
+        return Err(FulfillmentError::Conflict(
+            "list is archived; no changes can be made".into(),
+        ));
+    }
 
     if reversed_at.is_some() {
         return Err(FulfillmentError::BadRequest(
@@ -702,13 +763,17 @@ async fn reverse_fulfillment(
 async fn mark_delivered(
     State(state): State<AppState>,
     Path((_list_id, item_id)): Path<(Uuid, Uuid)>,
-    CurrentList {
+    cur: CurrentList,
+) -> Result<Json<ListDetail>, FulfillmentError> {
+    cur.require_mutable().map_err(|_| {
+        FulfillmentError::Conflict("list is archived; no changes can be made".into())
+    })?;
+    let CurrentList {
         list_id,
         user_id,
         role,
         ..
-    }: CurrentList,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+    } = cur;
     let mut tx = state.pool.begin().await.map_err(internal)?;
     lock_list(&mut tx, list_id).await?;
 
@@ -747,7 +812,42 @@ async fn mark_delivered(
         .await
         .map_err(internal)?;
 
+    let all_done: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS(\
+             SELECT 1 FROM list_items \
+             WHERE list_id = $1 AND status NOT IN ('delivered','settled')\
+         )",
+    )
+    .bind(list_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    let hauler_name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal)?;
+    let (list_dest, group_id_for_wh): (Option<String>, Uuid) =
+        sqlx::query_as("SELECT destination_label, group_id FROM lists WHERE id = $1")
+            .bind(list_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal)?;
+
     tx.commit().await.map_err(internal)?;
+
+    if all_done {
+        fire_webhook(
+            &state,
+            group_id_for_wh,
+            WebhookEvent::ListDelivered {
+                list_destination: list_dest.unwrap_or_else(|| "(unnamed)".into()),
+                hauler_name,
+            },
+        );
+    }
+
     let detail = load_list_detail(&state, list_id, user_id, role)
         .await
         .map_err(list_err)?;
@@ -758,15 +858,19 @@ async fn mark_delivered(
 
 async fn set_list_tip(
     State(state): State<AppState>,
-    CurrentList {
+    cur: CurrentList,
+    Json(body): Json<SetTipBody>,
+) -> Result<Json<ListDetail>, FulfillmentError> {
+    cur.require_mutable().map_err(|_| {
+        FulfillmentError::Conflict("list is archived; no changes can be made".into())
+    })?;
+    let CurrentList {
         list_id,
         user_id,
         role,
         created_by_user_id,
         ..
-    }: CurrentList,
-    Json(body): Json<SetTipBody>,
-) -> Result<Json<ListDetail>, FulfillmentError> {
+    } = cur;
     validate_tip_pct(body.tip_pct)?;
 
     let is_creator = user_id == created_by_user_id;
@@ -881,7 +985,8 @@ async fn settle_reimbursement(
 
     if reimb_status != ReimbursementStatus::Pending {
         return Err(FulfillmentError::Conflict(format!(
-            "reimbursement is already {}", r.status
+            "reimbursement is already {}",
+            r.status
         )));
     }
 
@@ -937,7 +1042,44 @@ async fn settle_reimbursement(
             settlement::SettlementError::Db(e) => internal(e),
         })?;
 
+    let (list_dest, group_id_for_wh): (Option<String>, Uuid) =
+        sqlx::query_as("SELECT destination_label, group_id FROM lists WHERE id = $1")
+            .bind(list_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal)?;
+
+    let req_name: String = match requester_user_id {
+        Some(uid) => sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal)?,
+        None => "Corp".into(),
+    };
+    let (hauler_name, total_isk): (String, rust_decimal::Decimal) = sqlx::query_as(
+        "SELECT hu.display_name, r.total_isk FROM reimbursements r \
+         JOIN users hu ON hu.id = r.hauler_user_id \
+         WHERE r.id = $1",
+    )
+    .bind(reimb_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+
     tx.commit().await.map_err(internal)?;
+
+    fire_webhook(
+        &state,
+        group_id_for_wh,
+        WebhookEvent::ReimbursementSettled {
+            list_destination: list_dest.unwrap_or_else(|| "(unnamed)".into()),
+            requester_name: req_name,
+            hauler_name,
+            total_isk: total_isk.to_string(),
+        },
+    );
+
     let detail = load_list_detail(&state, list_id, user_id, role)
         .await
         .map_err(list_err)?;

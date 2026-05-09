@@ -216,6 +216,17 @@ pub async fn recompute_contract_expected_total(
     Ok(())
 }
 
+/// Info about a reimbursement that was just settled via contract, for webhook
+/// delivery by the caller after the transaction commits.
+#[derive(Debug, Clone)]
+pub struct ContractSettledReimbursement {
+    pub group_id: Uuid,
+    pub list_destination: String,
+    pub requester_name: String,
+    pub hauler_name: String,
+    pub total_isk: Decimal,
+}
+
 /// Promote items that are `bought` *or* `delivered` to `settled` for every
 /// reimbursement bound to `contract_id`, mark those reimbursements settled,
 /// and write the aggregate delta. The contract's `date_completed` is used as
@@ -224,7 +235,7 @@ pub async fn recompute_contract_expected_total(
 pub async fn settle_via_contract(
     tx: &mut Transaction<'_, Postgres>,
     contract_id: Uuid,
-) -> Result<usize, SettlementError> {
+) -> Result<Vec<ContractSettledReimbursement>, SettlementError> {
     let date_completed: Option<Option<DateTime<Utc>>> =
         sqlx::query_scalar("SELECT date_completed FROM contracts WHERE id = $1 FOR UPDATE")
             .bind(contract_id)
@@ -234,19 +245,19 @@ pub async fn settle_via_contract(
 
     let settled_at = date_completed.unwrap_or_else(Utc::now);
 
-    let settled = sqlx::query(
+    let settled_rows: Vec<(Uuid, Uuid, Option<Uuid>, Uuid, Decimal)> = sqlx::query_as(
         "UPDATE reimbursements \
          SET status = 'settled', settled_at = $1, settled_by_user_id = NULL, updated_at = now() \
-         WHERE contract_id = $2 AND status = 'pending'",
+         WHERE contract_id = $2 AND status = 'pending' \
+         RETURNING id, list_id, requester_user_id, hauler_user_id, total_isk",
     )
     .bind(settled_at)
     .bind(contract_id)
-    .execute(&mut **tx)
-    .await?
-    .rows_affected() as usize;
+    .fetch_all(&mut **tx)
+    .await?;
 
-    if settled == 0 {
-        return Ok(0);
+    if settled_rows.is_empty() {
+        return Ok(vec![]);
     }
 
     // Bulk-flip every list_item that any reimbursement bound to this contract
@@ -302,7 +313,50 @@ pub async fn settle_via_contract(
     .execute(&mut **tx)
     .await?;
 
-    Ok(settled)
+    let list_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT DISTINCT list_id FROM reimbursements WHERE contract_id = $1")
+            .bind(contract_id)
+            .fetch_all(&mut **tx)
+            .await?;
+
+    for lid in &list_ids {
+        auto_close_list_if_complete(tx, *lid).await?;
+    }
+
+    let mut webhook_info: Vec<ContractSettledReimbursement> =
+        Vec::with_capacity(settled_rows.len());
+    for (_, list_id, requester_user_id, hauler_user_id, total_isk) in &settled_rows {
+        let (group_id, list_dest): (Uuid, Option<String>) =
+            sqlx::query_as("SELECT group_id, destination_label FROM lists WHERE id = $1")
+                .bind(list_id)
+                .fetch_one(&mut **tx)
+                .await?;
+
+        let req_name: String = match requester_user_id {
+            Some(uid) => {
+                sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+                    .bind(uid)
+                    .fetch_one(&mut **tx)
+                    .await?
+            }
+            None => "Corp".into(),
+        };
+        let hauler_name: String =
+            sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+                .bind(hauler_user_id)
+                .fetch_one(&mut **tx)
+                .await?;
+
+        webhook_info.push(ContractSettledReimbursement {
+            group_id,
+            list_destination: list_dest.unwrap_or_else(|| "(unnamed)".into()),
+            requester_name: req_name,
+            hauler_name,
+            total_isk: *total_isk,
+        });
+    }
+
+    Ok(webhook_info)
 }
 
 /// Promote items to `settled` for a `(list, requester, hauler)` triple,
@@ -476,6 +530,8 @@ pub async fn settle_manual(
         flip_items_to_settled(tx, list_id, req_uid, hauler_user_id, false).await?;
     }
 
+    auto_close_list_if_complete(tx, list_id).await?;
+
     Ok(())
 }
 
@@ -493,12 +549,11 @@ pub async fn verify_contract_against_journal(
     contract_id: Uuid,
 ) -> Result<(), SettlementError> {
     // Fetch esi_contract_id and price_isk for this contract.
-    let row: Option<(i64, Decimal)> = sqlx::query_as(
-        "SELECT esi_contract_id, price_isk FROM contracts WHERE id = $1",
-    )
-    .bind(contract_id)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(i64, Decimal)> =
+        sqlx::query_as("SELECT esi_contract_id, price_isk FROM contracts WHERE id = $1")
+            .bind(contract_id)
+            .fetch_optional(pool)
+            .await?;
 
     let (esi_contract_id, _price_isk) = match row {
         Some(r) => r,
@@ -615,6 +670,25 @@ pub async fn verify_contract_against_journal(
     }
 
     Ok(())
+}
+
+pub async fn auto_close_list_if_complete(
+    tx: &mut Transaction<'_, Postgres>,
+    list_id: Uuid,
+) -> Result<bool, SettlementError> {
+    let rows = sqlx::query(
+        "UPDATE lists SET status = 'closed', updated_at = now() \
+         WHERE id = $1 AND status = 'open' \
+           AND NOT EXISTS( \
+               SELECT 1 FROM list_items WHERE list_id = $1 AND status <> 'settled' \
+           )",
+    )
+    .bind(list_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+
+    Ok(rows > 0)
 }
 
 /// Detach all reimbursements bound to a failed/cancelled contract, returning

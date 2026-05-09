@@ -1332,6 +1332,7 @@ dependencies = [
  "market",
  "nea-esi",
  "rand 0.8.6",
+ "reqwest",
  "rust_decimal",
  "secrecy",
  "serde",

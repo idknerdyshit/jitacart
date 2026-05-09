@@ -29,7 +29,7 @@ async fn confirm_happy_path_contract_outstanding(pool: PgPool) {
     let sugg_id =
         insert_suggestion(&pool, contract.contract_id, ids.reimbursement_id, "pending").await;
 
-    let res = do_confirm(&pool, hauler, sugg_id).await.unwrap();
+    let (res, _) = do_confirm(&pool, hauler, sugg_id).await.unwrap();
     assert_eq!(res.state, "confirmed");
     assert!(!res.settled);
 
@@ -68,7 +68,7 @@ async fn confirm_against_finished_contract_settles_immediately(pool: PgPool) {
     let sugg_id =
         insert_suggestion(&pool, contract.contract_id, ids.reimbursement_id, "pending").await;
 
-    let res = do_confirm(&pool, hauler, sugg_id).await.unwrap();
+    let (res, _) = do_confirm(&pool, hauler, sugg_id).await.unwrap();
     assert_eq!(res.state, "confirmed");
     assert!(res.settled);
 
@@ -183,7 +183,7 @@ async fn double_confirm_hits_partial_unique_index(pool: PgPool) {
     .await;
 
     // First confirm against A succeeds.
-    do_confirm(&pool, hauler, sugg_a).await.unwrap();
+    let _ = do_confirm(&pool, hauler, sugg_a).await.unwrap();
 
     // Now manually unbind reimbursement so the "already bound" check passes,
     // but leave A's confirmed suggestion in place — that's what triggers the

@@ -41,13 +41,11 @@ pub async fn insert_user(pool: &PgPool, name: &str) -> Uuid {
 }
 
 pub async fn get_user_principal_id(pool: &PgPool, user_id: Uuid) -> Uuid {
-    sqlx::query_scalar(
-        "SELECT id FROM principals WHERE kind = 'user' AND user_id = $1",
-    )
-    .bind(user_id)
-    .fetch_one(pool)
-    .await
-    .unwrap()
+    sqlx::query_scalar("SELECT id FROM principals WHERE kind = 'user' AND user_id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 pub async fn insert_group(pool: &PgPool, owner: Uuid, name: &str) -> Uuid {

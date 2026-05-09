@@ -46,11 +46,11 @@ async fn run_one(pool: &PgPool, contract_id: Uuid) -> anyhow::Result<()> {
     .fetch_optional(pool)
     .await?;
 
-    let (issuer_principal_id, assignee_principal_id, contract_type, items_synced_at) =
-        match header {
-            Some(h) => h,
-            None => return Ok(()),
-        };
+    let (issuer_principal_id, assignee_principal_id, contract_type, items_synced_at) = match header
+    {
+        Some(h) => h,
+        None => return Ok(()),
+    };
 
     if contract_type != "item_exchange" || items_synced_at.is_none() {
         return Ok(());

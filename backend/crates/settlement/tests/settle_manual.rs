@@ -67,14 +67,19 @@ async fn cross_hauler_isolation(pool: PgPool) {
     set_item_status(&pool, item_c, "delivered").await;
 
     // hauler_b's pending reimbursement on the same list/requester.
+    let requester_pid = get_user_principal_id(&pool, requester).await;
+    let hauler_b_pid = get_user_principal_id(&pool, hauler_b).await;
     let reimb_b: uuid::Uuid = sqlx::query_scalar(
         "INSERT INTO reimbursements \
-         (list_id, requester_user_id, hauler_user_id, subtotal_isk, tip_isk, total_isk) \
-         VALUES ($1, $2, $3, 2000, 0, 2000) RETURNING id",
+         (list_id, requester_user_id, hauler_user_id, subtotal_isk, tip_isk, total_isk, \
+          requester_principal_id, hauler_principal_id) \
+         VALUES ($1, $2, $3, 2000, 0, 2000, $4, $5) RETURNING id",
     )
     .bind(ids.list_id)
     .bind(requester)
     .bind(hauler_b)
+    .bind(requester_pid)
+    .bind(hauler_b_pid)
     .fetch_one(&pool)
     .await
     .unwrap();

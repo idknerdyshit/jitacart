@@ -2,7 +2,8 @@
     import { onMount } from 'svelte';
     import { goto } from '$app/navigation';
     import { page } from '$app/state';
-    import { api, fmtPct, type Group } from '$lib/api';
+    import { api, fmtPct, type Group, type WebhookConfig } from '$lib/api';
+    import { toast } from 'svelte-sonner';
 
     type Member = {
         user_id: string;
@@ -18,11 +19,19 @@
 
     let detail = $state<Detail | null>(null);
     let error = $state<string | null>(null);
-    let copyMsg = $state<string | null>(null);
 
     let editingTip = $state(false);
     let tipInput = $state('');
     let savingTip = $state(false);
+
+    let webhook = $state<WebhookConfig | null>(null);
+    let webhookLoaded = $state(false);
+    let webhookUrl = $state('');
+    let whListCreated = $state(true);
+    let whListClaimed = $state(true);
+    let whListDelivered = $state(true);
+    let whReimbSettled = $state(true);
+    let savingWebhook = $state(false);
 
     const groupId = $derived(page.params.id);
 
@@ -40,7 +49,25 @@
         detail = await res.json();
     }
 
-    onMount(load);
+    onMount(async () => {
+        await load();
+        if (detail?.role === 'owner') {
+            try {
+                const cfg = await api<WebhookConfig | null>(`/groups/${groupId}/webhook`);
+                if (cfg) {
+                    webhook = cfg;
+                    webhookUrl = cfg.webhook_url;
+                    whListCreated = cfg.notify_list_created;
+                    whListClaimed = cfg.notify_list_claimed;
+                    whListDelivered = cfg.notify_list_delivered;
+                    whReimbSettled = cfg.notify_reimbursement_settled;
+                }
+            } catch {
+                // non-fatal
+            }
+            webhookLoaded = true;
+        }
+    });
 
     function inviteUrl(code: string) {
         return `${location.origin}/g/join/${code}`;
@@ -49,8 +76,7 @@
     async function copyInvite() {
         if (!detail) return;
         await navigator.clipboard.writeText(inviteUrl(detail.group.invite_code));
-        copyMsg = 'Copied!';
-        setTimeout(() => (copyMsg = null), 1500);
+        toast.success('Invite link copied');
     }
 
     async function rotateInvite() {
@@ -66,6 +92,7 @@
         }
         const updated: Group = await res.json();
         detail = { ...detail, group: updated };
+        toast.success('Invite code rotated');
     }
 
     async function leave() {
@@ -108,6 +135,43 @@
         editingTip = true;
     }
 
+    async function saveWebhook() {
+        if (savingWebhook) return;
+        savingWebhook = true;
+        try {
+            webhook = await api<WebhookConfig>(`/groups/${groupId}/webhook`, {
+                method: 'PUT',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                    webhook_url: webhookUrl,
+                    notify_list_created: whListCreated,
+                    notify_list_claimed: whListClaimed,
+                    notify_list_delivered: whListDelivered,
+                    notify_reimbursement_settled: whReimbSettled
+                })
+            });
+            toast.success('Webhook saved');
+        } catch (e) {
+            error = (e as Error).message;
+            toast.error(error ?? 'Failed to save webhook');
+        } finally {
+            savingWebhook = false;
+        }
+    }
+
+    async function removeWebhook() {
+        if (!confirm('Remove the Discord webhook?')) return;
+        try {
+            await api(`/groups/${groupId}/webhook`, { method: 'DELETE' });
+            webhook = null;
+            webhookUrl = '';
+            toast.success('Webhook removed');
+        } catch (e) {
+            error = (e as Error).message;
+            toast.error(error ?? 'Failed to remove webhook');
+        }
+    }
+
     async function saveTip() {
         if (!detail || savingTip) return;
         const pct = Number(tipInput);
@@ -124,8 +188,10 @@
             });
             detail = { ...detail, group: updated };
             editingTip = false;
+            toast.success('Default tip updated');
         } catch (e) {
             error = (e as Error).message;
+            toast.error(error ?? 'Failed to update tip');
         } finally {
             savingTip = false;
         }
@@ -150,7 +216,6 @@
             {#if detail.role === 'owner'}
                 <button onclick={rotateInvite}>Rotate</button>
             {/if}
-            {#if copyMsg}<span class="muted">{copyMsg}</span>{/if}
         </div>
     </section>
 
@@ -196,6 +261,35 @@
                 </div>
             {/if}
             <p class="muted small">New lists inherit this tip percentage.</p>
+        </section>
+    {/if}
+
+    {#if detail.role === 'owner' && webhookLoaded}
+        <section>
+            <h2>Discord Notifications</h2>
+            <label class="wh-label">
+                Webhook URL
+                <input
+                    type="text"
+                    placeholder="https://discord.com/api/webhooks/..."
+                    bind:value={webhookUrl}
+                    class="wh-url"
+                />
+            </label>
+            <div class="wh-toggles">
+                <label><input type="checkbox" bind:checked={whListCreated} /> List created</label>
+                <label><input type="checkbox" bind:checked={whListClaimed} /> List claimed</label>
+                <label><input type="checkbox" bind:checked={whListDelivered} /> List delivered</label>
+                <label><input type="checkbox" bind:checked={whReimbSettled} /> Reimbursement settled</label>
+            </div>
+            <div class="actions">
+                <button class="primary" disabled={savingWebhook || !webhookUrl.trim()} onclick={saveWebhook}>
+                    {savingWebhook ? 'Saving…' : 'Save'}
+                </button>
+                {#if webhook}
+                    <button class="danger" onclick={removeWebhook}>Remove</button>
+                {/if}
+            </div>
         </section>
     {/if}
 
@@ -284,5 +378,48 @@
     }
     section {
         margin-top: 1.25rem;
+    }
+    .wh-label {
+        display: flex;
+        flex-direction: column;
+        gap: 0.3rem;
+        font-size: 0.9rem;
+        color: #8b949e;
+        margin-bottom: 0.5rem;
+    }
+    .wh-url {
+        background: #0d1117;
+        color: #e6edf3;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 0.3rem 0.5rem;
+        width: 100%;
+    }
+    .wh-toggles {
+        display: flex;
+        flex-direction: column;
+        gap: 0.3rem;
+        margin-bottom: 0.5rem;
+        font-size: 0.9rem;
+    }
+    .wh-toggles label {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+    }
+    @media (max-width: 640px) {
+        code {
+            font-size: 0.8rem;
+        }
+        .actions {
+            flex-wrap: wrap;
+        }
+        .nav-row {
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+        .tip-row {
+            flex-wrap: wrap;
+        }
     }
 </style>

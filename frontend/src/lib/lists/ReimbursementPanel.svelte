@@ -1,6 +1,7 @@
 <script lang="ts">
     import { api, deltaClass, fmtIsk, fmtPct, isContractTerminalSuccess } from '$lib/api';
     import type { ListDetail, Reimbursement } from '$lib/api';
+    import { toast } from 'svelte-sonner';
 
     interface Props {
         detail: ListDetail;
@@ -71,8 +72,10 @@
                 method: 'POST'
             });
             onUpdate(updated);
+            toast.success('Reimbursement settled');
         } catch (e) {
             errMsg = (e as Error).message;
+            toast.error(errMsg ?? 'Failed to settle');
         } finally {
             settling = null;
         }

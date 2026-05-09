@@ -1,6 +1,14 @@
 <script lang="ts">
+    import { Toaster } from 'svelte-sonner';
     let { children } = $props();
 </script>
+
+<Toaster
+    position="top-right"
+    toastOptions={{
+        style: 'background: #161b22; color: #e6edf3; border: 1px solid #30363d;'
+    }}
+/>
 
 <main>
     {@render children()}

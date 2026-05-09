@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, patch, post},
@@ -34,6 +34,7 @@ use crate::{
     extract::{CurrentGroup, CurrentList},
     markets::MarketRow,
     state::AppState,
+    webhooks::{fire_webhook, WebhookEvent},
 };
 
 pub const MAX_MULTIBUY_BYTES: usize = 64 * 1024;
@@ -351,13 +352,36 @@ async fn create(
 
     tx.commit().await.map_err(internal)?;
 
+    let creator_name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(internal)?;
+    fire_webhook(
+        &state,
+        group_id,
+        WebhookEvent::ListCreated {
+            list_destination: body.destination_label.unwrap_or_else(|| "(unnamed)".into()),
+            item_count: items_to_insert.len() as i64,
+            estimate_isk: total.to_string(),
+            creator_name,
+        },
+    );
+
     let detail = load_list_detail(&state, list_id, user_id, role).await?;
     Ok(Json(detail))
+}
+
+#[derive(Deserialize)]
+struct ListForGroupQuery {
+    #[serde(default)]
+    include_archived: bool,
 }
 
 async fn list_for_group(
     State(state): State<AppState>,
     CurrentGroup { group_id, .. }: CurrentGroup,
+    Query(q): Query<ListForGroupQuery>,
 ) -> Result<Json<Vec<ListSummary>>, ListError> {
     let rows: Vec<ListSummaryRow> = sqlx::query_as(
         r#"
@@ -372,11 +396,12 @@ async fn list_for_group(
                   WHERE lm.list_id = l.id AND lm.is_primary
                   LIMIT 1) AS primary_short_label
         FROM lists l
-        WHERE l.group_id = $1
+        WHERE l.group_id = $1 AND ($2 OR l.status <> 'archived')
         ORDER BY l.created_at DESC
         "#,
     )
     .bind(group_id)
+    .bind(q.include_archived)
     .fetch_all(&state.pool)
     .await
     .map_err(internal)?;
@@ -403,17 +428,25 @@ async fn detail(
 
 async fn patch_list(
     State(state): State<AppState>,
-    CurrentList {
-        list_id,
-        user_id,
-        role,
-        ..
-    }: CurrentList,
+    cur: CurrentList,
     Json(body): Json<PatchListBody>,
 ) -> Result<Json<ListDetail>, ListError> {
     if body.destination_label.is_none() && body.notes.is_none() && body.status.is_none() {
         return Err(ListError::BadRequest("nothing to update".into()));
     }
+    if body.status.is_none() {
+        cur.require_mutable()
+            .map_err(|_| ListError::Conflict("list is archived; no changes can be made".into()))?;
+    }
+    if body.status.is_some() {
+        cur.require_can_manage().map_err(|_| ListError::Forbidden)?;
+    }
+    let CurrentList {
+        list_id,
+        user_id,
+        role,
+        ..
+    } = cur;
 
     let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE lists SET updated_at = now()");
     if let Some(label_opt) = &body.destination_label {
@@ -436,6 +469,46 @@ async fn patch_list(
     Ok(Json(detail))
 }
 
+/// Apply a status transition to a list, checking that the caller is the
+/// list's creator or a group owner. Extracted so tests can drive the archive
+/// transition without going through the extractor stack.
+pub async fn do_patch_list_status(
+    pool: &sqlx::PgPool,
+    list_id: Uuid,
+    user_id: Uuid,
+    new_status: ListStatus,
+) -> Result<(), ListError> {
+    let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT l.created_by_user_id, gm.role \
+         FROM lists l \
+         LEFT JOIN group_memberships gm \
+           ON gm.group_id = l.group_id AND gm.user_id = $1 \
+         WHERE l.id = $2",
+    )
+    .bind(user_id)
+    .bind(list_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(internal)?;
+
+    let (created_by, role_raw) = row.ok_or(ListError::NotFound)?;
+    let role_raw = role_raw.ok_or(ListError::Forbidden)?;
+    let role: GroupRole = role_raw
+        .parse()
+        .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
+    if user_id != created_by && role != GroupRole::Owner {
+        return Err(ListError::Forbidden);
+    }
+
+    sqlx::query("UPDATE lists SET status = $1, updated_at = now() WHERE id = $2")
+        .bind(new_status.as_str())
+        .bind(list_id)
+        .execute(pool)
+        .await
+        .map_err(internal)?;
+    Ok(())
+}
+
 async fn delete_list(
     State(state): State<AppState>,
     cur: CurrentList,
@@ -456,15 +529,18 @@ async fn delete_list(
 
 async fn replace_markets(
     State(state): State<AppState>,
-    CurrentList {
+    cur: CurrentList,
+    Json(body): Json<ReplaceMarketsBody>,
+) -> Result<Json<ListDetail>, ListError> {
+    cur.require_mutable()
+        .map_err(|_| ListError::Conflict("list is archived; no changes can be made".into()))?;
+    let CurrentList {
         list_id,
         group_id,
         user_id,
         role,
         ..
-    }: CurrentList,
-    Json(body): Json<ReplaceMarketsBody>,
-) -> Result<Json<ListDetail>, ListError> {
+    } = cur;
     validate_market_ids_size(&body.market_ids)?;
     if !body.market_ids.contains(&body.primary_market_id) {
         return Err(ListError::BadRequest(
@@ -517,14 +593,21 @@ async fn replace_markets(
 
 async fn add_items(
     State(state): State<AppState>,
-    CurrentList {
+    cur: CurrentList,
+    Json(body): Json<AddItemsBody>,
+) -> Result<Json<ListDetail>, ListError> {
+    cur.require_open().map_err(|_| {
+        ListError::Conflict(format!(
+            "list is {}; items can only be added to open lists",
+            cur.status
+        ))
+    })?;
+    let CurrentList {
         list_id,
         user_id,
         role,
         ..
-    }: CurrentList,
-    Json(body): Json<AddItemsBody>,
-) -> Result<Json<ListDetail>, ListError> {
+    } = cur;
     let new_lines: Vec<(String, i64, i32)> = match (body.multibuy, body.type_name, body.qty) {
         (Some(mb), _, _) => {
             validate_multibuy_size(&mb)?;
@@ -633,6 +716,8 @@ async fn patch_item(
     Json(body): Json<PatchItemBody>,
 ) -> Result<Json<ListDetail>, ListError> {
     debug_assert_eq!(cur.list_id, list_id);
+    cur.require_mutable()
+        .map_err(|_| ListError::Conflict("list is archived; no changes can be made".into()))?;
     if body.qty_requested.is_none() && body.type_name.is_none() {
         return Err(ListError::BadRequest("nothing to update".into()));
     }
@@ -734,6 +819,8 @@ async fn delete_item(
     cur: CurrentList,
 ) -> Result<Json<ListDetail>, ListError> {
     debug_assert_eq!(cur.list_id, list_id);
+    cur.require_mutable()
+        .map_err(|_| ListError::Conflict("list is archived; no changes can be made".into()))?;
     let updated_after = {
         let mut tx = state.pool.begin().await.map_err(internal)?;
         let _: (Uuid,) = sqlx::query_as("SELECT id FROM lists WHERE id = $1 FOR UPDATE")
@@ -1700,6 +1787,7 @@ impl ReimbursementRow {
     }
 }
 
+#[derive(Debug)]
 pub enum ListError {
     BadRequest(String),
     NotFound,

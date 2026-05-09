@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::{
     extract::{CurrentGroup, CurrentUser},
     state::AppState,
+    webhooks::{fire_webhook, WebhookEvent},
 };
 
 pub fn router() -> Router<AppState> {
@@ -167,14 +168,33 @@ async fn confirm_suggestion(
     Path(suggestion_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
 ) -> Result<Json<SuggestionDecision>, ContractError> {
-    Ok(Json(do_confirm(&state.pool, user_id, suggestion_id).await?))
+    let (decision, webhook_info) = do_confirm(&state.pool, user_id, suggestion_id).await?;
+    for info in webhook_info {
+        fire_webhook(
+            &state,
+            info.group_id,
+            WebhookEvent::ReimbursementSettled {
+                list_destination: info.list_destination,
+                requester_name: info.requester_name,
+                hauler_name: info.hauler_name,
+                total_isk: info.total_isk.to_string(),
+            },
+        );
+    }
+    Ok(Json(decision))
 }
 
 pub async fn do_confirm(
     pool: &sqlx::PgPool,
     user_id: Uuid,
     suggestion_id: Uuid,
-) -> Result<SuggestionDecision, ContractError> {
+) -> Result<
+    (
+        SuggestionDecision,
+        Vec<settlement::ContractSettledReimbursement>,
+    ),
+    ContractError,
+> {
     let mut tx = pool.begin().await.map_err(internal)?;
 
     let row: Option<LinkLockRow> = sqlx::query_as(
@@ -228,14 +248,18 @@ pub async fn do_confirm(
     .await
     .map_err(map_confirmed_dup)?;
 
-    let settled = finalize_link(&mut tx, &ctx).await?;
+    let (settled, webhook_info) = finalize_link(&mut tx, &ctx).await?;
 
     tx.commit().await.map_err(internal)?;
-    Ok(SuggestionDecision {
-        suggestion_id,
-        state: "confirmed".into(),
-        settled,
-    })
+
+    Ok((
+        SuggestionDecision {
+            suggestion_id,
+            state: "confirmed".into(),
+            settled,
+        },
+        webhook_info,
+    ))
 }
 
 /// Shared lock-row for confirm and manual-link. `suggestion_state` is `None`
@@ -315,11 +339,11 @@ async fn validate_link(
 
 /// Bind the reimbursement to the contract, refresh totals, and run
 /// settle-via-contract if the contract is already in a terminal-success state.
-/// Returns `true` iff the contract finished settling.
+/// Returns `(settled, webhook_info)` — caller fires webhooks after commit.
 async fn finalize_link(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ctx: &LinkLockRow,
-) -> Result<bool, ContractError> {
+) -> Result<(bool, Vec<settlement::ContractSettledReimbursement>), ContractError> {
     sqlx::query("UPDATE reimbursements SET contract_id = $1, updated_at = now() WHERE id = $2")
         .bind(ctx.contract_id)
         .bind(ctx.reimbursement_id)
@@ -336,12 +360,14 @@ async fn finalize_link(
         .parse::<ContractStatus>()
         .map(|s| s.is_terminal_success())
         .unwrap_or(false);
-    if already_finished {
+    let webhook_info = if already_finished {
         settlement::settle_via_contract(tx, ctx.contract_id)
             .await
-            .map_err(|e| internal(anyhow::anyhow!("settle_via_contract: {e}")))?;
-    }
-    Ok(already_finished)
+            .map_err(|e| internal(anyhow::anyhow!("settle_via_contract: {e}")))?
+    } else {
+        vec![]
+    };
+    Ok((already_finished, webhook_info))
 }
 
 fn map_confirmed_dup(e: sqlx::Error) -> ContractError {
@@ -427,9 +453,21 @@ async fn manual_link(
     CurrentUser(user_id): CurrentUser,
     Json(body): Json<ManualLinkBody>,
 ) -> Result<Json<SuggestionDecision>, ContractError> {
-    Ok(Json(
-        do_manual_link(&state.pool, user_id, contract_id, body.reimbursement_id).await?,
-    ))
+    let (decision, webhook_info) =
+        do_manual_link(&state.pool, user_id, contract_id, body.reimbursement_id).await?;
+    for info in webhook_info {
+        fire_webhook(
+            &state,
+            info.group_id,
+            WebhookEvent::ReimbursementSettled {
+                list_destination: info.list_destination,
+                requester_name: info.requester_name,
+                hauler_name: info.hauler_name,
+                total_isk: info.total_isk.to_string(),
+            },
+        );
+    }
+    Ok(Json(decision))
 }
 
 pub async fn do_manual_link(
@@ -437,7 +475,13 @@ pub async fn do_manual_link(
     user_id: Uuid,
     contract_id: Uuid,
     reimbursement_id: Uuid,
-) -> Result<SuggestionDecision, ContractError> {
+) -> Result<
+    (
+        SuggestionDecision,
+        Vec<settlement::ContractSettledReimbursement>,
+    ),
+    ContractError,
+> {
     let mut tx = pool.begin().await.map_err(internal)?;
 
     let row: Option<LinkLockRow> = sqlx::query_as(
@@ -489,14 +533,18 @@ pub async fn do_manual_link(
     .await
     .map_err(map_confirmed_dup)?;
 
-    let settled = finalize_link(&mut tx, &ctx).await?;
+    let (settled, webhook_info) = finalize_link(&mut tx, &ctx).await?;
 
     tx.commit().await.map_err(internal)?;
-    Ok(SuggestionDecision {
-        suggestion_id: ctx.reimbursement_id,
-        state: "confirmed".into(),
-        settled,
-    })
+
+    Ok((
+        SuggestionDecision {
+            suggestion_id: ctx.reimbursement_id,
+            state: "confirmed".into(),
+            settled,
+        },
+        webhook_info,
+    ))
 }
 
 async fn unlink_contract(

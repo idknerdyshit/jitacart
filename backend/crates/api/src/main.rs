@@ -19,7 +19,7 @@ use auth_tokens::{CharacterTokenStore, EsiBudgetGuard, TokenCipher};
 
 use jitacart_api::{
     auth, citadels, config::Config, contracts, corps, fulfillment, groups, jwt::JwksCache, lists,
-    markets, state::AppState,
+    markets, state::AppState, webhooks,
 };
 
 #[tokio::main]
@@ -85,6 +85,12 @@ async fn main() -> anyhow::Result<()> {
 
     let budget_guard = EsiBudgetGuard::default();
 
+    let webhook_http = reqwest::Client::builder()
+        .user_agent("JitaCart-Webhook/1.0")
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("building webhook reqwest client")?;
+
     let state = AppState {
         pool,
         config: Arc::new(config),
@@ -93,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         esi: Arc::new(esi),
         token_store,
         budget_guard,
+        webhook_http,
     };
 
     let bind: SocketAddr = state
@@ -112,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(fulfillment::router())
         .merge(contracts::router())
         .merge(corps::router())
+        .merge(webhooks::router())
         .with_state(state)
         .layer(session_layer)
         .layer(TraceLayer::new_for_http());

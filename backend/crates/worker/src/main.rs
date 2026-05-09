@@ -174,6 +174,7 @@ pub struct Ctx {
     pub esi_anon: Arc<EsiClient>,
     pub token_store: CharacterTokenStore,
     pub budget: EsiBudgetGuard,
+    pub webhook_http: reqwest::Client,
 }
 
 #[tokio::main]
@@ -222,6 +223,10 @@ async fn main() -> anyhow::Result<()> {
         esi_anon: Arc::new(esi_anon),
         token_store,
         budget: EsiBudgetGuard::default(),
+        webhook_http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("building webhook http client"),
     });
 
     let intervals = &ctx.config.esi.poll_intervals_secs;

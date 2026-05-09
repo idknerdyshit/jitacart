@@ -2,22 +2,33 @@
     import { onMount } from 'svelte';
     import { page } from '$app/state';
     import { api, fmtIsk, type ListSummary } from '$lib/api';
+    import Skeleton from '$lib/components/Skeleton.svelte';
+    import EmptyState from '$lib/components/EmptyState.svelte';
 
     const groupId = $derived(page.params.id);
 
     let lists = $state<ListSummary[] | null>(null);
     let error = $state<string | null>(null);
+    let tab = $state<'active' | 'archived'>('active');
 
     async function load() {
         error = null;
         try {
-            lists = await api<ListSummary[]>(`/groups/${groupId}/lists`);
+            lists = await api<ListSummary[]>(`/groups/${groupId}/lists?include_archived=true`);
         } catch (e) {
             error = (e as Error).message;
         }
     }
 
     onMount(load);
+
+    const filtered = $derived(
+        lists
+            ? tab === 'active'
+                ? lists.filter((l) => l.status !== 'archived')
+                : lists.filter((l) => l.status === 'archived')
+            : null
+    );
 </script>
 
 <p><a href="/groups/{groupId}">← Group</a></p>
@@ -32,9 +43,22 @@
     <a class="button primary" href="/groups/{groupId}/lists/new">+ New list</a>
 </p>
 
-{#if lists}
-    {#if lists.length === 0}
-        <p class="muted">No lists in this group yet.</p>
+<div class="tabs">
+    <button class:active={tab === 'active'} onclick={() => (tab = 'active')}>
+        Active
+    </button>
+    <button class:active={tab === 'archived'} onclick={() => (tab = 'archived')}>
+        Archived
+    </button>
+</div>
+
+{#if filtered}
+    {#if filtered.length === 0}
+        {#if tab === 'active'}
+            <EmptyState message="No lists in this group yet." hint="Create one to get started." />
+        {:else}
+            <EmptyState message="No archived lists." />
+        {/if}
     {:else}
         <table>
             <thead>
@@ -48,21 +72,23 @@
                 </tr>
             </thead>
             <tbody>
-                {#each lists as l (l.id)}
+                {#each filtered as l (l.id)}
                     <tr onclick={() => (window.location.href = `/lists/${l.id}`)}>
-                        <td>{l.destination_label ?? '—'}</td>
-                        <td>{l.primary_market_short_label ?? '—'}</td>
-                        <td>{l.item_count}</td>
-                        <td>{fmtIsk(l.total_estimate_isk)}</td>
-                        <td>{l.status}</td>
-                        <td class="muted">{new Date(l.created_at).toLocaleDateString()}</td>
+                        <td data-label="Destination">{l.destination_label ?? '—'}</td>
+                        <td data-label="Hub">{l.primary_market_short_label ?? '—'}</td>
+                        <td data-label="Items">{l.item_count}</td>
+                        <td data-label="Estimate">{fmtIsk(l.total_estimate_isk)}</td>
+                        <td data-label="Status">{l.status}</td>
+                        <td data-label="Created" class="muted"
+                            >{new Date(l.created_at).toLocaleDateString()}</td
+                        >
                     </tr>
                 {/each}
             </tbody>
         </table>
     {/if}
 {:else if !error}
-    <p>Loading…</p>
+    <Skeleton rows={5} columns={6} />
 {/if}
 
 <style>
@@ -85,6 +111,24 @@
     .button.primary {
         border-color: #2f6feb;
     }
+    .tabs {
+        display: flex;
+        gap: 0.4rem;
+        margin: 0.75rem 0;
+    }
+    .tabs button {
+        background: #21262d;
+        color: #e6edf3;
+        border: 1px solid #30363d;
+        padding: 0.3rem 0.7rem;
+        border-radius: 999px;
+        cursor: pointer;
+        font-size: 0.85rem;
+    }
+    .tabs button.active {
+        border-color: #2f6feb;
+        color: #79c0ff;
+    }
     table {
         width: 100%;
         border-collapse: collapse;
@@ -104,5 +148,30 @@
     }
     .muted {
         color: #8b949e;
+    }
+    @media (max-width: 768px) {
+        thead {
+            display: none;
+        }
+        tbody tr {
+            display: block;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+        td {
+            display: flex;
+            justify-content: space-between;
+            border-bottom: none;
+            padding: 0.2rem 0;
+        }
+        td::before {
+            content: attr(data-label);
+            font-weight: 600;
+            color: #8b949e;
+            margin-right: 0.5rem;
+        }
     }
 </style>

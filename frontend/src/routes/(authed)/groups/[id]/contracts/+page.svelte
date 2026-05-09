@@ -10,6 +10,8 @@
         type ContractSuggestion,
         type BoundContract
     } from '$lib/api';
+    import Skeleton from '$lib/components/Skeleton.svelte';
+    import { toast } from 'svelte-sonner';
 
     const groupId = $derived(page.params.id);
 
@@ -41,9 +43,11 @@
         busy = s.id;
         try {
             await api(`/contracts/suggestions/${s.id}/confirm`, { method: 'POST' });
+            toast.success('Contract match confirmed');
             await load();
         } catch (e) {
             error = (e as Error).message;
+            toast.error(error ?? 'Failed to confirm');
         } finally {
             busy = null;
         }
@@ -54,9 +58,11 @@
         busy = s.id;
         try {
             await api(`/contracts/suggestions/${s.id}/reject`, { method: 'POST' });
+            toast.success('Contract match rejected');
             await load();
         } catch (e) {
             error = (e as Error).message;
+            toast.error(error ?? 'Failed to reject');
         } finally {
             busy = null;
         }
@@ -67,9 +73,11 @@
         busy = c.contract_id;
         try {
             await api(`/contracts/${c.contract_id}/unlink`, { method: 'POST' });
+            toast.success('Contract unlinked');
             await load();
         } catch (e) {
             error = (e as Error).message;
+            toast.error(error ?? 'Failed to unlink');
         } finally {
             busy = null;
         }
@@ -93,6 +101,9 @@
     <p class="err">{error}</p>
 {/if}
 
+{#if suggestions === null && bound === null && !error}
+    <Skeleton rows={3} variant="card" />
+{:else}
 <div class="tabs">
     <button class:active={tab === 'pending'} onclick={() => (tab = 'pending')}>
         Pending ({pending.length})
@@ -226,6 +237,7 @@
         </div>
     {/if}
 {/if}
+{/if}
 
 <style>
     .tabs {
@@ -324,5 +336,17 @@
     }
     .neg {
         color: #f87171;
+    }
+    @media (max-width: 640px) {
+        .row-between {
+            flex-wrap: wrap;
+            gap: 0.25rem 0.5rem;
+        }
+        .amounts {
+            grid-template-columns: 1fr auto;
+        }
+        .actions {
+            flex-wrap: wrap;
+        }
     }
 </style>

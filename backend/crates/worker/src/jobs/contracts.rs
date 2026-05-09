@@ -23,7 +23,7 @@ use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use domain::principals::{EsiContractParties, resolve_contract_parties};
+use domain::principals::{resolve_contract_parties, EsiContractParties};
 
 use super::corp_contracts::{build_principal_index, find_user_for_principal};
 
@@ -141,7 +141,7 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
         if !u.status_changed {
             continue;
         }
-        if let Err(e) = handle_terminal_transition(&ctx.pool, &u).await {
+        if let Err(e) = handle_terminal_transition(ctx, &u).await {
             tracing::warn!(
                 error = ?e,
                 esi_contract_id = u.esi_contract_id,
@@ -513,29 +513,31 @@ async fn sync_items_for(
     Ok(true)
 }
 
-async fn handle_terminal_transition(pool: &PgPool, u: &UpsertedContract) -> anyhow::Result<()> {
+async fn handle_terminal_transition(ctx: &Ctx, u: &UpsertedContract) -> anyhow::Result<()> {
     let parsed: domain::ContractStatus = match u.status.parse() {
         Ok(s) => s,
         Err(_) => return Ok(()),
     };
 
     if parsed.is_terminal_success() {
-        let mut tx = pool.begin().await?;
-        // Lock the contract row and confirm there's at least one bound row.
+        let mut tx = ctx.pool.begin().await?;
         let bound: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM reimbursements WHERE contract_id = $1 AND status = 'pending'",
         )
         .bind(u.contract_id)
         .fetch_one(&mut *tx)
         .await?;
-        if bound > 0 {
+        let settled = if bound > 0 {
             settlement::settle_via_contract(&mut tx, u.contract_id)
                 .await
-                .map_err(|e| anyhow::anyhow!("settle_via_contract: {e}"))?;
-        }
+                .map_err(|e| anyhow::anyhow!("settle_via_contract: {e}"))?
+        } else {
+            vec![]
+        };
         tx.commit().await?;
+        super::webhooks::fire_settlement_webhooks(&ctx.pool, &ctx.webhook_http, settled).await;
     } else if parsed.is_terminal_failure() {
-        let mut tx = pool.begin().await?;
+        let mut tx = ctx.pool.begin().await?;
         settlement::unbind_contract(&mut tx, u.contract_id)
             .await
             .map_err(|e| anyhow::anyhow!("unbind_contract: {e}"))?;
@@ -543,4 +545,3 @@ async fn handle_terminal_transition(pool: &PgPool, u: &UpsertedContract) -> anyh
     }
     Ok(())
 }
-

@@ -18,4 +18,6 @@ pub struct AppState {
     pub esi: Arc<EsiClient>,
     pub token_store: CharacterTokenStore,
     pub budget_guard: EsiBudgetGuard,
+    /// Separate HTTP client for outbound webhook calls (Discord, etc.).
+    pub webhook_http: reqwest::Client,
 }

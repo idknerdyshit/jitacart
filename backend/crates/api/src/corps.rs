@@ -38,10 +38,7 @@ pub fn router() -> Router<AppState> {
             delete(remove_ambassador),
         )
         // Wallet journal
-        .route(
-            "/groups/{id}/corps/{corp_id}/journal",
-            get(list_journal),
-        )
+        .route("/groups/{id}/corps/{corp_id}/journal", get(list_journal))
         // List payer patch
         .route("/lists/{id}/payer", patch(patch_list_payer))
 }
@@ -256,7 +253,9 @@ async fn link_corp(
     tx.commit().await.map_err(internal)?;
 
     // Return updated corp dto.
-    let corps = list_corps_inner(&state.pool, group_id, user_id, role).await.map_err(internal)?;
+    let corps = list_corps_inner(&state.pool, group_id, user_id, role)
+        .await
+        .map_err(internal)?;
     let dto = corps
         .into_iter()
         .find(|c| c.id == corp_id)
@@ -411,7 +410,9 @@ async fn list_journal(
     State(state): State<AppState>,
     Path((group_id, corp_id)): Path<(Uuid, Uuid)>,
     CurrentGroup {
-        user_id, group_id: _gid, ..
+        user_id,
+        group_id: _gid,
+        ..
     }: CurrentGroup,
     Query(q): Query<JournalQuery>,
 ) -> Result<Json<Vec<JournalEntryDto>>, CorpError> {
@@ -501,7 +502,11 @@ async fn list_journal(
             context_id: r.context_id,
             context_id_type: r.context_id_type,
             reason: r.reason,
-            raw_json: if full_visibility { Some(r.raw_json) } else { None },
+            raw_json: if full_visibility {
+                Some(r.raw_json)
+            } else {
+                None
+            },
         })
         .collect();
 
@@ -560,13 +565,12 @@ async fn patch_list_payer(
         .unwrap_or(GroupRole::Member);
 
     // Mid-flight rule: reject if reimbursements already exist.
-    let has_reimbs: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM reimbursements WHERE list_id = $1)",
-    )
-    .bind(list_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(internal)?;
+    let has_reimbs: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM reimbursements WHERE list_id = $1)")
+            .bind(list_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(internal)?;
 
     if has_reimbs {
         return Err(CorpError::Conflict(
@@ -579,15 +583,13 @@ async fn patch_list_payer(
         require_corp_in_group(&state.pool, group_id, corp_id).await?;
     }
 
-    sqlx::query(
-        "UPDATE lists SET payer_corp_id = $2, payer_division = $3 WHERE id = $1",
-    )
-    .bind(list_id)
-    .bind(body.payer_corp_id)
-    .bind(body.payer_division)
-    .execute(&state.pool)
-    .await
-    .map_err(internal)?;
+    sqlx::query("UPDATE lists SET payer_corp_id = $2, payer_division = $3 WHERE id = $1")
+        .bind(list_id)
+        .bind(body.payer_corp_id)
+        .bind(body.payer_division)
+        .execute(&state.pool)
+        .await
+        .map_err(internal)?;
 
     let detail = load_list_detail(&state, list_id, user_id, actual_role)
         .await

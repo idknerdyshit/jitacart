@@ -30,10 +30,7 @@ pub struct EsiContractParties {
 
 /// Resolve issuer and assignee ESI ids into `Principal` ids using the provided
 /// in-memory index. Tests cover all combinations.
-pub fn resolve_contract_parties(
-    c: &EsiContractParties,
-    idx: &PrincipalIndex,
-) -> ResolvedParties {
+pub fn resolve_contract_parties(c: &EsiContractParties, idx: &PrincipalIndex) -> ResolvedParties {
     // Issuer side.
     let issuer_principal_id: Option<Uuid> = if c.for_corporation {
         // Corp contract: issuer is the corporation.
@@ -55,17 +52,11 @@ pub fn resolve_contract_parties(
         Some(esi_id) => {
             // First try corp lookup.
             if let Some(corp_id) = idx.corp_by_esi_id.get(&esi_id) {
-                let pid = idx
-                    .principal_by_corp_id
-                    .get(corp_id)
-                    .map(|p| p.id);
+                let pid = idx.principal_by_corp_id.get(corp_id).map(|p| p.id);
                 (pid, pid.is_none())
             } else if let Some(user_id) = idx.user_by_character_id.get(&esi_id) {
                 // Known character.
-                let pid = idx
-                    .principal_by_user_id
-                    .get(user_id)
-                    .map(|p| p.id);
+                let pid = idx.principal_by_user_id.get(user_id).map(|p| p.id);
                 (pid, pid.is_none())
             } else {
                 // Unknown — persist for visibility, skip matching.

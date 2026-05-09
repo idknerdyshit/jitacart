@@ -25,12 +25,12 @@ async fn bought_only_items_flip_to_settled(pool: PgPool) {
     bind_reimbursement_to_contract(&pool, ids.reimbursement_id, contract.contract_id).await;
 
     let mut tx = pool.begin().await.unwrap();
-    let count = settlement::settle_via_contract(&mut tx, contract.contract_id)
+    let settled = settlement::settle_via_contract(&mut tx, contract.contract_id)
         .await
         .unwrap();
     tx.commit().await.unwrap();
 
-    assert_eq!(count, 1);
+    assert_eq!(settled.len(), 1);
     assert_eq!(get_item_status(&pool, ids.item_a_id).await, "settled");
     assert_eq!(get_item_status(&pool, ids.item_b_id).await, "settled");
     assert_eq!(
@@ -60,12 +60,12 @@ async fn delivered_only_items_flip_to_settled(pool: PgPool) {
     bind_reimbursement_to_contract(&pool, ids.reimbursement_id, contract.contract_id).await;
 
     let mut tx = pool.begin().await.unwrap();
-    let count = settlement::settle_via_contract(&mut tx, contract.contract_id)
+    let settled = settlement::settle_via_contract(&mut tx, contract.contract_id)
         .await
         .unwrap();
     tx.commit().await.unwrap();
 
-    assert_eq!(count, 1);
+    assert_eq!(settled.len(), 1);
     assert_eq!(get_item_status(&pool, ids.item_a_id).await, "settled");
     assert_eq!(get_item_status(&pool, ids.item_b_id).await, "settled");
 }
@@ -234,12 +234,12 @@ async fn no_bound_rows_returns_zero_no_side_effects(pool: PgPool) {
     // Deliberately do NOT bind the reimbursement.
 
     let mut tx = pool.begin().await.unwrap();
-    let count = settlement::settle_via_contract(&mut tx, contract.contract_id)
+    let settled = settlement::settle_via_contract(&mut tx, contract.contract_id)
         .await
         .unwrap();
     tx.commit().await.unwrap();
 
-    assert_eq!(count, 0);
+    assert_eq!(settled.len(), 0);
     assert_eq!(get_item_status(&pool, ids.item_a_id).await, "bought");
     assert_eq!(get_item_status(&pool, ids.item_b_id).await, "bought");
     assert_eq!(
@@ -264,14 +264,19 @@ async fn multiple_bound_reimbursements_all_settle(pool: PgPool) {
     set_item_status(&pool, item_c, "bought").await;
 
     // Reimbursement for requester_b ↔ hauler.
+    let requester_b_pid = get_user_principal_id(&pool, requester_b).await;
+    let hauler_pid = get_user_principal_id(&pool, hauler).await;
     let reimb_b: uuid::Uuid = sqlx::query_scalar(
         "INSERT INTO reimbursements \
-         (list_id, requester_user_id, hauler_user_id, subtotal_isk, tip_isk, total_isk) \
-         VALUES ($1, $2, $3, 3000, 0, 3000) RETURNING id",
+         (list_id, requester_user_id, hauler_user_id, subtotal_isk, tip_isk, total_isk, \
+          requester_principal_id, hauler_principal_id) \
+         VALUES ($1, $2, $3, 3000, 0, 3000, $4, $5) RETURNING id",
     )
     .bind(ids.list_id)
     .bind(requester_b)
     .bind(hauler)
+    .bind(requester_b_pid)
+    .bind(hauler_pid)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -292,12 +297,12 @@ async fn multiple_bound_reimbursements_all_settle(pool: PgPool) {
     bind_reimbursement_to_contract(&pool, reimb_b, contract.contract_id).await;
 
     let mut tx = pool.begin().await.unwrap();
-    let count = settlement::settle_via_contract(&mut tx, contract.contract_id)
+    let settled = settlement::settle_via_contract(&mut tx, contract.contract_id)
         .await
         .unwrap();
     tx.commit().await.unwrap();
 
-    assert_eq!(count, 2);
+    assert_eq!(settled.len(), 2);
     assert_eq!(
         get_reimb_status(&pool, ids.reimbursement_id).await,
         "settled"

@@ -15,6 +15,9 @@
     import ClaimChips from '$lib/lists/ClaimChips.svelte';
     import BuyModal from '$lib/lists/BuyModal.svelte';
     import ReimbursementPanel from '$lib/lists/ReimbursementPanel.svelte';
+    import Skeleton from '$lib/components/Skeleton.svelte';
+    import EmptyState from '$lib/components/EmptyState.svelte';
+    import { toast } from 'svelte-sonner';
 
     const listId = $derived(page.params.id);
     const STALE_AFTER_MS = 2 * 600 * 1000;
@@ -81,8 +84,10 @@
                 headers: { 'content-type': 'application/json' },
                 body: JSON.stringify({ status })
             });
+            toast.success(`List ${status}`);
         } catch (e) {
             error = (e as Error).message;
+            toast.error(error ?? 'Failed to update status');
         }
     }
 
@@ -92,9 +97,11 @@
         try {
             const groupId = detail.list.group_id;
             await api(`/lists/${listId}`, { method: 'DELETE' });
+            toast.success('List deleted');
             goto(`/groups/${groupId}/lists`);
         } catch (e) {
             error = (e as Error).message;
+            toast.error(error ?? 'Failed to delete list');
         }
     }
 
@@ -348,17 +355,27 @@
         <p>{detail.list.notes}</p>
     {/if}
 
+    {#if detail.list.status === 'closed'}
+        <div class="banner">This list is closed.</div>
+    {:else if detail.list.status === 'archived'}
+        <div class="banner">This list is archived.</div>
+    {/if}
+
+    {#if detail.viewer_user_id === detail.list.created_by_user_id || detail.viewer_role === 'owner'}
     <section>
         <h2>Status</h2>
-        <select
-            value={detail.list.status}
-            onchange={(e) => setStatus((e.currentTarget as HTMLSelectElement).value as ListStatus)}
-        >
-            <option value="open">open</option>
-            <option value="closed">closed</option>
-            <option value="archived">archived</option>
-        </select>
+        <div class="status-actions">
+            {#if detail.list.status === 'open'}
+                <button onclick={() => setStatus('closed')}>Close list</button>
+            {:else if detail.list.status === 'closed'}
+                <button onclick={() => setStatus('open')}>Reopen</button>
+                <button onclick={() => setStatus('archived')}>Archive</button>
+            {:else if detail.list.status === 'archived'}
+                <button onclick={() => setStatus('closed')}>Unarchive</button>
+            {/if}
+        </div>
     </section>
+    {/if}
 
     <section>
         <div class="row-between">
@@ -420,104 +437,109 @@
 
     <section>
         <h2>Items</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>Item</th>
-                    <th>Qty</th>
-                    <th>Status</th>
-                    <th>Claim</th>
-                    <th>Saved unit</th>
-                    {#each detail.markets as m (m.id)}
-                        <th>
-                            {m.short_label ?? '(unnamed)'}
-                            {#if m.kind === 'public_structure'}<span class="badge">citadel</span>{/if}
-                        </th>
-                    {/each}
-                    <th></th>
-                </tr>
-            </thead>
-            <tbody>
-                {#each detail.items as it (it.id)}
+        {#if detail.items.length === 0}
+            <EmptyState message="No items yet." hint="Paste a MultiBuy string." />
+        {:else}
+            <table>
+                <thead>
                     <tr>
-                        <td>{it.type_name}</td>
-                        <td>
-                            <input
-                                type="number"
-                                min="1"
-                                value={it.qty_requested}
-                                disabled={it.status !== 'open'}
-                                title={it.status !== 'open'
-                                    ? 'Release the claim or reverse fulfillments to edit'
-                                    : ''}
-                                onchange={(e) =>
-                                    updateQty(
-                                        it.id,
-                                        Number((e.currentTarget as HTMLInputElement).value)
-                                    )}
-                                style="width: 6rem"
-                            />
-                        </td>
-                        <td>
-                            <span class="status-pill" class:pill-open={it.status === 'open'} class:pill-claimed={it.status === 'claimed'} class:pill-bought={it.status === 'bought'} class:pill-delivered={it.status === 'delivered'} class:pill-settled={it.status === 'settled'}>
-                                {statusPill(it.id, it.status)}
-                            </span>
-                        </td>
-                        <td>
-                            <ClaimChips
-                                item={it}
-                                {detail}
-                                onUpdate={(d) => (detail = d)}
-                            />
-                        </td>
-                        <td>{fmtIsk(it.est_unit_price_isk)}</td>
+                        <th>Item</th>
+                        <th>Qty</th>
+                        <th>Status</th>
+                        <th>Claim</th>
+                        <th>Saved unit</th>
                         {#each detail.markets as m (m.id)}
-                            {@const lp = priceFor(it.id, m.id)}
-                            {@const cellStale = isStaleMarket(m.id) ||
-                                (lp?.computed_at != null && Date.now() - new Date(lp.computed_at).getTime() > STALE_AFTER_MS)}
-                            <td
-                                class:stale={cellStale}
-                                title={lp?.computed_at == null
-                                    ? 'worker has not priced this yet'
-                                    : `priced at ${new Date(lp.computed_at).toLocaleTimeString()}`}
-                            >
-                                {#if lp == null || lp.best_sell == null}
-                                    <span class="muted">no offers</span>
-                                {:else}
-                                    {fmtIsk(lp.best_sell)}
-                                    {#if lp.sell_volume <= it.qty_requested}
-                                        <span class="warn">·thin (vol {lp.sell_volume.toLocaleString()})</span>
-                                    {:else}
-                                        <span class="muted vol">vol {lp.sell_volume.toLocaleString()}</span>
-                                    {/if}
-                                    {#if cellStale}<span class="muted">·stale</span>{/if}
-                                {/if}
-                            </td>
+                            <th>
+                                {m.short_label ?? '(unnamed)'}
+                                {#if m.kind === 'public_structure'}<span class="badge">citadel</span>{/if}
+                            </th>
                         {/each}
-                        <td class="actions-cell">
-                            {#if (it.status === 'open' || it.status === 'claimed') }
-                                <button class="primary small" onclick={() => (buyModalItem = it.id)}>
-                                    Buy
-                                </button>
-                            {/if}
-                            {#if it.status === 'bought' && (isLastHauler(it.id) || detail.viewer_role === 'owner')}
-                                <button class="small" onclick={() => markDelivered(it.id)}>
-                                    Delivered
-                                </button>
-                            {/if}
-                            <button
-                                class="danger"
-                                disabled={it.status !== 'open'}
-                                title={it.status !== 'open'
-                                    ? 'Release the claim or reverse fulfillments to delete'
-                                    : ''}
-                                onclick={() => deleteItem(it.id)}
-                            >×</button>
-                        </td>
+                        <th></th>
                     </tr>
-                {/each}
-            </tbody>
-        </table>
+                </thead>
+                <tbody>
+                    {#each detail.items as it (it.id)}
+                        <tr>
+                            <td data-label="Item">{it.type_name}</td>
+                            <td data-label="Qty">
+                                <input
+                                    type="number"
+                                    min="1"
+                                    value={it.qty_requested}
+                                    disabled={it.status !== 'open'}
+                                    title={it.status !== 'open'
+                                        ? 'Release the claim or reverse fulfillments to edit'
+                                        : ''}
+                                    onchange={(e) =>
+                                        updateQty(
+                                            it.id,
+                                            Number((e.currentTarget as HTMLInputElement).value)
+                                        )}
+                                    style="width: 6rem"
+                                />
+                            </td>
+                            <td data-label="Status">
+                                <span class="status-pill" class:pill-open={it.status === 'open'} class:pill-claimed={it.status === 'claimed'} class:pill-bought={it.status === 'bought'} class:pill-delivered={it.status === 'delivered'} class:pill-settled={it.status === 'settled'}>
+                                    {statusPill(it.id, it.status)}
+                                </span>
+                            </td>
+                            <td data-label="Claim">
+                                <ClaimChips
+                                    item={it}
+                                    {detail}
+                                    onUpdate={(d) => (detail = d)}
+                                />
+                            </td>
+                            <td data-label="Saved unit">{fmtIsk(it.est_unit_price_isk)}</td>
+                            {#each detail.markets as m (m.id)}
+                                {@const lp = priceFor(it.id, m.id)}
+                                {@const cellStale = isStaleMarket(m.id) ||
+                                    (lp?.computed_at != null && Date.now() - new Date(lp.computed_at).getTime() > STALE_AFTER_MS)}
+                                <td
+                                    data-label={m.short_label ?? 'Price'}
+                                    class:stale={cellStale}
+                                    title={lp?.computed_at == null
+                                        ? 'worker has not priced this yet'
+                                        : `priced at ${new Date(lp.computed_at).toLocaleTimeString()}`}
+                                >
+                                    {#if lp == null || lp.best_sell == null}
+                                        <span class="muted">no offers</span>
+                                    {:else}
+                                        {fmtIsk(lp.best_sell)}
+                                        {#if lp.sell_volume <= it.qty_requested}
+                                            <span class="warn">·thin (vol {lp.sell_volume.toLocaleString()})</span>
+                                        {:else}
+                                            <span class="muted vol">vol {lp.sell_volume.toLocaleString()}</span>
+                                        {/if}
+                                        {#if cellStale}<span class="muted">·stale</span>{/if}
+                                    {/if}
+                                </td>
+                            {/each}
+                            <td class="actions-cell">
+                                {#if (it.status === 'open' || it.status === 'claimed') }
+                                    <button class="primary small" onclick={() => (buyModalItem = it.id)}>
+                                        Buy
+                                    </button>
+                                {/if}
+                                {#if it.status === 'bought' && (isLastHauler(it.id) || detail.viewer_role === 'owner')}
+                                    <button class="small" onclick={() => markDelivered(it.id)}>
+                                        Delivered
+                                    </button>
+                                {/if}
+                                <button
+                                    class="danger"
+                                    disabled={it.status !== 'open'}
+                                    title={it.status !== 'open'
+                                        ? 'Release the claim or reverse fulfillments to delete'
+                                        : ''}
+                                    onclick={() => deleteItem(it.id)}
+                                >×</button>
+                            </td>
+                        </tr>
+                    {/each}
+                </tbody>
+            </table>
+        {/if}
     </section>
 
     <section>
@@ -580,7 +602,7 @@
         <button class="danger" onclick={deleteList}>Delete list</button>
     </section>
 {:else if !error}
-    <p>Loading…</p>
+    <Skeleton rows={4} columns={5} />
 {/if}
 
 {#if buyItem && detail}
@@ -724,5 +746,48 @@
     .err {
         color: #f87171;
         margin: 0;
+    }
+    .banner {
+        background: #1c2128;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 0.5rem 0.75rem;
+        color: #8b949e;
+        margin-bottom: 0.75rem;
+    }
+    .status-actions {
+        display: flex;
+        gap: 0.5rem;
+    }
+    @media (max-width: 768px) {
+        table thead {
+            display: none;
+        }
+        table tbody tr {
+            display: block;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+        table td {
+            display: flex;
+            justify-content: space-between;
+            border-bottom: none;
+            padding: 0.2rem 0;
+        }
+        table td::before {
+            content: attr(data-label);
+            font-weight: 600;
+            color: #8b949e;
+            margin-right: 0.5rem;
+        }
+        .actions-cell {
+            justify-content: flex-end;
+        }
+        .actions-cell::before {
+            display: none;
+        }
     }
 </style>

@@ -2,6 +2,9 @@
     import { onMount } from 'svelte';
     import { page } from '$app/state';
     import { api, fmtIsk, type Corp, type CorpAmbassador, type CorpWalletDivision } from '$lib/api';
+    import Skeleton from '$lib/components/Skeleton.svelte';
+    import EmptyState from '$lib/components/EmptyState.svelte';
+    import { toast } from 'svelte-sonner';
 
     type CorpRow = Corp & {
         ambassadors: CorpAmbassador[];
@@ -56,9 +59,11 @@
                 body: JSON.stringify({ character_id: charId })
             });
             linkCharId = '';
+            toast.success('Corp linked');
             await load();
         } catch (e) {
             linkErr = (e as Error).message;
+            toast.error(linkErr ?? 'Failed to link corp');
         } finally {
             linking = false;
         }
@@ -68,9 +73,11 @@
         if (!confirm(`Unlink corp "${name}"? Ambassadors contributed by this group will be disabled.`)) return;
         try {
             await api(`/groups/${groupId}/corps/${corpId}`, { method: 'DELETE' });
+            toast.success('Corp unlinked');
             await load();
         } catch (e) {
             error = (e as Error).message;
+            toast.error(error ?? 'Failed to unlink corp');
         }
     }
 
@@ -90,9 +97,11 @@
             });
             addAmbCharId = '';
             addingAmbFor = null;
+            toast.success('Ambassador added');
             await load();
         } catch (e) {
             addAmbErr = (e as Error).message;
+            toast.error(addAmbErr ?? 'Failed to add ambassador');
         }
     }
 
@@ -102,9 +111,11 @@
             await api(`/groups/${groupId}/corps/${corpId}/ambassadors/${characterId}`, {
                 method: 'DELETE'
             });
+            toast.success('Ambassador removed');
             await load();
         } catch (e) {
             error = (e as Error).message;
+            toast.error(error ?? 'Failed to remove ambassador');
         }
     }
 </script>
@@ -119,7 +130,7 @@
 
 {#if data}
     {#if data.corps.length === 0}
-        <p class="muted">No corps linked yet.</p>
+        <EmptyState message="No corporations linked yet." hint="Link a corp below to start tracking wallets." />
     {/if}
 
     {#each data.corps as corp (corp.id)}
@@ -225,7 +236,7 @@
         </section>
     {/if}
 {:else if !error}
-    <p>Loading…</p>
+    <Skeleton rows={3} variant="card" />
 {/if}
 
 <style>
@@ -350,5 +361,26 @@
     }
     .err {
         color: #f87171;
+    }
+    @media (max-width: 640px) {
+        .corp-header {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.5rem;
+        }
+        .add-amb-row {
+            flex-direction: column;
+            align-items: stretch;
+        }
+        .add-amb-row input[type='number'] {
+            width: 100% !important;
+        }
+        .row {
+            flex-direction: column;
+            align-items: stretch;
+        }
+        .row input[type='number'] {
+            width: 100% !important;
+        }
     }
 </style>

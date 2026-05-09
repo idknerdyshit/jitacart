@@ -7,6 +7,8 @@
         type RunSummary,
         type ContractSuggestion
     } from '$lib/api';
+    import Skeleton from '$lib/components/Skeleton.svelte';
+    import EmptyState from '$lib/components/EmptyState.svelte';
 
     const groupId = $derived(page.params.id);
 
@@ -16,18 +18,17 @@
 
     async function load() {
         error = null;
-        try {
-            runs = await api<RunSummary[]>(`/groups/${groupId}/runs`);
-        } catch (e) {
-            error = (e as Error).message;
+        const [runsResult, suggestionsResult] = await Promise.allSettled([
+            api<RunSummary[]>(`/groups/${groupId}/runs`),
+            api<ContractSuggestion[]>(`/groups/${groupId}/contracts/suggestions`),
+        ]);
+        if (runsResult.status === 'fulfilled') {
+            runs = runsResult.value;
+        } else {
+            error = (runsResult.reason as Error).message;
         }
-        try {
-            const s = await api<ContractSuggestion[]>(
-                `/groups/${groupId}/contracts/suggestions`
-            );
-            pendingContracts = s.filter((x) => x.state === 'pending').length;
-        } catch {
-            // non-fatal
+        if (suggestionsResult.status === 'fulfilled') {
+            pendingContracts = suggestionsResult.value.filter((x) => x.state === 'pending').length;
         }
     }
 
@@ -62,7 +63,7 @@
 
 {#if runs !== null}
     {#if runs.length === 0}
-        <p class="muted">No open lists at the moment.</p>
+        <EmptyState message="All caught up!" hint="Create a list to get started." />
     {:else}
         <table>
             <thead>
@@ -77,12 +78,12 @@
             <tbody>
                 {#each runs as r (r.list_id)}
                     <tr>
-                        <td>
+                        <td data-label="Destination">
                             <a href={`/lists/${r.list_id}`}>
                                 {r.destination_label ?? '(unnamed)'}
                             </a>
                         </td>
-                        <td>
+                        <td data-label="Markets">
                             <div class="market-chips">
                                 {#each r.accepted_markets as m (m.market_id)}
                                     <span class="chip" class:primary={m.is_primary}>
@@ -91,10 +92,10 @@
                                 {/each}
                             </div>
                         </td>
-                        <td class="counts">
+                        <td data-label="Items" class="counts">
                             {statusCounts(r)}
                         </td>
-                        <td class="muted">{fmtIsk(r.total_estimate_isk)}</td>
+                        <td data-label="Budget" class="muted">{fmtIsk(r.total_estimate_isk)}</td>
                         <td>
                             <a
                                 href={`/lists/${r.list_id}#claim`}
@@ -110,7 +111,7 @@
         </table>
     {/if}
 {:else if !error}
-    <p>Loading…</p>
+    <Skeleton rows={4} columns={5} />
 {/if}
 
 <style>
@@ -179,5 +180,30 @@
         border-radius: 999px;
         text-decoration: none;
         font-size: 0.85rem;
+    }
+    @media (max-width: 768px) {
+        thead {
+            display: none;
+        }
+        tbody tr {
+            display: block;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+        td {
+            display: flex;
+            justify-content: space-between;
+            border-bottom: none;
+            padding: 0.2rem 0;
+        }
+        td::before {
+            content: attr(data-label);
+            font-weight: 600;
+            color: #8b949e;
+            margin-right: 0.5rem;
+        }
     }
 </style>

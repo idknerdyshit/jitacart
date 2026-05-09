@@ -23,7 +23,7 @@ use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use domain::principals::{EsiContractParties, resolve_contract_parties};
+use domain::principals::{resolve_contract_parties, EsiContractParties};
 use domain::{Principal, PrincipalIndex, PrincipalKind};
 
 use crate::Ctx;
@@ -86,9 +86,7 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
         "corp_contracts tick"
     );
 
-    let sem = Arc::new(Semaphore::new(
-        ctx.config.worker.corp_contracts_concurrency,
-    ));
+    let sem = Arc::new(Semaphore::new(ctx.config.worker.corp_contracts_concurrency));
     let mut tasks: Vec<tokio::task::JoinHandle<Vec<UpsertedContract>>> = Vec::new();
 
     for corp in due {
@@ -130,10 +128,12 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
     }
 
     // Sync items for any contracts still missing them (corp ambassador path).
-    let synced_ids = super::contracts::sync_pending_items(ctx).await.unwrap_or_else(|e| {
-        tracing::warn!(error = ?e, "corp_contracts items sync failed");
-        Vec::new()
-    });
+    let synced_ids = super::contracts::sync_pending_items(ctx)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = ?e, "corp_contracts items sync failed");
+            Vec::new()
+        });
 
     // Run matcher for newly-upserted contracts plus those whose items just landed.
     let mut candidate_ids: Vec<Uuid> = all_upserts.iter().map(|u| u.contract_id).collect();
@@ -154,7 +154,7 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
         if !u.status_changed {
             continue;
         }
-        if let Err(e) = handle_terminal(&ctx.pool, &u).await {
+        if let Err(e) = handle_terminal(ctx, &u).await {
             tracing::warn!(
                 error = ?e,
                 esi_contract_id = u.esi_contract_id,
@@ -280,18 +280,11 @@ async fn poll_one_corp(
         Some(v) => v,
         None => {
             // All ambassadors failed.
-            let _ = sqlx::query(
-                "UPDATE corps SET last_auth_error_at = now() WHERE id = $1",
-            )
-            .bind(corp_id)
-            .execute(pool)
-            .await;
-            advance_corp_cursor(
-                pool,
-                corp_id,
-                interval_secs.min(MAX_BACKOFF_SECS),
-            )
-            .await?;
+            let _ = sqlx::query("UPDATE corps SET last_auth_error_at = now() WHERE id = $1")
+                .bind(corp_id)
+                .execute(pool)
+                .await;
+            advance_corp_cursor(pool, corp_id, interval_secs.min(MAX_BACKOFF_SECS)).await?;
             return Ok(Vec::new());
         }
     };
@@ -369,8 +362,7 @@ async fn poll_one_corp(
             status: c.status.clone(),
             price_isk: Decimal::from_f64(c.price.unwrap_or(0.0)).unwrap_or(Decimal::ZERO),
             reward_isk: Decimal::from_f64(c.reward.unwrap_or(0.0)).unwrap_or(Decimal::ZERO),
-            collateral_isk: Decimal::from_f64(c.collateral.unwrap_or(0.0))
-                .unwrap_or(Decimal::ZERO),
+            collateral_isk: Decimal::from_f64(c.collateral.unwrap_or(0.0)).unwrap_or(Decimal::ZERO),
             date_issued: c.date_issued,
             date_expired: Some(c.date_expired),
             date_accepted: c.date_accepted,
@@ -521,14 +513,14 @@ pub(crate) fn find_user_for_principal(idx: &PrincipalIndex, principal_id: Uuid) 
         .and_then(|p| p.user_id)
 }
 
-async fn handle_terminal(pool: &PgPool, u: &UpsertedContract) -> anyhow::Result<()> {
+async fn handle_terminal(ctx: &Ctx, u: &UpsertedContract) -> anyhow::Result<()> {
     let parsed: domain::ContractStatus = match u.status.parse() {
         Ok(s) => s,
         Err(_) => return Ok(()),
     };
 
     if parsed.is_terminal_success() {
-        let mut tx = pool.begin().await?;
+        let mut tx = ctx.pool.begin().await?;
         let bound: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM reimbursements \
              WHERE contract_id = $1 AND status = 'pending'",
@@ -536,14 +528,17 @@ async fn handle_terminal(pool: &PgPool, u: &UpsertedContract) -> anyhow::Result<
         .bind(u.contract_id)
         .fetch_one(&mut *tx)
         .await?;
-        if bound > 0 {
+        let settled = if bound > 0 {
             settlement::settle_via_contract(&mut tx, u.contract_id)
                 .await
-                .map_err(|e| anyhow::anyhow!("settle_via_contract: {e}"))?;
-        }
+                .map_err(|e| anyhow::anyhow!("settle_via_contract: {e}"))?
+        } else {
+            vec![]
+        };
         tx.commit().await?;
+        super::webhooks::fire_settlement_webhooks(&ctx.pool, &ctx.webhook_http, settled).await;
     } else if parsed.is_terminal_failure() {
-        let mut tx = pool.begin().await?;
+        let mut tx = ctx.pool.begin().await?;
         settlement::unbind_contract(&mut tx, u.contract_id)
             .await
             .map_err(|e| anyhow::anyhow!("unbind_contract: {e}"))?;

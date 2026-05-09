@@ -8,6 +8,8 @@
         CONTRACTS_SCOPE,
         type ViewerCharacter
     } from '$lib/stores/me';
+    import { activeCharacter } from '$lib/stores/activeCharacter';
+    import { toast } from 'svelte-sonner';
 
     interface Props {
         item: ListItem;
@@ -25,7 +27,8 @@
     let selectedMarketId = $state<string | null>(null);
     let otherNote = $state('');
     let useOther = $state(false);
-    let charId = $state<string>(untrack(() => detail.last_hauler_character_id ?? ''));
+    const activeChar = $derived($activeCharacter);
+    let charId = $state<string>(untrack(() => activeChar?.id ?? detail.last_hauler_character_id ?? ''));
 
     let busy = $state(false);
     let errMsg = $state<string | null>(null);
@@ -74,9 +77,11 @@
                 }
             );
             onUpdate(updated);
+            toast.success('Buy recorded');
             onClose();
         } catch (e) {
             errMsg = (e as Error).message;
+            toast.error(errMsg ?? 'Failed to record buy');
         } finally {
             busy = false;
         }

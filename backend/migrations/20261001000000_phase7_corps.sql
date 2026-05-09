@@ -115,9 +115,12 @@ SELECT 'user', id FROM users;
 
 -- ── Refactor contracts: add principal-id columns ──────────────────────────────
 
+-- Newly-added nullable FK columns: existing rows are NULL, so the FK
+-- has nothing to validate at ADD time. (Inline `NOT VALID` is not legal
+-- on `ADD COLUMN ... REFERENCES` — only on `ADD CONSTRAINT`.)
 ALTER TABLE contracts
-    ADD COLUMN issuer_principal_id   uuid REFERENCES principals(id) ON DELETE RESTRICT NOT VALID,
-    ADD COLUMN assignee_principal_id uuid REFERENCES principals(id) ON DELETE RESTRICT NOT VALID,
+    ADD COLUMN issuer_principal_id   uuid REFERENCES principals(id) ON DELETE RESTRICT,
+    ADD COLUMN assignee_principal_id uuid REFERENCES principals(id) ON DELETE RESTRICT,
     ADD COLUMN wallet_verified_at          timestamptz,
     ADD COLUMN wallet_payout_aggregate_isk numeric(20,2);
 
@@ -133,9 +136,6 @@ SET assignee_principal_id = p.id
 FROM principals p
 WHERE p.kind = 'user' AND p.user_id = c.assignee_user_id
   AND c.assignee_user_id IS NOT NULL;
-
-ALTER TABLE contracts VALIDATE CONSTRAINT contracts_issuer_principal_id_fkey;
-ALTER TABLE contracts VALIDATE CONSTRAINT contracts_assignee_principal_id_fkey;
 
 CREATE INDEX contracts_issuer_principal_idx
     ON contracts(issuer_principal_id) WHERE issuer_principal_id IS NOT NULL;
@@ -154,8 +154,8 @@ ALTER TABLE reimbursements
     ALTER COLUMN requester_user_id DROP NOT NULL;
 
 ALTER TABLE reimbursements
-    ADD COLUMN requester_principal_id uuid REFERENCES principals(id) ON DELETE RESTRICT NOT VALID,
-    ADD COLUMN hauler_principal_id    uuid REFERENCES principals(id) ON DELETE RESTRICT NOT VALID,
+    ADD COLUMN requester_principal_id uuid REFERENCES principals(id) ON DELETE RESTRICT,
+    ADD COLUMN hauler_principal_id    uuid REFERENCES principals(id) ON DELETE RESTRICT,
     ADD COLUMN is_corp_funded         boolean NOT NULL DEFAULT false,
     ADD COLUMN verified_by_wallet     boolean NOT NULL DEFAULT false,
     ADD COLUMN wallet_settlement_delta_isk numeric(20,2);
@@ -177,9 +177,6 @@ WHERE p.kind = 'user' AND p.user_id = r.hauler_user_id
 ALTER TABLE reimbursements
     ALTER COLUMN requester_principal_id SET NOT NULL,
     ALTER COLUMN hauler_principal_id    SET NOT NULL;
-
-ALTER TABLE reimbursements VALIDATE CONSTRAINT reimbursements_requester_principal_id_fkey;
-ALTER TABLE reimbursements VALIDATE CONSTRAINT reimbursements_hauler_principal_id_fkey;
 
 -- New partial unique index: one row per (list, requester-principal, hauler-principal)
 -- where the row isn't cancelled. Cancelled rows don't block re-creation.

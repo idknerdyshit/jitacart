@@ -215,8 +215,7 @@ async fn poll_one_corp_wallet(
 
         // Upsert division balances.
         for w in &wallets {
-            let balance =
-                Decimal::from_f64(w.balance).unwrap_or(Decimal::ZERO);
+            let balance = Decimal::from_f64(w.balance).unwrap_or(Decimal::ZERO);
             sqlx::query(
                 r#"
                 INSERT INTO corp_wallet_divisions (corp_id, division, balance_isk, last_synced_at)
@@ -231,9 +230,7 @@ async fn poll_one_corp_wallet(
             .bind(balance)
             .execute(pool)
             .await
-            .with_context(|| {
-                format!("upsert wallet balance corp={corp_id} div={}", w.division)
-            })?;
+            .with_context(|| format!("upsert wallet balance corp={corp_id} div={}", w.division))?;
         }
 
         // Fetch journal per division.
@@ -265,10 +262,14 @@ async fn poll_one_corp_wallet(
             };
 
             for entry in &journal {
-                let amount =
-                    entry.amount.and_then(Decimal::from_f64).unwrap_or(Decimal::ZERO);
-                let balance =
-                    entry.balance.and_then(Decimal::from_f64).unwrap_or(Decimal::ZERO);
+                let amount = entry
+                    .amount
+                    .and_then(Decimal::from_f64)
+                    .unwrap_or(Decimal::ZERO);
+                let balance = entry
+                    .balance
+                    .and_then(Decimal::from_f64)
+                    .unwrap_or(Decimal::ZERO);
                 let raw = serde_json::to_value(entry).unwrap_or(Value::Null);
 
                 // Insert; RETURNING tells us if it was newly inserted (non-conflict).
@@ -319,13 +320,11 @@ async fn poll_one_corp_wallet(
         let mut contract_uuids: Vec<Uuid> = if contract_esi_ids.is_empty() {
             Vec::new()
         } else {
-            sqlx::query_scalar(
-                "SELECT id FROM contracts WHERE esi_contract_id = ANY($1::bigint[])",
-            )
-            .bind(&contract_esi_ids)
-            .fetch_all(pool)
-            .await
-            .with_context(|| format!("resolve contract ids corp={corp_id}"))?
+            sqlx::query_scalar("SELECT id FROM contracts WHERE esi_contract_id = ANY($1::bigint[])")
+                .bind(&contract_esi_ids)
+                .fetch_all(pool)
+                .await
+                .with_context(|| format!("resolve contract ids corp={corp_id}"))?
         };
 
         // Also include any contracts for this corp that have matching journal
@@ -364,7 +363,10 @@ async fn poll_one_corp_wallet(
         .execute(pool)
         .await
         .with_context(|| {
-            format!("update last_used_at corp={corp_id} char={}", amb.character_id)
+            format!(
+                "update last_used_at corp={corp_id} char={}",
+                amb.character_id
+            )
         })?;
 
         if let Err(e) = token_store.persist_rotations(amb.character_id).await {

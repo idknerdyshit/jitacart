@@ -18,6 +18,7 @@ domain = { workspace = true }
 market = { workspace = true }
 auth-tokens = { workspace = true }
 settlement = { workspace = true }
+webhook-dispatch = { workspace = true }
 rust_decimal = { workspace = true }
 
 tokio = { workspace = true }

@@ -16,8 +16,9 @@ use jitacart_api::extract::CurrentList;
 use jitacart_api::lists::{do_patch_list_status, ListError};
 use jitacart_api::webhooks::{
     build_payload, dispatch_webhook, do_delete_webhook, do_get_webhook, do_upsert_webhook,
-    WebhookConfig, WebhookError, WebhookEvent, WebhookSender,
+    WebhookConfig, WebhookEvent, WebhookSender,
 };
+use webhook_dispatch::Error as WebhookDispatchError;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -123,7 +124,7 @@ async fn webhook_upsert_rejects_non_discord_url(pool: PgPool) {
     let err = do_upsert_webhook(&pool, group, GroupRole::Owner, bad)
         .await
         .unwrap_err();
-    assert!(matches!(err, WebhookError::BadRequest(_)));
+    assert!(matches!(err, WebhookDispatchError::BadRequest(_)));
 
     let stored = do_get_webhook(&pool, group, GroupRole::Owner)
         .await

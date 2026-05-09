@@ -115,9 +115,6 @@ SELECT 'user', id FROM users;
 
 -- ── Refactor contracts: add principal-id columns ──────────────────────────────
 
--- Newly-added nullable FK columns: existing rows are NULL, so the FK
--- has nothing to validate at ADD time. (Inline `NOT VALID` is not legal
--- on `ADD COLUMN ... REFERENCES` — only on `ADD CONSTRAINT`.)
 ALTER TABLE contracts
     ADD COLUMN issuer_principal_id   uuid REFERENCES principals(id) ON DELETE RESTRICT,
     ADD COLUMN assignee_principal_id uuid REFERENCES principals(id) ON DELETE RESTRICT,

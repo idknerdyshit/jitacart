@@ -323,38 +323,32 @@ pub async fn settle_via_contract(
         auto_close_list_if_complete(tx, *lid).await?;
     }
 
-    let mut webhook_info: Vec<ContractSettledReimbursement> =
-        Vec::with_capacity(settled_rows.len());
-    for (_, list_id, requester_user_id, hauler_user_id, total_isk) in &settled_rows {
-        let (group_id, list_dest): (Uuid, Option<String>) =
-            sqlx::query_as("SELECT group_id, destination_label FROM lists WHERE id = $1")
-                .bind(list_id)
-                .fetch_one(&mut **tx)
-                .await?;
-
-        let req_name: String = match requester_user_id {
-            Some(uid) => {
-                sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
-                    .bind(uid)
-                    .fetch_one(&mut **tx)
-                    .await?
-            }
-            None => "Corp".into(),
-        };
-        let hauler_name: String =
-            sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
-                .bind(hauler_user_id)
-                .fetch_one(&mut **tx)
-                .await?;
-
-        webhook_info.push(ContractSettledReimbursement {
+    let reimb_ids: Vec<Uuid> = settled_rows.iter().map(|r| r.0).collect();
+    let webhook_info: Vec<ContractSettledReimbursement> = sqlx::query_as::<
+        _,
+        (Uuid, Option<String>, Option<String>, String, Decimal),
+    >(
+        "SELECT l.group_id, l.destination_label, ureq.display_name, uh.display_name, r.total_isk \
+         FROM reimbursements r \
+         JOIN lists l ON l.id = r.list_id \
+         LEFT JOIN users ureq ON ureq.id = r.requester_user_id \
+         JOIN users uh ON uh.id = r.hauler_user_id \
+         WHERE r.id = ANY($1)",
+    )
+    .bind(&reimb_ids)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .map(
+        |(group_id, dest, req_name, hauler_name, total_isk)| ContractSettledReimbursement {
             group_id,
-            list_destination: list_dest.unwrap_or_else(|| "(unnamed)".into()),
-            requester_name: req_name,
+            list_destination: dest.unwrap_or_else(|| "(unnamed)".into()),
+            requester_name: req_name.unwrap_or_else(|| "Corp".into()),
             hauler_name,
-            total_isk: *total_isk,
-        });
-    }
+            total_isk,
+        },
+    )
+    .collect();
 
     Ok(webhook_info)
 }

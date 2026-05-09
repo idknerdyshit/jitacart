@@ -122,6 +122,20 @@ struct ClaimPath {
     claim_id: Option<Uuid>,
 }
 
+#[allow(clippy::result_large_err)]
+impl CurrentClaim {
+    pub fn require_list_mutable(&self) -> Result<(), Response> {
+        if self.list_status == ListStatus::Archived {
+            return Err((
+                StatusCode::CONFLICT,
+                "list is archived; no changes can be made",
+            )
+                .into_response());
+        }
+        Ok(())
+    }
+}
+
 impl FromRequestParts<AppState> for CurrentClaim {
     type Rejection = Response;
 

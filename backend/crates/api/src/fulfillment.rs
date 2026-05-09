@@ -7,8 +7,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use domain::{
-    ClaimStatus, GroupRole, ListDetail, ListItemStatus, ReimbursementStatus, RunMarketRef,
-    RunSummary,
+    ClaimStatus, GroupRole, ListDetail, ListItemStatus, ListStatus, ReimbursementStatus,
+    RunMarketRef, RunSummary,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -288,23 +288,21 @@ async fn create_claim(
 
 async fn add_claim_items(
     State(state): State<AppState>,
-    CurrentClaim {
+    cur: CurrentClaim,
+    Json(body): Json<AddClaimItemsBody>,
+) -> Result<Json<ListDetail>, FulfillmentError> {
+    cur.require_list_mutable().map_err(|_| {
+        FulfillmentError::Conflict("list is archived; no changes can be made".into())
+    })?;
+    let CurrentClaim {
         claim_id,
         list_id,
         user_id,
         hauler_user_id,
         role,
         status,
-        list_status,
         ..
-    }: CurrentClaim,
-    Json(body): Json<AddClaimItemsBody>,
-) -> Result<Json<ListDetail>, FulfillmentError> {
-    if list_status == domain::ListStatus::Archived {
-        return Err(FulfillmentError::Conflict(
-            "list is archived; no changes can be made".into(),
-        ));
-    }
+    } = cur;
     ensure_claim_writable(user_id, hauler_user_id, role, status)?;
     if body.item_ids.is_empty() {
         return Err(FulfillmentError::BadRequest(
@@ -329,22 +327,20 @@ async fn add_claim_items(
 async fn remove_claim_item(
     State(state): State<AppState>,
     Path((_claim_id, item_id)): Path<(Uuid, Uuid)>,
-    CurrentClaim {
+    cur: CurrentClaim,
+) -> Result<Json<ListDetail>, FulfillmentError> {
+    cur.require_list_mutable().map_err(|_| {
+        FulfillmentError::Conflict("list is archived; no changes can be made".into())
+    })?;
+    let CurrentClaim {
         claim_id,
         list_id,
         user_id,
         hauler_user_id,
         role,
         status,
-        list_status,
         ..
-    }: CurrentClaim,
-) -> Result<Json<ListDetail>, FulfillmentError> {
-    if list_status == domain::ListStatus::Archived {
-        return Err(FulfillmentError::Conflict(
-            "list is archived; no changes can be made".into(),
-        ));
-    }
+    } = cur;
     ensure_claim_writable(user_id, hauler_user_id, role, status)?;
 
     let mut tx = state.pool.begin().await.map_err(internal)?;
@@ -372,22 +368,20 @@ async fn remove_claim_item(
 
 async fn release_claim(
     State(state): State<AppState>,
-    CurrentClaim {
+    cur: CurrentClaim,
+) -> Result<Json<ListDetail>, FulfillmentError> {
+    cur.require_list_mutable().map_err(|_| {
+        FulfillmentError::Conflict("list is archived; no changes can be made".into())
+    })?;
+    let CurrentClaim {
         claim_id,
         list_id,
         user_id,
         hauler_user_id,
         role,
         status,
-        list_status,
         ..
-    }: CurrentClaim,
-) -> Result<Json<ListDetail>, FulfillmentError> {
-    if list_status == domain::ListStatus::Archived {
-        return Err(FulfillmentError::Conflict(
-            "list is archived; no changes can be made".into(),
-        ));
-    }
+    } = cur;
     ensure_claim_writable(user_id, hauler_user_id, role, status)?;
 
     let mut tx = state.pool.begin().await.map_err(internal)?;
@@ -668,7 +662,10 @@ async fn reverse_fulfillment(
     let (hauler_user_id, list_id, requested_by_user_id, reversed_at, list_status_str) =
         row.ok_or(FulfillmentError::NotFound)?;
 
-    if list_status_str == "archived" {
+    let list_status: ListStatus = list_status_str
+        .parse()
+        .map_err(|e: String| internal(anyhow::anyhow!(e)))?;
+    if list_status == ListStatus::Archived {
         return Err(FulfillmentError::Conflict(
             "list is archived; no changes can be made".into(),
         ));

@@ -43,7 +43,7 @@ async fn seed_two_tenants(pool: &PgPool) -> TwoTenants {
         hauler_a,
         requester_a,
         Decimal::new(10_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -80,7 +80,7 @@ async fn patch_list_status_cross_tenant_is_forbidden(pool: PgPool) {
     );
 
     // List must remain unchanged.
-    let status: String = sqlx::query_scalar("SELECT status FROM lists WHERE id = $1")
+    let status: String = sqlx::query_scalar("SELECT status::text FROM lists WHERE id = $1")
         .bind(t.a.list_id)
         .fetch_one(&pool)
         .await
@@ -91,14 +91,9 @@ async fn patch_list_status_cross_tenant_is_forbidden(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn patch_list_status_for_unknown_list_is_not_found(pool: PgPool) {
     let _t = seed_two_tenants(&pool).await;
-    let err = do_patch_list_status(
-        &pool,
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        ListStatus::Archived,
-    )
-    .await
-    .unwrap_err();
+    let err = do_patch_list_status(&pool, Uuid::new_v4(), Uuid::new_v4(), ListStatus::Archived)
+        .await
+        .unwrap_err();
     assert!(matches!(err, ApiError::NotFound(_)));
 }
 
@@ -113,14 +108,16 @@ async fn confirm_suggestion_cross_tenant_is_forbidden(pool: PgPool) {
     )
     .await;
 
-    let err = do_confirm(&pool, t.stranger_in_b, sugg_id).await.unwrap_err();
+    let err = do_confirm(&pool, t.stranger_in_b, sugg_id)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, ApiError::Forbidden(_)),
         "stranger from group B must not confirm group A's suggestion, got {err:?}"
     );
 
     let state: String =
-        sqlx::query_scalar("SELECT state FROM contract_match_suggestions WHERE id = $1")
+        sqlx::query_scalar("SELECT state::text FROM contract_match_suggestions WHERE id = $1")
             .bind(sugg_id)
             .fetch_one(&pool)
             .await
@@ -182,8 +179,47 @@ async fn reject_suggestion_cross_tenant_is_forbidden(pool: PgPool) {
     )
     .await;
 
-    let err = do_reject(&pool, t.stranger_in_b, sugg_id).await.unwrap_err();
+    let err = do_reject(&pool, t.stranger_in_b, sugg_id)
+        .await
+        .unwrap_err();
     assert!(matches!(err, ApiError::Forbidden(_)), "got {err:?}");
+}
+
+/// Corp-issued contracts have issuer_user_id = NULL. The hauler (assignee) must
+/// still be able to reject the suggestion; previously the `Some(user_id)` check
+/// rejected everyone. Cross-tenant strangers must still be 403.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reject_corp_issued_suggestion_by_hauler(pool: PgPool) {
+    let t = seed_two_tenants(&pool).await;
+    // Make the contract corp-issued: clear issuer_user_id.
+    sqlx::query("UPDATE contracts SET issuer_user_id = NULL WHERE id = $1")
+        .bind(t.contract_a.contract_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let sugg_id = insert_suggestion(
+        &pool,
+        t.contract_a.contract_id,
+        t.a.reimbursement_id,
+        "pending",
+    )
+    .await;
+
+    // Stranger (only in group B) is still 403.
+    let err = do_reject(&pool, t.stranger_in_b, sugg_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Forbidden(_)), "got {err:?}");
+
+    // Hauler in group A can reject the corp-issued suggestion.
+    let hauler: Uuid =
+        sqlx::query_scalar("SELECT hauler_user_id FROM reimbursements WHERE id = $1")
+            .bind(t.a.reimbursement_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let dec = do_reject(&pool, hauler, sugg_id).await.unwrap();
+    assert_eq!(dec.state, "rejected");
 }
 
 // ────────────────── Extractor SQL probes (regression guards) ─────────────
@@ -200,7 +236,7 @@ async fn current_group_query_rejects_non_member(pool: PgPool) {
 
     // Mirrors `CurrentGroup::from_request_parts` in extract.rs.
     let role: Option<String> = sqlx::query_scalar(
-        "SELECT role FROM group_memberships WHERE user_id = $1 AND group_id = $2",
+        "SELECT role::text FROM group_memberships WHERE user_id = $1 AND group_id = $2",
     )
     .bind(t.stranger_in_b)
     .bind(t.a.group_id)
@@ -217,7 +253,7 @@ async fn current_list_query_returns_null_role_for_non_member(pool: PgPool) {
     // Mirrors `CurrentList::from_request_parts`. Existence-of-list returns a
     // row, but the LEFT-joined role is NULL — handler converts to 403.
     let row: Option<(Uuid, Uuid, String, Option<String>)> = sqlx::query_as(
-        "SELECT l.group_id, l.created_by_user_id, l.status, gm.role \
+        "SELECT l.group_id, l.created_by_user_id, l.status::text, gm.role::text \
          FROM lists l \
          LEFT JOIN group_memberships gm \
            ON gm.group_id = l.group_id AND gm.user_id = $1 \
@@ -240,7 +276,7 @@ async fn current_list_query_returns_null_role_for_non_member(pool: PgPool) {
 async fn current_list_query_returns_none_for_unknown_list(pool: PgPool) {
     let _t = seed_two_tenants(&pool).await;
     let row: Option<(Uuid, Uuid, String, Option<String>)> = sqlx::query_as(
-        "SELECT l.group_id, l.created_by_user_id, l.status, gm.role \
+        "SELECT l.group_id, l.created_by_user_id, l.status::text, gm.role::text \
          FROM lists l \
          LEFT JOIN group_memberships gm \
            ON gm.group_id = l.group_id AND gm.user_id = $1 \
@@ -270,7 +306,8 @@ async fn current_claim_query_returns_null_role_for_non_member(pool: PgPool) {
 
     // Mirrors `CurrentClaim::from_request_parts`.
     let row: Option<(Uuid, Uuid, Uuid, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT c.list_id, l.group_id, c.hauler_user_id, c.status, gm.role, l.status \
+        "SELECT c.list_id, l.group_id, c.hauler_user_id, c.status::text, \
+                gm.role::text, l.status::text \
          FROM claims c \
          JOIN lists l ON l.id = c.list_id \
          LEFT JOIN group_memberships gm \
@@ -296,23 +333,23 @@ async fn current_claim_query_returns_null_role_for_non_member(pool: PgPool) {
 async fn lists_for_group_excludes_other_tenants(pool: PgPool) {
     let t = seed_two_tenants(&pool).await;
     // Group B has its own list — find any list NOT in group A:
-    let other_list_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM lists WHERE group_id != $1",
-    )
-    .bind(t.a.group_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(other_list_count >= 1, "fixture should have created a list in group B");
+    let other_list_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM lists WHERE group_id != $1")
+            .bind(t.a.group_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        other_list_count >= 1,
+        "fixture should have created a list in group B"
+    );
 
     // The list-for-group query (lists.rs:list_for_group) must filter by group_id.
-    let listed: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM lists WHERE group_id = $1",
-    )
-    .bind(t.a.group_id)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let listed: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM lists WHERE group_id = $1")
+        .bind(t.a.group_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
     assert_eq!(listed.len(), 1, "only group A's list should be visible");
     assert_eq!(listed[0], t.a.list_id);
 }

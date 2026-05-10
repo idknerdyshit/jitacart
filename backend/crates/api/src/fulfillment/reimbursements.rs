@@ -18,31 +18,36 @@ pub(super) async fn settle_reimbursement(
     Path(reimb_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
 ) -> Result<Json<ListDetail>, ApiError> {
-    // Load reimbursement (also for permission checks).
-    // requester_user_id is nullable for corp-funded rows.
+    // Need list_id from the reimbursement before we can lock_list. Read the
+    // minimum, then re-read every authz-relevant field inside the tx so a
+    // concurrent writer can't slip past TOCTOU.
     #[derive(sqlx::FromRow)]
     struct ReimbRow {
-        list_id: Uuid,
         requester_user_id: Option<Uuid>,
-        status: String,
+        status: ReimbursementStatus,
         contract_id: Option<Uuid>,
     }
+    let pre: Option<(Uuid,)> = sqlx::query_as("SELECT list_id FROM reimbursements WHERE id = $1")
+        .bind(reimb_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    let list_id = pre.ok_or_else(ApiError::not_found)?.0;
+
+    let mut tx = state.pool.begin().await?;
+    super::lock_list(&mut tx, list_id).await?;
+
     let row: Option<ReimbRow> = sqlx::query_as(
-        "SELECT list_id, requester_user_id, status, contract_id \
-         FROM reimbursements WHERE id = $1",
+        "SELECT requester_user_id, status, contract_id \
+         FROM reimbursements WHERE id = $1 FOR UPDATE",
     )
     .bind(reimb_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     let r = row.ok_or_else(ApiError::not_found)?;
-    let (list_id, requester_user_id, contract_id) = (r.list_id, r.requester_user_id, r.contract_id);
-    let reimb_status: ReimbursementStatus = r
-        .status
-        .parse()
-        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
+    let (requester_user_id, contract_id) = (r.requester_user_id, r.contract_id);
 
-    if reimb_status != ReimbursementStatus::Pending {
+    if r.status != ReimbursementStatus::Pending {
         return Err(ApiError::Conflict(format!(
             "reimbursement is already {}",
             r.status
@@ -57,10 +62,10 @@ pub(super) async fn settle_reimbursement(
         ));
     }
 
-    // Check group membership and permissions. Only the requester (whose debt
-    // is being settled) or a group owner may settle — list creators have no
-    // standing to mark another member's reimbursement as paid.
-    let role_str: Option<String> = sqlx::query_scalar(
+    // Check group membership and permissions inside the tx. Only the requester
+    // (whose debt is being settled) or a group owner may settle — list creators
+    // have no standing to mark another member's reimbursement as paid.
+    let role: GroupRole = sqlx::query_scalar(
         "SELECT gm.role \
          FROM lists l \
          JOIN group_memberships gm ON gm.group_id = l.group_id AND gm.user_id = $1 \
@@ -68,13 +73,9 @@ pub(super) async fn settle_reimbursement(
     )
     .bind(user_id)
     .bind(list_id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    let role: GroupRole = role_str
-        .ok_or_else(ApiError::forbidden)?
-        .parse()
-        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(ApiError::forbidden)?;
 
     // Corp-funded reimbursements have no user requester; only owners can settle.
     let is_requester = requester_user_id == Some(user_id);
@@ -83,9 +84,6 @@ pub(super) async fn settle_reimbursement(
     if !is_requester && !is_owner {
         return Err(ApiError::forbidden());
     }
-
-    let mut tx = state.pool.begin().await?;
-    super::lock_list(&mut tx, list_id).await?;
 
     settlement::settle_manual(&mut tx, reimb_id, user_id)
         .await

@@ -419,11 +419,12 @@ async fn list_journal(
     let is_owner: bool = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM group_memberships
-            WHERE group_id = $1 AND user_id = $2 AND role = 'owner'
+            WHERE group_id = $1 AND user_id = $2 AND role = $3
         )",
     )
     .bind(group_id)
     .bind(user_id)
+    .bind(GroupRole::Owner)
     .fetch_one(&state.pool)
     .await?;
 
@@ -464,7 +465,7 @@ async fn list_journal(
     )
     .bind(corp_id)
     .bind(q.before)
-    .bind(q.limit.min(500))
+    .bind(q.limit.clamp(1, 500))
     .bind(q.division)
     .fetch_all(&state.pool)
     .await?;
@@ -522,27 +523,18 @@ async fn patch_list_payer(
         "SELECT l.group_id FROM lists l \
          JOIN group_memberships gm ON gm.group_id = l.group_id AND gm.user_id = $2 \
          WHERE l.id = $1 \
-           AND gm.role = 'owner'",
+           AND gm.role = $3",
     )
     .bind(list_id)
     .bind(user_id)
+    .bind(GroupRole::Owner)
     .fetch_optional(&state.pool)
     .await?;
 
     let group_id = row.ok_or_else(ApiError::forbidden)?.0;
 
-    // Determine the caller's actual role for the response payload.
-    let role_str: Option<String> = sqlx::query_scalar(
-        "SELECT role FROM group_memberships WHERE group_id = $1 AND user_id = $2",
-    )
-    .bind(group_id)
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await?;
-    let actual_role: GroupRole = role_str
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(GroupRole::Member);
+    // First query gated on role = Owner; the caller's role here is necessarily Owner.
+    let actual_role = GroupRole::Owner;
 
     // Mid-flight rule: reject if reimbursements already exist.
     let has_reimbs: bool =
@@ -601,6 +593,8 @@ async fn list_corps_inner(
     caller_user_id: Uuid,
     caller_role: GroupRole,
 ) -> anyhow::Result<Vec<CorpDto>> {
+    use std::collections::{HashMap, HashSet};
+
     #[derive(sqlx::FromRow)]
     struct CorpRow {
         id: Uuid,
@@ -629,62 +623,86 @@ async fn list_corps_inner(
     .fetch_all(pool)
     .await?;
 
-    let mut result = Vec::new();
+    if corps.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let corp_ids: Vec<Uuid> = corps.iter().map(|c| c.id).collect();
+
+    #[derive(sqlx::FromRow)]
+    struct AmbRow {
+        corp_id: Uuid,
+        character_id: Uuid,
+        character_name: String,
+        granted_scopes: Vec<String>,
+        last_used_at: Option<DateTime<Utc>>,
+        last_auth_error_at: Option<DateTime<Utc>>,
+        disabled_at: Option<DateTime<Utc>>,
+        character_user_id: Uuid,
+    }
+
+    let amb_rows: Vec<AmbRow> = sqlx::query_as(
+        r#"
+        SELECT ca.corp_id, ca.character_id, ch.character_name,
+               ca.granted_scopes, ca.last_used_at,
+               ca.last_auth_error_at, ca.disabled_at,
+               ch.user_id AS character_user_id
+        FROM corp_ambassadors ca
+        JOIN characters ch ON ch.id = ca.character_id
+        WHERE ca.corp_id = ANY($1::uuid[])
+        ORDER BY ca.disabled_at NULLS FIRST, ca.last_used_at NULLS FIRST
+        "#,
+    )
+    .bind(&corp_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut ambassadors_by_corp: HashMap<Uuid, Vec<AmbassadorDto>> = HashMap::new();
+    let mut ambassador_corps_for_caller: HashSet<Uuid> = HashSet::new();
+    for r in amb_rows {
+        if r.character_user_id == caller_user_id && r.disabled_at.is_none() {
+            ambassador_corps_for_caller.insert(r.corp_id);
+        }
+        ambassadors_by_corp
+            .entry(r.corp_id)
+            .or_default()
+            .push(AmbassadorDto {
+                character_id: r.character_id,
+                character_name: r.character_name,
+                granted_scopes: r.granted_scopes,
+                last_used_at: r.last_used_at,
+                last_auth_error_at: r.last_auth_error_at,
+                disabled_at: r.disabled_at,
+            });
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct DivRow {
+        corp_id: Uuid,
+        division: i16,
+        name: Option<String>,
+        balance_isk: Decimal,
+        last_synced_at: Option<DateTime<Utc>>,
+    }
+    let div_rows: Vec<DivRow> = sqlx::query_as(
+        "SELECT corp_id, division, name, balance_isk, last_synced_at \
+         FROM corp_wallet_divisions WHERE corp_id = ANY($1::uuid[]) \
+         ORDER BY corp_id, division",
+    )
+    .bind(&corp_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut divisions_by_corp: HashMap<Uuid, Vec<DivRow>> = HashMap::new();
+    for d in div_rows {
+        divisions_by_corp.entry(d.corp_id).or_default().push(d);
+    }
+
+    let mut result = Vec::with_capacity(corps.len());
     for corp in corps {
-        #[derive(sqlx::FromRow)]
-        struct AmbRow {
-            character_id: Uuid,
-            character_name: String,
-            granted_scopes: Vec<String>,
-            last_used_at: Option<DateTime<Utc>>,
-            last_auth_error_at: Option<DateTime<Utc>>,
-            disabled_at: Option<DateTime<Utc>>,
-        }
-
-        let ambassadors: Vec<AmbRow> = sqlx::query_as(
-            r#"
-            SELECT ca.character_id, ch.character_name,
-                   ca.granted_scopes, ca.last_used_at,
-                   ca.last_auth_error_at, ca.disabled_at
-            FROM corp_ambassadors ca
-            JOIN characters ch ON ch.id = ca.character_id
-            WHERE ca.corp_id = $1
-            ORDER BY ca.disabled_at NULLS FIRST, ca.last_used_at NULLS FIRST
-            "#,
-        )
-        .bind(corp.id)
-        .fetch_all(pool)
-        .await?;
-
-        #[derive(sqlx::FromRow)]
-        struct DivRow {
-            division: i16,
-            name: Option<String>,
-            balance_isk: Decimal,
-            last_synced_at: Option<DateTime<Utc>>,
-        }
-        let divisions: Vec<DivRow> = sqlx::query_as(
-            "SELECT division, name, balance_isk, last_synced_at \
-             FROM corp_wallet_divisions WHERE corp_id = $1 ORDER BY division",
-        )
-        .bind(corp.id)
-        .fetch_all(pool)
-        .await?;
-
-        let is_ambassador: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS(
-                SELECT 1 FROM corp_ambassadors ca
-                JOIN characters ch ON ch.id = ca.character_id
-                WHERE ca.corp_id = $1 AND ch.user_id = $2 AND ca.disabled_at IS NULL
-            )
-            "#,
-        )
-        .bind(corp.id)
-        .bind(caller_user_id)
-        .fetch_one(pool)
-        .await?;
-
+        let is_ambassador = ambassador_corps_for_caller.contains(&corp.id);
+        let ambassadors = ambassadors_by_corp.remove(&corp.id).unwrap_or_default();
+        let divisions = divisions_by_corp.remove(&corp.id).unwrap_or_default();
         result.push(CorpDto {
             id: corp.id,
             esi_corporation_id: corp.esi_corporation_id,
@@ -696,17 +714,7 @@ async fn list_corps_inner(
             linked_at: corp.linked_at,
             linked_by_user_id: corp.linked_by_user_id,
             is_ambassador,
-            ambassadors: ambassadors
-                .into_iter()
-                .map(|a| AmbassadorDto {
-                    character_id: a.character_id,
-                    character_name: a.character_name,
-                    granted_scopes: a.granted_scopes,
-                    last_used_at: a.last_used_at,
-                    last_auth_error_at: a.last_auth_error_at,
-                    disabled_at: a.disabled_at,
-                })
-                .collect(),
+            ambassadors,
             wallet_divisions: divisions
                 .into_iter()
                 .map(|d| WalletDivisionDto {

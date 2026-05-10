@@ -45,8 +45,7 @@ pub(super) async fn set_list_tip(
     cur: CurrentList,
     Json(body): Json<SetTipBody>,
 ) -> Result<Json<domain::ListDetail>, ApiError> {
-    cur.require_mutable()
-        .map_err(|_| ApiError::Conflict("list is archived; no changes can be made".into()))?;
+    cur.require_mutable()?;
     let CurrentList {
         list_id,
         user_id,
@@ -61,7 +60,11 @@ pub(super) async fn set_list_tip(
         return Err(ApiError::forbidden());
     }
 
-    // Creator is locked out once any fulfillment exists; owner can always edit
+    let mut tx = state.pool.begin().await?;
+    super::lock_list(&mut tx, list_id).await?;
+
+    // Creator is locked out once any fulfillment exists; owner can always edit.
+    // Read inside the tx so a concurrent fulfillment cannot slip past the check.
     if is_creator && role != GroupRole::Owner {
         let has_fulfillments: bool = sqlx::query_scalar(
             "SELECT EXISTS( \
@@ -71,15 +74,12 @@ pub(super) async fn set_list_tip(
             )",
         )
         .bind(list_id)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await?;
         if has_fulfillments {
             return Err(ApiError::forbidden());
         }
     }
-
-    let mut tx = state.pool.begin().await?;
-    super::lock_list(&mut tx, list_id).await?;
 
     sqlx::query("UPDATE lists SET tip_pct = $1 WHERE id = $2")
         .bind(body.tip_pct)

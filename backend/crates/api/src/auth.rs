@@ -143,7 +143,7 @@ async fn upgrade(
         .filter(|s| !s.is_empty())
         .collect();
     if requested.is_empty() {
-        return Err(ApiError::Internal(anyhow!("no scopes requested")));
+        return Err(ApiError::BadRequest("no scopes requested".into()));
     }
     let allowed: std::collections::HashSet<&str> = cfg
         .login_scopes

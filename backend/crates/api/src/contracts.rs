@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use domain::ContractStatus;
+use domain::{ContractMatchState, ContractStatus, ContractType, ReimbursementStatus};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -48,7 +48,7 @@ struct SuggestionDto {
     id: Uuid,
     contract_id: Uuid,
     esi_contract_id: i64,
-    contract_status: String,
+    contract_status: ContractStatus,
     contract_price_isk: Decimal,
     contract_expected_total_isk: Option<Decimal>,
     reimbursement_id: Uuid,
@@ -59,7 +59,7 @@ struct SuggestionDto {
     reimbursement_total_isk: Decimal,
     score: Decimal,
     exact_match: bool,
-    state: String,
+    state: ContractMatchState,
     created_at: DateTime<Utc>,
     decided_at: Option<DateTime<Utc>>,
 }
@@ -117,7 +117,7 @@ async fn list_suggestions(
 struct BoundContractDto {
     contract_id: Uuid,
     esi_contract_id: i64,
-    status: String,
+    status: ContractStatus,
     price_isk: Decimal,
     expected_total_isk: Option<Decimal>,
     settlement_delta_isk: Option<Decimal>,
@@ -224,10 +224,12 @@ pub async fn do_confirm(
     .await?;
     let row = row.ok_or_else(ApiError::not_found)?;
 
-    if row.suggestion_state.as_deref() != Some("pending") {
+    if row.suggestion_state != Some(ContractMatchState::Pending) {
         return Err(ApiError::Conflict(format!(
             "suggestion is already {}",
-            row.suggestion_state.as_deref().unwrap_or("(unknown)")
+            row.suggestion_state
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "(unknown)".into())
         )));
     }
     let ctx = row;
@@ -265,10 +267,10 @@ pub async fn do_confirm(
 #[derive(sqlx::FromRow)]
 #[allow(dead_code)]
 struct LinkLockRow {
-    suggestion_state: Option<String>,
+    suggestion_state: Option<ContractMatchState>,
     contract_id: Uuid,
-    contract_type: String,
-    contract_status: String,
+    contract_type: ContractType,
+    contract_status: ContractStatus,
     issuer_user_id: Option<Uuid>,
     /// Corp-issued contracts store the corp principal here; user contracts
     /// store a user principal.
@@ -277,7 +279,7 @@ struct LinkLockRow {
     /// Principal-level assignee (may be a corp principal for corp-funded rows).
     assignee_principal_id: Option<Uuid>,
     reimbursement_id: Uuid,
-    reimbursement_status: String,
+    reimbursement_status: ReimbursementStatus,
     reimbursement_contract_id: Option<Uuid>,
     hauler_user_id: Uuid,
     /// NULL for corp-funded reimbursements (requester is a corp principal).
@@ -291,10 +293,12 @@ async fn validate_link(
     ctx: &LinkLockRow,
     user_id: Uuid,
 ) -> Result<(), ApiError> {
-    if ctx.contract_type != "item_exchange" {
+    if ctx.contract_type != ContractType::ItemExchange {
         return Err(ApiError::Conflict("contract is not item_exchange".into()));
     }
-    if ctx.reimbursement_status != "pending" || ctx.reimbursement_contract_id.is_some() {
+    if ctx.reimbursement_status != ReimbursementStatus::Pending
+        || ctx.reimbursement_contract_id.is_some()
+    {
         return Err(ApiError::Conflict(
             "reimbursement is no longer eligible".into(),
         ));
@@ -351,11 +355,7 @@ async fn finalize_link(
             ApiError::internal(anyhow::anyhow!("recompute_contract_expected_total: {e}"))
         })?;
 
-    let already_finished = ctx
-        .contract_status
-        .parse::<ContractStatus>()
-        .map(|s| s.is_terminal_success())
-        .unwrap_or(false);
+    let already_finished = ctx.contract_status.is_terminal_success();
     let webhook_info = if already_finished {
         settlement::settle_via_contract(tx, ctx.contract_id)
             .await
@@ -398,23 +398,45 @@ pub async fn do_reject(
     suggestion_id: Uuid,
 ) -> Result<SuggestionDecision, ApiError> {
     let mut tx = pool.begin().await?;
-    let row: Option<(String, Option<Uuid>)> = sqlx::query_as(
-        "SELECT s.state, c.issuer_user_id \
+    let row: Option<(ContractMatchState, Option<Uuid>, Uuid, Uuid)> = sqlx::query_as(
+        "SELECT s.state, c.issuer_user_id, r.hauler_user_id, l.group_id \
          FROM contract_match_suggestions s \
          JOIN contracts c ON c.id = s.contract_id \
+         JOIN reimbursements r ON r.id = s.reimbursement_id \
+         JOIN lists l ON l.id = r.list_id \
          WHERE s.id = $1 FOR UPDATE OF s",
     )
     .bind(suggestion_id)
     .fetch_optional(&mut *tx)
     .await?;
 
-    let (cur_state, issuer_user_id) = row.ok_or_else(ApiError::not_found)?;
-    if cur_state != "pending" {
+    let (cur_state, issuer_user_id, hauler_user_id, group_id) =
+        row.ok_or_else(ApiError::not_found)?;
+    if cur_state != ContractMatchState::Pending {
         return Err(ApiError::Conflict(format!(
             "suggestion is already {cur_state}"
         )));
     }
-    if issuer_user_id != Some(user_id) {
+    // Personal-issued: only the issuer may reject. Corp-issued (issuer_user_id
+    // is NULL): the hauler may reject — hauler is the principal acting on the
+    // contract on behalf of the corp.
+    let allowed = match issuer_user_id {
+        Some(iuid) => iuid == user_id,
+        None => hauler_user_id == user_id,
+    };
+    if !allowed {
+        return Err(ApiError::forbidden());
+    }
+    // Caller must still be a member of the group that owns the list.
+    let is_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM group_memberships \
+         WHERE group_id = $1 AND user_id = $2)",
+    )
+    .bind(group_id)
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !is_member {
         return Err(ApiError::forbidden());
     }
     sqlx::query(
@@ -553,7 +575,7 @@ pub async fn do_unlink(
 ) -> Result<SuggestionDecision, ApiError> {
     let mut tx = pool.begin().await?;
 
-    let row: Option<(Option<Uuid>, String)> =
+    let row: Option<(Option<Uuid>, ContractStatus)> =
         sqlx::query_as("SELECT issuer_user_id, status FROM contracts WHERE id = $1 FOR UPDATE")
             .bind(contract_id)
             .fetch_optional(&mut *tx)
@@ -563,10 +585,7 @@ pub async fn do_unlink(
     if issuer_user_id != Some(user_id) {
         return Err(ApiError::forbidden());
     }
-    let is_finished = status
-        .parse::<ContractStatus>()
-        .map(|s| s.is_terminal_success())
-        .unwrap_or(false);
+    let is_finished = status.is_terminal_success();
     if is_finished {
         return Err(ApiError::Conflict(
             "cannot unlink a finished contract; that would unwind a settlement".into(),

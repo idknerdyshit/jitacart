@@ -3,7 +3,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use domain::{GroupRole, ListDetail, ListItemStatus, ListStatus, ReimbursementStatus};
+use domain::{ClaimStatus, GroupRole, ListDetail, ListItemStatus, ListStatus, ReimbursementStatus};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -32,8 +32,7 @@ pub(super) async fn record_fulfillment(
     cur: CurrentList,
     Json(body): Json<RecordFulfillmentBody>,
 ) -> Result<Json<ListDetail>, ApiError> {
-    cur.require_mutable()
-        .map_err(|_| ApiError::Conflict("list is archived; no changes can be made".into()))?;
+    cur.require_mutable()?;
     let CurrentList {
         list_id,
         user_id,
@@ -43,10 +42,14 @@ pub(super) async fn record_fulfillment(
     if body.qty <= 0 {
         return Err(ApiError::BadRequest("qty must be positive".into()));
     }
+    if body.qty > 10_000_000 {
+        return Err(ApiError::BadRequest(
+            "qty must be at most 10,000,000".into(),
+        ));
+    }
     if body.unit_price_isk < Decimal::ZERO {
         return Err(ApiError::BadRequest("unit_price_isk must be >= 0".into()));
     }
-    // Validate market or note
     if body.bought_at_market_id.is_none() {
         match &body.bought_at_note {
             None => {
@@ -66,7 +69,6 @@ pub(super) async fn record_fulfillment(
     let mut tx = state.pool.begin().await?;
     super::lock_list(&mut tx, list_id).await?;
 
-    // Load the item
     let item_row: Option<(i64, i64, Uuid)> = sqlx::query_as(
         "SELECT qty_requested, qty_fulfilled, requested_by_user_id \
          FROM list_items WHERE id = $1 AND list_id = $2 FOR UPDATE",
@@ -91,7 +93,7 @@ pub(super) async fn record_fulfillment(
     // to attach the new fulfillment, and reversal of past fulfillments is also
     // blocked once the row is settled. Resolve principals from the list's payer
     // so the lookup key matches what `upsert_reimbursement` will write.
-    let existing_reimb_status: Option<String> = sqlx::query_scalar(
+    let existing_reimb_status: Option<ReimbursementStatus> = sqlx::query_scalar(
         r#"
         SELECT r.status FROM reimbursements r
         WHERE r.list_id = $1
@@ -115,13 +117,10 @@ pub(super) async fn record_fulfillment(
     .fetch_optional(&mut *tx)
     .await?;
 
-    if let Some(s) = existing_reimb_status {
-        let rs: ReimbursementStatus = s
-            .parse()
-            .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
+    if let Some(rs) = existing_reimb_status {
         if rs != ReimbursementStatus::Pending {
             return Err(ApiError::Conflict(format!(
-                "reimbursement for this requester is already {s}; \
+                "reimbursement for this requester is already {rs}; \
                  cannot record additional fulfillments"
             )));
         }
@@ -157,7 +156,6 @@ pub(super) async fn record_fulfillment(
         // Note: a market that exists but isn't in list_markets is a soft warning, not an error.
     }
 
-    // Permission gate: check active claim for this item
     let active_claim: Option<(Uuid, Uuid)> = sqlx::query_as(
         "SELECT c.id, c.hauler_user_id \
          FROM claim_items ci \
@@ -172,7 +170,6 @@ pub(super) async fn record_fulfillment(
         if user_id != active_hauler_user_id && role != GroupRole::Owner {
             return Err(ApiError::forbidden());
         }
-        // Validate explicit claim_id if provided
         if let Some(explicit_claim_id) = body.claim_id {
             if explicit_claim_id != active_claim_id {
                 return Err(ApiError::BadRequest(
@@ -207,7 +204,6 @@ pub(super) async fn record_fulfillment(
     let new_status =
         super::recompute_item_status(&mut tx, item_id, super::DeliveredDemotion::Forbid).await?;
 
-    // If item flipped to bought and there's an active claim, check if all claim items are done
     if new_status == ListItemStatus::Bought || new_status == ListItemStatus::Settled {
         if let Some((claim_id, _)) = active_claim {
             let all_done: bool = sqlx::query_scalar(
@@ -225,12 +221,12 @@ pub(super) async fn record_fulfillment(
             .await?;
 
             if all_done {
-                sqlx::query(
-                    "UPDATE claims SET status = 'completed' WHERE id = $1 AND status = 'active'",
-                )
-                .bind(claim_id)
-                .execute(&mut *tx)
-                .await?;
+                sqlx::query("UPDATE claims SET status = $1 WHERE id = $2 AND status = $3")
+                    .bind(ClaimStatus::Completed)
+                    .bind(claim_id)
+                    .bind(ClaimStatus::Active)
+                    .execute(&mut *tx)
+                    .await?;
             }
         }
     }
@@ -249,7 +245,7 @@ pub(super) async fn reverse_fulfillment(
     CurrentUser(user_id): CurrentUser,
 ) -> Result<Json<ListDetail>, ApiError> {
     // Load fulfillment + its list context to get the group membership
-    type ReverseRow = (Uuid, Uuid, Uuid, Option<DateTime<Utc>>, String);
+    type ReverseRow = (Uuid, Uuid, Uuid, Option<DateTime<Utc>>, ListStatus);
     let row: Option<ReverseRow> = sqlx::query_as(
         "SELECT f.hauler_user_id, li.list_id, li.requested_by_user_id, f.reversed_at, l.status \
          FROM fulfillments f \
@@ -261,12 +257,9 @@ pub(super) async fn reverse_fulfillment(
     .fetch_optional(&state.pool)
     .await?;
 
-    let (hauler_user_id, list_id, requested_by_user_id, reversed_at, list_status_str) =
+    let (hauler_user_id, list_id, requested_by_user_id, reversed_at, list_status) =
         row.ok_or_else(ApiError::not_found)?;
 
-    let list_status: ListStatus = list_status_str
-        .parse()
-        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
     if list_status == ListStatus::Archived {
         return Err(ApiError::Conflict(
             "list is archived; no changes can be made".into(),
@@ -279,32 +272,29 @@ pub(super) async fn reverse_fulfillment(
         ));
     }
 
-    // Check group membership to determine role
-    let role_str: Option<String> = sqlx::query_scalar(
+    let mut tx = state.pool.begin().await?;
+    super::lock_list(&mut tx, list_id).await?;
+
+    // Read group membership inside the tx so authz reflects the same state
+    // we'll mutate. A non-member returns 403; non-hauler-non-owner also 403.
+    let role: GroupRole = sqlx::query_scalar(
         "SELECT gm.role FROM lists l \
          JOIN group_memberships gm ON gm.group_id = l.group_id AND gm.user_id = $1 \
          WHERE l.id = $2",
     )
     .bind(user_id)
     .bind(list_id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    let role: GroupRole = role_str
-        .ok_or_else(ApiError::forbidden)?
-        .parse()
-        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(ApiError::forbidden)?;
 
     if user_id != hauler_user_id && role != GroupRole::Owner {
         return Err(ApiError::forbidden());
     }
 
-    let mut tx = state.pool.begin().await?;
-    super::lock_list(&mut tx, list_id).await?;
-
     // Check reimbursement is not settled; resolve principals from the list's
     // payer so the lookup key matches what `upsert_reimbursement` wrote.
-    let reimb_status: Option<String> = sqlx::query_scalar(
+    let reimb_status: Option<ReimbursementStatus> = sqlx::query_scalar(
         r#"
         SELECT r.status FROM reimbursements r
         WHERE r.list_id = $1
@@ -328,15 +318,10 @@ pub(super) async fn reverse_fulfillment(
     .fetch_optional(&mut *tx)
     .await?;
 
-    if let Some(s) = reimb_status {
-        let rs: ReimbursementStatus = s
-            .parse()
-            .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
-        if rs != ReimbursementStatus::Pending {
-            return Err(ApiError::Conflict(
-                "cannot reverse a fulfillment whose reimbursement is already settled".into(),
-            ));
-        }
+    if matches!(reimb_status, Some(rs) if rs != ReimbursementStatus::Pending) {
+        return Err(ApiError::Conflict(
+            "cannot reverse a fulfillment whose reimbursement is already settled".into(),
+        ));
     }
 
     let item_id: Uuid = sqlx::query_scalar(
@@ -365,8 +350,7 @@ pub(super) async fn mark_delivered(
     Path((_list_id, item_id)): Path<(Uuid, Uuid)>,
     cur: CurrentList,
 ) -> Result<Json<ListDetail>, ApiError> {
-    cur.require_mutable()
-        .map_err(|_| ApiError::Conflict("list is archived; no changes can be made".into()))?;
+    cur.require_mutable()?;
     let CurrentList {
         list_id,
         user_id,
@@ -377,7 +361,7 @@ pub(super) async fn mark_delivered(
     super::lock_list(&mut tx, list_id).await?;
 
     // Check current status and last hauler
-    let row: Option<(String, Option<Uuid>)> = sqlx::query_as(
+    let row: Option<(ListItemStatus, Option<Uuid>)> = sqlx::query_as(
         "SELECT li.status, \
                 (SELECT f.hauler_user_id FROM fulfillments f \
                  WHERE f.list_item_id = li.id AND f.reversed_at IS NULL \
@@ -389,14 +373,11 @@ pub(super) async fn mark_delivered(
     .fetch_optional(&mut *tx)
     .await?;
 
-    let (status_str, last_hauler) = row.ok_or_else(ApiError::not_found)?;
-    let item_status: ListItemStatus = status_str
-        .parse()
-        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
+    let (item_status, last_hauler) = row.ok_or_else(ApiError::not_found)?;
 
     if item_status != ListItemStatus::Bought {
         return Err(ApiError::BadRequest(format!(
-            "item must be in 'bought' status to mark delivered (currently: {status_str})"
+            "item must be in 'bought' status to mark delivered (currently: {item_status})"
         )));
     }
 
@@ -404,7 +385,8 @@ pub(super) async fn mark_delivered(
         return Err(ApiError::forbidden());
     }
 
-    sqlx::query("UPDATE list_items SET status = 'delivered' WHERE id = $1")
+    sqlx::query("UPDATE list_items SET status = $1 WHERE id = $2")
+        .bind(ListItemStatus::Delivered)
         .bind(item_id)
         .execute(&mut *tx)
         .await?;

@@ -75,7 +75,14 @@ jobs:
         with:
           workspaces: backend
       - run: cargo install cargo-audit --locked
-      - run: cargo audit
+      # RUSTSEC-2023-0071 (Marvin): sqlx-macros-core unconditionally
+      # pulls in sqlx-mysql + rsa for offline-cache support, even
+      # though we only enable the `postgres` feature. rsa is a
+      # build-time dep here — never reaches the runtime binary — and
+      # upstream has no fixed release. Re-evaluate when a non-vulnerable
+      # rsa is published or when sqlx-macros-core stops pulling in the
+      # mysql backend unconditionally.
+      - run: cargo audit --ignore RUSTSEC-2023-0071
 
   audit-frontend:
     name: frontend npm audit

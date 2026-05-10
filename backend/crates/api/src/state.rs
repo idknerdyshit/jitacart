@@ -7,7 +7,6 @@ use sqlx::PgPool;
 use crate::{config::Config, jwt::JwksCache};
 
 #[derive(Clone)]
-#[allow(dead_code)] // token_store + budget_guard are wired in PR #4/#5.
 pub struct AppState {
     pub pool: PgPool,
     pub config: Arc<Config>,

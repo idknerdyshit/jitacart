@@ -33,12 +33,12 @@ pub enum SettlementError {
 pub struct ContractUpsert {
     pub esi_contract_id: i64,
     pub issuer_character_id: i64,
-    /// Deprecated (Phase 7): NULL for corp contracts. Kept for backward compat.
+    /// Deprecated: NULL for corp contracts. Use `issuer_principal_id`.
     pub issuer_user_id: Option<Uuid>,
     pub assignee_character_id: Option<i64>,
-    /// Deprecated (Phase 7): NULL for corp-assignee contracts. Kept for compat.
+    /// Deprecated: NULL for corp-assignee contracts. Use `assignee_principal_id`.
     pub assignee_user_id: Option<Uuid>,
-    // Phase 7: principal-id fields (may be None if resolution failed).
+    // Principal-id fields (may be None if resolution failed).
     pub issuer_principal_id: Option<Uuid>,
     pub assignee_principal_id: Option<Uuid>,
     pub contract_type: String,
@@ -529,7 +529,7 @@ pub async fn settle_manual(
     Ok(())
 }
 
-/// Wallet verification (Phase 7, audit-only).
+/// Wallet verification (audit-only).
 ///
 /// Looks up the ESI contract id, sums `corp_wallet_journal.amount` for
 /// `ref_type = 'contract_price'` entries that reference this contract, then:

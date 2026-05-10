@@ -27,7 +27,7 @@ pub async fn insert_user(pool: &PgPool, name: &str) -> Uuid {
             .fetch_one(pool)
             .await
             .unwrap();
-    // Phase 7: every user gets a user-principal (the migration backfills existing
+    // Every user gets a user-principal (the migration backfills existing
     // rows, but for test-created rows we do it here).
     sqlx::query(
         "INSERT INTO principals (kind, user_id) VALUES ('user', $1) \

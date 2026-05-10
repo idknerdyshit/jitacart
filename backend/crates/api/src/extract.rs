@@ -106,7 +106,6 @@ impl FromRequestParts<AppState> for CurrentGroup {
 /// of the claim's list's group.
 pub struct CurrentClaim {
     pub user_id: Uuid,
-    #[allow(dead_code)]
     pub group_id: Uuid,
     pub list_id: Uuid,
     pub claim_id: Uuid,
@@ -205,7 +204,6 @@ impl FromRequestParts<AppState> for CurrentClaim {
 pub struct CurrentList {
     pub user_id: Uuid,
     /// Surfaced for handlers that need to scope further DB queries by group.
-    #[allow(dead_code)]
     pub group_id: Uuid,
     pub list_id: Uuid,
     pub role: GroupRole,

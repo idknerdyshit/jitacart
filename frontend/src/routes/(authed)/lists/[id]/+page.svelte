@@ -39,7 +39,7 @@
     let tipInput = $state('');
     let savingTip = $state(false);
 
-    // Phase 7: payer picker
+    // Payer picker (corp-funded lists).
     let groupCorps = $state<Corp[]>([]);
     let payerCorpId = $state<string>('');
     let payerDivision = $state<number>(1);

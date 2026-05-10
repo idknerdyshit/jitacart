@@ -1,4 +1,4 @@
-//! Corp wallet poller (Phase 7).
+//! Corp wallet poller.
 //!
 //! Each tick:
 //! 1. Pick corps whose `wallet_next_poll_at` is due.

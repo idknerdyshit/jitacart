@@ -69,7 +69,7 @@ export type List = {
     status: ListStatus;
     total_estimate_isk: string;
     tip_pct: string;
-    /** Phase 7: corp-funded reimbursement payer, if set. */
+    /** Corp-funded reimbursement payer, if set. */
     payer_corp_id: string | null;
     payer_division: number | null;
     created_at: string;
@@ -182,7 +182,6 @@ export type Reimbursement = {
     settled_by_user_id: string | null;
     contract_id: string | null;
     contract: ContractSummary | null;
-    /** Phase 7 fields */
     is_corp_funded: boolean;
     verified_by_wallet: boolean;
     wallet_settlement_delta_isk: string | null;
@@ -290,7 +289,7 @@ export type PreviewResponse = {
     errors: { line_no: number; raw: string; reason: string }[];
 };
 
-// ── Phase 7: corps ────────────────────────────────────────────────────────────
+// ── Corps ─────────────────────────────────────────────────────────────────────
 
 export type Corp = {
     id: string;

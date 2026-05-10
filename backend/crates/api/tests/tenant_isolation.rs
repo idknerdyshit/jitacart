@@ -1,4 +1,4 @@
-//! Phase 9 / M1: cross-tenant isolation regressions.
+//! Cross-tenant isolation regressions.
 //!
 //! Two patterns are exercised here:
 //!

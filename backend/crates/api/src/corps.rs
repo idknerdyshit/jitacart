@@ -1,4 +1,4 @@
-//! Corp management endpoints (Phase 7).
+//! Corp management endpoints.
 //!
 //! Allows group owners to link EVE corporations, add/remove ambassadors,
 //! set the payer-corp on lists, and browse the corp wallet journal.

@@ -67,8 +67,7 @@ impl EsiBudgetGuard {
 
 /// Run an ESI future under budget accounting: on `Err`, decrement the
 /// guard before returning. New ESI call sites should always go through
-/// this rather than calling `record_non_2xx` by hand — that pattern was
-/// audited in Phase 9 / M4 and is now the convention.
+/// this rather than calling `record_non_2xx` by hand.
 ///
 /// ```ignore
 /// let row = budgeted(&ctx.budget, esi.get_contracts(char_id)).await?;

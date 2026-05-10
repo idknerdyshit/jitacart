@@ -1,4 +1,4 @@
-//! Phase 9 / M3: abuse-cap enforcement.
+//! Abuse-cap enforcement.
 //!
 //! Drives the `check_*_quota` helpers directly against a `sqlx::test`
 //! pool with cap values dialled low, so we don't need 200 fixture rows

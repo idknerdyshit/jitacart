@@ -337,8 +337,8 @@ pub struct List {
     pub tip_pct: Decimal,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// Phase 7: corp wallet funding source. When set, reimbursements on this
-    /// list are corp-funded (one per hauler, covering all items).
+    /// Corp wallet funding source. When set, reimbursements on this list are
+    /// corp-funded (one per hauler, covering all items).
     pub payer_corp_id: Option<Uuid>,
     pub payer_division: Option<i16>,
 }
@@ -415,8 +415,8 @@ pub struct Fulfillment {
 pub struct Reimbursement {
     pub id: Uuid,
     pub list_id: Uuid,
-    /// Deprecated (Phase 7): NULL for corp-funded reimbursements. Kept for
-    /// backward compatibility; use `requester_principal` instead.
+    /// Deprecated: NULL for corp-funded reimbursements. Use
+    /// `requester_principal_id` instead.
     pub requester_user_id: Option<Uuid>,
     pub requester_display_name: String,
     pub hauler_user_id: Uuid,
@@ -432,7 +432,6 @@ pub struct Reimbursement {
     pub contract: Option<ContractSummary>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    // Phase 7 additions
     pub requester_principal_id: Uuid,
     pub hauler_principal_id: Uuid,
     pub is_corp_funded: bool,
@@ -600,10 +599,10 @@ pub struct Contract {
     pub id: Uuid,
     pub esi_contract_id: i64,
     pub issuer_character_id: i64,
-    /// Deprecated (Phase 7): use `issuer_principal_id`. Kept for compatibility.
+    /// Deprecated: use `issuer_principal_id`.
     pub issuer_user_id: Option<Uuid>,
     pub assignee_character_id: Option<i64>,
-    /// Deprecated (Phase 7): use `assignee_principal_id`. Kept for compatibility.
+    /// Deprecated: use `assignee_principal_id`.
     pub assignee_user_id: Option<Uuid>,
     pub contract_type: ContractType,
     pub status: ContractStatus,
@@ -619,7 +618,6 @@ pub struct Contract {
     pub start_location_id: Option<i64>,
     pub end_location_id: Option<i64>,
     pub items_synced_at: Option<DateTime<Utc>>,
-    // Phase 7
     pub issuer_principal_id: Option<Uuid>,
     pub assignee_principal_id: Option<Uuid>,
     pub wallet_verified_at: Option<DateTime<Utc>>,
@@ -703,7 +701,7 @@ pub struct ResolvedType {
     pub type_name: String,
 }
 
-// ── Phase 7: Corp principals ──────────────────────────────────────────────────
+// ── Corp principals ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -1,4 +1,4 @@
-//! Phase 9 / M6: /me/export.
+//! `/me/export` endpoint.
 //!
 //! The endpoint returns a JSON document keyed to the caller's user_id.
 //! These tests exercise `do_export_me` directly.

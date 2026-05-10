@@ -259,7 +259,9 @@ pub async fn do_confirm(
 }
 
 /// Shared lock-row for confirm and manual-link. `suggestion_state` is `None`
-/// in the manual-link path (the query SELECTs `NULL::text`).
+/// in the manual-link path (the query SELECTs `NULL::text`). Several fields
+/// (e.g. `contract_status`, `assignee_*`) are SELECTed for the `FOR UPDATE
+/// OF` lock and JOIN consistency but not read directly.
 #[derive(sqlx::FromRow)]
 #[allow(dead_code)]
 struct LinkLockRow {

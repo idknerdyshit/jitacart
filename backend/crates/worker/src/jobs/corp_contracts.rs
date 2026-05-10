@@ -1,4 +1,4 @@
-//! Corp contract poller (Phase 7).
+//! Corp contract poller.
 //!
 //! Each tick:
 //! 1. Pick corps whose `contracts_next_poll_at` is due (cursor-based fan-out).

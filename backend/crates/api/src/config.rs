@@ -129,8 +129,8 @@ pub struct EveSsoConfig {
     pub client_id: String,
     pub client_secret: String,
     pub callback_url: String,
-    /// Scopes requested on the *first* login. Phase 1 only needs `publicData`;
-    /// later phases will add per-feature scope upgrades.
+    /// Scopes requested on the *first* login. Upgrades request additional
+    /// scopes via `/auth/eve/upgrade`.
     #[serde(default = "default_login_scopes")]
     pub login_scopes: Vec<String>,
     /// Scopes that may be requested by `/auth/eve/upgrade`. Each request is
@@ -147,7 +147,6 @@ pub struct EsiConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // contracts/wallet_transactions are read in Phase 5+
 pub struct PollIntervals {
     #[serde(default = "default_market_prices_secs")]
     pub market_prices: u64,

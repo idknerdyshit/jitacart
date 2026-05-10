@@ -93,7 +93,6 @@ pub(crate) async fn load_list_detail(
     let live_prices: Vec<LiveItemPrice> =
         live_rows.into_iter().map(LivePriceRow::into_live).collect();
 
-    // Phase 5: claims
     let claim_rows: Vec<ClaimRow> = sqlx::query_as(
         r#"
         SELECT c.id, c.list_id, c.hauler_user_id, c.status, c.note,
@@ -117,7 +116,7 @@ pub(crate) async fn load_list_detail(
         .map(ClaimRow::into_claim)
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    // Phase 5: fulfillments (non-reversed only)
+    // Non-reversed fulfillments only.
     let fulfillment_rows: Vec<FulfillmentRow> = sqlx::query_as(
         r#"
         SELECT f.id, f.list_item_id, f.claim_id, f.hauler_user_id, f.hauler_character_id,
@@ -226,7 +225,6 @@ struct ListRow {
     tip_pct: Decimal,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
-    // Phase 7
     payer_corp_id: Option<Uuid>,
     payer_division: Option<i16>,
 }
@@ -447,7 +445,6 @@ pub(crate) struct ReimbursementRow {
     pub contract_expected_total_isk: Option<Decimal>,
     pub contract_settlement_delta_isk: Option<Decimal>,
     pub contract_date_completed: Option<DateTime<Utc>>,
-    // Phase 7
     pub requester_principal_id: Uuid,
     pub hauler_principal_id: Uuid,
     pub is_corp_funded: bool,

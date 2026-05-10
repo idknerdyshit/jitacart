@@ -66,7 +66,6 @@ pub struct PollIntervals {
     pub citadel_orders: u64,
     #[serde(default = "default_structure_access_backoff_secs")]
     pub structure_access_backoff: u64,
-    // Phase 7
     #[serde(default = "default_corp_contracts_secs")]
     pub corp_contracts: u64,
     #[serde(default = "default_corp_wallet_secs")]
@@ -137,7 +136,6 @@ pub struct WorkerSection {
     pub citadel_orders_concurrency: usize,
     #[serde(default = "default_contracts_concurrency")]
     pub contracts_concurrency: usize,
-    // Phase 7
     #[serde(default = "default_corp_contracts_concurrency")]
     pub corp_contracts_concurrency: usize,
     #[serde(default = "default_corp_wallet_concurrency")]

@@ -98,14 +98,11 @@ pub(crate) async fn recompute_item_status(
     item_id: Uuid,
     demotion: DeliveredDemotion,
 ) -> Result<ListItemStatus, ApiError> {
-    let current: String = sqlx::query_scalar("SELECT status FROM list_items WHERE id = $1")
-        .bind(item_id)
-        .fetch_one(&mut **tx)
-        .await?;
-
-    let current_status: ListItemStatus = current
-        .parse()
-        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
+    let current_status: ListItemStatus =
+        sqlx::query_scalar("SELECT status FROM list_items WHERE id = $1")
+            .bind(item_id)
+            .fetch_one(&mut **tx)
+            .await?;
 
     if current_status == ListItemStatus::Settled {
         return Ok(current_status);
@@ -143,7 +140,7 @@ pub(crate) async fn recompute_item_status(
         };
 
     sqlx::query("UPDATE list_items SET status = $1, qty_fulfilled = $2 WHERE id = $3")
-        .bind(new_status.as_str())
+        .bind(new_status)
         .bind(qty_fulfilled)
         .bind(item_id)
         .execute(&mut **tx)

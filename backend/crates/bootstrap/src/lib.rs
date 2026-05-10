@@ -17,7 +17,9 @@ pub fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let registry = tracing_subscriber::registry().with(env_filter);
     if std::env::var(LOG_FORMAT_ENV).as_deref() == Ok("json") {
-        registry.with(fmt::layer().json().flatten_event(true)).init();
+        registry
+            .with(fmt::layer().json().flatten_event(true))
+            .init();
     } else {
         registry.with(fmt::layer()).init();
     }
@@ -30,5 +32,8 @@ pub fn load_config<T: serde::de::DeserializeOwned>(context: &'static str) -> any
     if std::path::Path::new("config.toml").exists() {
         figment = figment.merge(Toml::file("config.toml"));
     }
-    figment.merge(Env::raw().split("__")).extract().context(context)
+    figment
+        .merge(Env::raw().split("__"))
+        .extract()
+        .context(context)
 }

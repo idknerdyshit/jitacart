@@ -59,7 +59,7 @@ async fn group_quota_counts_joins_not_just_owns(pool: PgPool) {
 async fn insert_list(pool: &PgPool, group_id: Uuid, creator: Uuid, status: &str) -> Uuid {
     sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO lists (group_id, created_by_user_id, destination_label, status) \
-         VALUES ($1, $2, 'D', $3) RETURNING id",
+         VALUES ($1, $2, 'D', $3::list_status) RETURNING id",
     )
     .bind(group_id)
     .bind(creator)

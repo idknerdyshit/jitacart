@@ -18,7 +18,7 @@ async fn pending_reimbursements_lose_contract_id(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -51,7 +51,7 @@ async fn pending_suggestions_become_superseded(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -65,7 +65,7 @@ async fn pending_suggestions_become_superseded(pool: PgPool) {
     tx.commit().await.unwrap();
 
     let state: String =
-        sqlx::query_scalar("SELECT state FROM contract_match_suggestions WHERE id = $1")
+        sqlx::query_scalar("SELECT state::text FROM contract_match_suggestions WHERE id = $1")
             .bind(sugg_id)
             .fetch_one(&pool)
             .await
@@ -84,7 +84,7 @@ async fn settled_reimbursements_untouched_idempotent_double_unbind(pool: PgPool)
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "finished",
+        domain::ContractStatus::Finished,
         true,
     )
     .await;

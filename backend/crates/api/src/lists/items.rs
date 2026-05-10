@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use domain::{ListDetail, ResolvedType};
+use domain::{ListDetail, ListItemStatus, ResolvedType};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -123,25 +123,36 @@ pub(super) async fn add_items(
                 cap
             )));
         }
+        let n = new_lines.len();
+        let mut type_ids: Vec<i64> = Vec::with_capacity(n);
+        let mut type_names: Vec<String> = Vec::with_capacity(n);
+        let mut qtys: Vec<i64> = Vec::with_capacity(n);
+        let mut line_nos: Vec<i32> = Vec::with_capacity(n);
         for (name, qty, line_no) in &new_lines {
             let key = market::types::normalize_key(name);
             let r = resolved.get(&key).ok_or_else(|| {
                 ApiError::internal(anyhow::anyhow!("resolved missing for {}", name))
             })?;
-            sqlx::query(
-                "INSERT INTO list_items \
-                 (list_id, type_id, type_name, qty_requested, requested_by_user_id, source_line_no) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
-            )
-            .bind(list_id)
-            .bind(r.type_id)
-            .bind(&r.type_name)
-            .bind(*qty)
-            .bind(user_id)
-            .bind(*line_no)
-            .execute(&mut *tx)
-            .await?;
+            type_ids.push(r.type_id);
+            type_names.push(r.type_name.clone());
+            qtys.push(*qty);
+            line_nos.push(*line_no);
         }
+        sqlx::query(
+            "INSERT INTO list_items \
+             (list_id, type_id, type_name, qty_requested, requested_by_user_id, source_line_no) \
+             SELECT $1, type_id, type_name, qty_requested, $2, source_line_no \
+             FROM UNNEST($3::bigint[], $4::text[], $5::bigint[], $6::int[]) \
+                  AS t(type_id, type_name, qty_requested, source_line_no)",
+        )
+        .bind(list_id)
+        .bind(user_id)
+        .bind(&type_ids)
+        .bind(&type_names)
+        .bind(&qtys)
+        .bind(&line_nos)
+        .execute(&mut *tx)
+        .await?;
         let updated_after: DateTime<Utc> = sqlx::query_scalar(
             "UPDATE lists SET updated_at = now() WHERE id = $1 RETURNING updated_at",
         )
@@ -164,8 +175,7 @@ pub(super) async fn patch_item(
     Json(body): Json<PatchItemBody>,
 ) -> Result<Json<ListDetail>, ApiError> {
     debug_assert_eq!(cur.list_id, list_id);
-    cur.require_mutable()
-        .map_err(|_| ApiError::Conflict("list is archived; no changes can be made".into()))?;
+    cur.require_mutable()?;
     if body.qty_requested.is_none() && body.type_name.is_none() {
         return Err(ApiError::BadRequest("nothing to update".into()));
     }
@@ -201,7 +211,7 @@ pub(super) async fn patch_item(
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(ApiError::not_found)?;
-        let item_status: String = sqlx::query_scalar(
+        let item_status: ListItemStatus = sqlx::query_scalar(
             "SELECT status FROM list_items WHERE id = $1 AND list_id = $2 FOR UPDATE",
         )
         .bind(item_id)
@@ -212,7 +222,7 @@ pub(super) async fn patch_item(
         // Once a hauler has claimed or fulfilled this item, qty/type edits would
         // make status, qty_fulfilled, and reimbursement totals inconsistent.
         // The hauler must release the claim or reverse fulfillments first.
-        if item_status != "open" {
+        if item_status != ListItemStatus::Open {
             return Err(ApiError::Conflict(format!(
                 "cannot edit item with status '{item_status}'; \
                  release the claim or reverse fulfillments first"
@@ -259,8 +269,7 @@ pub(super) async fn delete_item(
     cur: CurrentList,
 ) -> Result<Json<ListDetail>, ApiError> {
     debug_assert_eq!(cur.list_id, list_id);
-    cur.require_mutable()
-        .map_err(|_| ApiError::Conflict("list is archived; no changes can be made".into()))?;
+    cur.require_mutable()?;
     let updated_after = {
         let mut tx = state.pool.begin().await?;
         let _: (Uuid,) = sqlx::query_as("SELECT id FROM lists WHERE id = $1 FOR UPDATE")
@@ -268,7 +277,7 @@ pub(super) async fn delete_item(
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(ApiError::not_found)?;
-        let item_status: Option<String> = sqlx::query_scalar(
+        let item_status: Option<ListItemStatus> = sqlx::query_scalar(
             "SELECT status FROM list_items WHERE id = $1 AND list_id = $2 FOR UPDATE",
         )
         .bind(item_id)
@@ -280,7 +289,7 @@ pub(super) async fn delete_item(
         // reimbursements with stale totals (and still settleable). Block
         // until the item is back to 'open' — i.e. no active claim and no
         // non-reversed fulfillments.
-        if item_status != "open" {
+        if item_status != ListItemStatus::Open {
             return Err(ApiError::Conflict(format!(
                 "cannot delete item with status '{item_status}'; \
                  release the claim or reverse fulfillments first"

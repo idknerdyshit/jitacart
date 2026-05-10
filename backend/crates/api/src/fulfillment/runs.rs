@@ -1,6 +1,6 @@
 use axum::{extract::State, Json};
 use chrono::{DateTime, Utc};
-use domain::{RunMarketRef, RunSummary};
+use domain::{ListStatus, RunMarketRef, RunSummary};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -10,7 +10,7 @@ use crate::{errors::ApiError, extract::CurrentGroup, state::AppState};
 struct RunRow {
     id: Uuid,
     destination_label: Option<String>,
-    status: String,
+    status: ListStatus,
     created_at: DateTime<Utc>,
     total_estimate_isk: Decimal,
     items_open: i64,
@@ -118,30 +118,24 @@ pub(super) async fn runs(
             });
     }
 
-    let summaries = rows
+    let summaries: Vec<RunSummary> = rows
         .into_iter()
-        .map(|r| {
-            let status = r
-                .status
-                .parse::<domain::ListStatus>()
-                .map_err(|e| ApiError::internal(anyhow::anyhow!(e)))?;
-            Ok(RunSummary {
-                list_id: r.id,
-                destination_label: r.destination_label,
-                status,
-                created_at: r.created_at,
-                accepted_markets: markets_by_list.remove(&r.id).unwrap_or_default(),
-                items_open: r.items_open,
-                items_claimed: r.items_claimed,
-                items_bought: r.items_bought,
-                items_delivered: r.items_delivered,
-                items_settled: r.items_settled,
-                total_estimate_isk: r.total_estimate_isk,
-                claimed_by_me: r.claimed_by_me,
-                my_active_claim_id: r.my_active_claim_id,
-            })
+        .map(|r| RunSummary {
+            list_id: r.id,
+            destination_label: r.destination_label,
+            status: r.status,
+            created_at: r.created_at,
+            accepted_markets: markets_by_list.remove(&r.id).unwrap_or_default(),
+            items_open: r.items_open,
+            items_claimed: r.items_claimed,
+            items_bought: r.items_bought,
+            items_delivered: r.items_delivered,
+            items_settled: r.items_settled,
+            total_estimate_isk: r.total_estimate_isk,
+            claimed_by_me: r.claimed_by_me,
+            my_active_claim_id: r.my_active_claim_id,
         })
-        .collect::<Result<Vec<_>, ApiError>>()?;
+        .collect();
 
     Ok(Json(summaries))
 }

@@ -99,10 +99,7 @@ pub(crate) async fn load_markets(state: &AppState, ids: &[Uuid]) -> Result<Vec<M
             "one or more market_ids do not exist".into(),
         ));
     }
-    Ok(rows
-        .into_iter()
-        .map(MarketRow::into_market)
-        .collect::<anyhow::Result<Vec<_>>>()?)
+    Ok(rows.into_iter().map(MarketRow::into_market).collect())
 }
 
 /// Allow if every market is either an NPC hub or present in
@@ -172,7 +169,7 @@ pub async fn do_patch_list_status(
     user_id: Uuid,
     new_status: ListStatus,
 ) -> Result<(), ApiError> {
-    let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
+    let row: Option<(Uuid, Option<GroupRole>)> = sqlx::query_as(
         "SELECT l.created_by_user_id, gm.role \
          FROM lists l \
          LEFT JOIN group_memberships gm \
@@ -184,17 +181,14 @@ pub async fn do_patch_list_status(
     .fetch_optional(pool)
     .await?;
 
-    let (created_by, role_raw) = row.ok_or_else(ApiError::not_found)?;
-    let role_raw = role_raw.ok_or_else(ApiError::forbidden)?;
-    let role: GroupRole = role_raw
-        .parse()
-        .map_err(|e: String| ApiError::internal(anyhow::anyhow!(e)))?;
+    let (created_by, role) = row.ok_or_else(ApiError::not_found)?;
+    let role = role.ok_or_else(ApiError::forbidden)?;
     if user_id != created_by && role != GroupRole::Owner {
         return Err(ApiError::forbidden());
     }
 
     sqlx::query("UPDATE lists SET status = $1, updated_at = now() WHERE id = $2")
-        .bind(new_status.as_str())
+        .bind(new_status)
         .bind(list_id)
         .execute(pool)
         .await?;

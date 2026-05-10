@@ -41,9 +41,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
-            ApiError::QuotaExceeded(msg) => {
-                (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response()
-            }
+            ApiError::QuotaExceeded(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response(),
             ApiError::Internal(e) => {
                 tracing::error!(error = ?e, "api handler error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()

@@ -6,6 +6,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use domain::{ClaimStatus, GroupRole, ListStatus};
+
+use crate::errors::ApiError;
 use serde::Deserialize;
 use tower_sessions::Session;
 use uuid::Uuid;
@@ -36,15 +38,6 @@ where
             None => Err((StatusCode::UNAUTHORIZED, "not logged in").into_response()),
         }
     }
-}
-
-/// Returns a small `(StatusCode, &str)` tuple so callers can convert via
-/// `.map_err(IntoResponse::into_response)` without boxing a large `Response`.
-fn parse_role(raw: String) -> Result<GroupRole, (StatusCode, &'static str)> {
-    raw.parse::<GroupRole>().map_err(|e| {
-        tracing::error!(error = ?e, "invalid group role in database");
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-    })
 }
 
 fn db_error(context: &'static str, e: sqlx::Error) -> Response {
@@ -80,7 +73,7 @@ impl FromRequestParts<AppState> for CurrentGroup {
             (StatusCode::BAD_REQUEST, "missing group id in route").into_response()
         })?;
 
-        let role: Option<String> = sqlx::query_scalar(
+        let role: Option<GroupRole> = sqlx::query_scalar(
             "SELECT role FROM group_memberships WHERE user_id = $1 AND group_id = $2",
         )
         .bind(user_id)
@@ -89,10 +82,9 @@ impl FromRequestParts<AppState> for CurrentGroup {
         .await
         .map_err(|e| db_error("group membership lookup failed", e))?;
 
-        let role = parse_role(role.ok_or_else(|| {
+        let role = role.ok_or_else(|| {
             (StatusCode::FORBIDDEN, "you are not a member of this group").into_response()
-        })?)
-        .map_err(IntoResponse::into_response)?;
+        })?;
 
         Ok(CurrentGroup {
             user_id,
@@ -150,40 +142,30 @@ impl FromRequestParts<AppState> for CurrentClaim {
             (StatusCode::BAD_REQUEST, "missing claim id in route").into_response()
         })?;
 
-        let row: Option<(Uuid, Uuid, Uuid, String, Option<String>, String)> = sqlx::query_as(
-            "SELECT c.list_id, l.group_id, c.hauler_user_id, c.status, gm.role, l.status \
-             FROM claims c \
-             JOIN lists l ON l.id = c.list_id \
-             LEFT JOIN group_memberships gm \
-               ON gm.group_id = l.group_id AND gm.user_id = $1 \
-             WHERE c.id = $2",
-        )
-        .bind(user_id)
-        .bind(claim_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|e| db_error("claim lookup failed", e))?;
+        let row: Option<(Uuid, Uuid, Uuid, ClaimStatus, Option<GroupRole>, ListStatus)> =
+            sqlx::query_as(
+                "SELECT c.list_id, l.group_id, c.hauler_user_id, c.status, gm.role, l.status \
+                 FROM claims c \
+                 JOIN lists l ON l.id = c.list_id \
+                 LEFT JOIN group_memberships gm \
+                   ON gm.group_id = l.group_id AND gm.user_id = $1 \
+                 WHERE c.id = $2",
+            )
+            .bind(user_id)
+            .bind(claim_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| db_error("claim lookup failed", e))?;
 
-        let (list_id, group_id, hauler_user_id, status_raw, role_opt, list_status_raw) =
+        let (list_id, group_id, hauler_user_id, status, role_opt, list_status) =
             row.ok_or_else(|| (StatusCode::NOT_FOUND, "claim not found").into_response())?;
 
-        let role = parse_role(role_opt.ok_or_else(|| {
+        let role = role_opt.ok_or_else(|| {
             (
                 StatusCode::FORBIDDEN,
                 "you are not a member of this claim's group",
             )
                 .into_response()
-        })?)
-        .map_err(IntoResponse::into_response)?;
-
-        let status: ClaimStatus = status_raw.parse().map_err(|e| {
-            tracing::error!(error = ?e, "invalid claim status in database");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-        })?;
-
-        let list_status: ListStatus = list_status_raw.parse().map_err(|e: String| {
-            tracing::error!(error = %e, "invalid list status in database");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         })?;
 
         Ok(CurrentClaim {
@@ -213,35 +195,30 @@ pub struct CurrentList {
 
 #[allow(clippy::result_large_err)] // Response is the standard axum error type.
 impl CurrentList {
-    pub fn require_open(&self) -> Result<(), Response> {
+    pub fn require_open(&self) -> Result<(), ApiError> {
         if self.status != ListStatus::Open {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("list is {}; this action requires an open list", self.status),
-            )
-                .into_response());
+            return Err(ApiError::Conflict(format!(
+                "list is {}; this action requires an open list",
+                self.status
+            )));
         }
         Ok(())
     }
 
-    pub fn require_mutable(&self) -> Result<(), Response> {
+    pub fn require_mutable(&self) -> Result<(), ApiError> {
         if self.status == ListStatus::Archived {
-            return Err((
-                StatusCode::CONFLICT,
-                "list is archived; no changes can be made",
-            )
-                .into_response());
+            return Err(ApiError::Conflict(
+                "list is archived; no changes can be made".into(),
+            ));
         }
         Ok(())
     }
 
-    pub fn require_can_manage(&self) -> Result<(), Response> {
+    pub fn require_can_manage(&self) -> Result<(), ApiError> {
         if self.user_id != self.created_by_user_id && self.role != GroupRole::Owner {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "only the list creator or a group owner can change list status",
-            )
-                .into_response());
+            return Err(ApiError::Forbidden(
+                "only the list creator or a group owner can change list status".into(),
+            ));
         }
         Ok(())
     }
@@ -271,7 +248,7 @@ impl FromRequestParts<AppState> for CurrentList {
 
         // Outer-join membership so a missing list returns 404 while a non-member
         // on an existing list returns 403 (role IS NULL).
-        let row: Option<(Uuid, Uuid, String, Option<String>)> = sqlx::query_as(
+        let row: Option<(Uuid, Uuid, ListStatus, Option<GroupRole>)> = sqlx::query_as(
             "SELECT l.group_id, l.created_by_user_id, l.status, gm.role \
              FROM lists l \
              LEFT JOIN group_memberships gm \
@@ -284,21 +261,15 @@ impl FromRequestParts<AppState> for CurrentList {
         .await
         .map_err(|e| db_error("list lookup failed", e))?;
 
-        let (group_id, created_by_user_id, status_raw, role) =
+        let (group_id, created_by_user_id, status, role) =
             row.ok_or_else(|| (StatusCode::NOT_FOUND, "list not found").into_response())?;
 
-        let role = parse_role(role.ok_or_else(|| {
+        let role = role.ok_or_else(|| {
             (
                 StatusCode::FORBIDDEN,
                 "you are not a member of this list's group",
             )
                 .into_response()
-        })?)
-        .map_err(IntoResponse::into_response)?;
-
-        let status: ListStatus = status_raw.parse().map_err(|e: String| {
-            tracing::error!(error = %e, "invalid list status in database");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         })?;
 
         Ok(CurrentList {

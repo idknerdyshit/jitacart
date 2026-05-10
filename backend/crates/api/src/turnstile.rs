@@ -66,11 +66,14 @@ mod tests {
 
     #[test]
     fn parses_failure_with_codes() {
-        let json = r#"{"success":false,"error-codes":["invalid-input-response","timeout-or-duplicate"]}"#;
+        let json =
+            r#"{"success":false,"error-codes":["invalid-input-response","timeout-or-duplicate"]}"#;
         let v: VerifyResponse = serde_json::from_str(json).unwrap();
         assert!(!v.success);
         assert_eq!(v.error_codes.len(), 2);
-        assert!(v.error_codes.contains(&"invalid-input-response".to_string()));
+        assert!(v
+            .error_codes
+            .contains(&"invalid-input-response".to_string()));
     }
 
     #[test]

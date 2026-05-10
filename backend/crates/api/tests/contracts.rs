@@ -23,7 +23,7 @@ async fn confirm_happy_path_contract_outstanding(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -43,7 +43,7 @@ async fn confirm_happy_path_contract_outstanding(pool: PgPool) {
             .unwrap();
     assert_eq!(bound, Some(contract.contract_id));
     let state: String =
-        sqlx::query_scalar("SELECT state FROM contract_match_suggestions WHERE id = $1")
+        sqlx::query_scalar("SELECT state::text FROM contract_match_suggestions WHERE id = $1")
             .bind(sugg_id)
             .fetch_one(&pool)
             .await
@@ -62,7 +62,7 @@ async fn confirm_against_finished_contract_settles_immediately(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "finished",
+        domain::ContractStatus::Finished,
         true,
     )
     .await;
@@ -93,7 +93,7 @@ async fn confirm_by_non_issuer_is_forbidden(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -115,7 +115,7 @@ async fn confirm_when_reimbursement_already_bound(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -124,7 +124,7 @@ async fn confirm_when_reimbursement_already_bound(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(11_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -155,7 +155,7 @@ async fn double_confirm_hits_partial_unique_index(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -164,7 +164,7 @@ async fn double_confirm_hits_partial_unique_index(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(11_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -214,7 +214,7 @@ async fn reject_by_non_issuer_is_forbidden(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -236,7 +236,7 @@ async fn reject_already_decided_is_conflict(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -266,7 +266,7 @@ async fn manual_link_with_mismatched_assignee_is_conflict(pool: PgPool) {
         hauler,
         other_requester,
         Decimal::new(10_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -299,7 +299,7 @@ async fn manual_link_by_non_member_is_forbidden(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "outstanding",
+        domain::ContractStatus::Outstanding,
         true,
     )
     .await;
@@ -321,7 +321,7 @@ async fn unlink_finished_contract_is_conflict(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "finished",
+        domain::ContractStatus::Finished,
         true,
     )
     .await;
@@ -346,7 +346,7 @@ async fn unlink_in_progress_returns_pending_supersedes_confirmed(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "in_progress",
+        domain::ContractStatus::InProgress,
         true,
     )
     .await;
@@ -372,7 +372,7 @@ async fn unlink_in_progress_returns_pending_supersedes_confirmed(pool: PgPool) {
     assert!(bound.is_none());
 
     let state: String =
-        sqlx::query_scalar("SELECT state FROM contract_match_suggestions WHERE id = $1")
+        sqlx::query_scalar("SELECT state::text FROM contract_match_suggestions WHERE id = $1")
             .bind(sugg)
             .fetch_one(&pool)
             .await

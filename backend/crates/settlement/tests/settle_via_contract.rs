@@ -18,7 +18,7 @@ async fn bought_only_items_flip_to_settled(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "finished",
+        domain::ContractStatus::Finished,
         true,
     )
     .await;
@@ -53,7 +53,7 @@ async fn delivered_only_items_flip_to_settled(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "finished",
+        domain::ContractStatus::Finished,
         true,
     )
     .await;
@@ -84,7 +84,7 @@ async fn mixed_bought_and_delivered_flip_together(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "finished",
+        domain::ContractStatus::Finished,
         true,
     )
     .await;
@@ -112,7 +112,7 @@ async fn settlement_delta_isk_is_overpayment_signed(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(12_000, 0),
-        "finished",
+        domain::ContractStatus::Finished,
         true,
     )
     .await;
@@ -147,7 +147,7 @@ async fn settlement_delta_isk_negative_when_underpaid(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(8_000, 0),
-        "finished",
+        domain::ContractStatus::Finished,
         true,
     )
     .await;
@@ -182,7 +182,7 @@ async fn settled_at_uses_contract_date_completed(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "finished",
+        domain::ContractStatus::Finished,
         true,
     )
     .await;
@@ -227,7 +227,7 @@ async fn no_bound_rows_returns_zero_no_side_effects(pool: PgPool) {
         hauler,
         requester,
         Decimal::new(10_000, 0),
-        "finished",
+        domain::ContractStatus::Finished,
         true,
     )
     .await;
@@ -289,7 +289,7 @@ async fn multiple_bound_reimbursements_all_settle(pool: PgPool) {
         hauler,
         requester_a,
         Decimal::new(20_000, 0),
-        "finished",
+        domain::ContractStatus::Finished,
         true,
     )
     .await;

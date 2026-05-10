@@ -9,7 +9,23 @@ use anyhow::anyhow;
 use auth_tokens::budgeted;
 use uuid::Uuid;
 
-use crate::Ctx;
+use crate::{Ctx, WorkerConfig};
+
+use super::{JobFuture, JobSlot};
+
+pub struct Job;
+
+impl JobSlot for Job {
+    fn name(&self) -> &'static str {
+        "citadel_discovery"
+    }
+    fn interval_secs(&self, cfg: &WorkerConfig) -> u64 {
+        cfg.esi.poll_intervals_secs.citadel_discovery
+    }
+    fn run<'a>(&'a self, ctx: &'a Ctx) -> JobFuture<'a> {
+        Box::pin(run(ctx))
+    }
+}
 
 pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
     if !ctx.budget.has_budget() {

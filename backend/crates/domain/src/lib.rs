@@ -33,7 +33,8 @@ pub struct Character {
     pub last_refreshed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "group_role", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum GroupRole {
     Owner,
@@ -55,17 +56,6 @@ impl fmt::Display for GroupRole {
     }
 }
 
-impl FromStr for GroupRole {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "owner" => Ok(GroupRole::Owner),
-            "member" => Ok(GroupRole::Member),
-            other => Err(format!("unknown group role: {other}")),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     pub id: Uuid,
@@ -84,7 +74,8 @@ pub struct GroupMember {
     pub joined_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "market_kind", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum MarketKind {
     NpcHub,
@@ -106,18 +97,8 @@ impl fmt::Display for MarketKind {
     }
 }
 
-impl FromStr for MarketKind {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "npc_hub" => Ok(MarketKind::NpcHub),
-            "public_structure" => Ok(MarketKind::PublicStructure),
-            other => Err(format!("unknown market kind: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "list_status", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum ListStatus {
     Open,
@@ -141,19 +122,8 @@ impl fmt::Display for ListStatus {
     }
 }
 
-impl FromStr for ListStatus {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "open" => Ok(ListStatus::Open),
-            "closed" => Ok(ListStatus::Closed),
-            "archived" => Ok(ListStatus::Archived),
-            other => Err(format!("unknown list status: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "list_item_status", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum ListItemStatus {
     Open,
@@ -181,21 +151,8 @@ impl fmt::Display for ListItemStatus {
     }
 }
 
-impl FromStr for ListItemStatus {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "open" => Ok(ListItemStatus::Open),
-            "claimed" => Ok(ListItemStatus::Claimed),
-            "bought" => Ok(ListItemStatus::Bought),
-            "delivered" => Ok(ListItemStatus::Delivered),
-            "settled" => Ok(ListItemStatus::Settled),
-            other => Err(format!("unknown list item status: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "claim_status", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum ClaimStatus {
     Active,
@@ -219,19 +176,8 @@ impl fmt::Display for ClaimStatus {
     }
 }
 
-impl FromStr for ClaimStatus {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "active" => Ok(ClaimStatus::Active),
-            "released" => Ok(ClaimStatus::Released),
-            "completed" => Ok(ClaimStatus::Completed),
-            other => Err(format!("unknown claim status: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "fulfillment_source", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum FulfillmentSource {
     Manual,
@@ -253,18 +199,8 @@ impl fmt::Display for FulfillmentSource {
     }
 }
 
-impl FromStr for FulfillmentSource {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "manual" => Ok(FulfillmentSource::Manual),
-            "contract" => Ok(FulfillmentSource::Contract),
-            other => Err(format!("unknown fulfillment source: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "reimbursement_status", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum ReimbursementStatus {
     Pending,
@@ -285,18 +221,6 @@ impl ReimbursementStatus {
 impl fmt::Display for ReimbursementStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for ReimbursementStatus {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(ReimbursementStatus::Pending),
-            "settled" => Ok(ReimbursementStatus::Settled),
-            "cancelled" => Ok(ReimbursementStatus::Cancelled),
-            other => Err(format!("unknown reimbursement status: {other}")),
-        }
     }
 }
 
@@ -439,7 +363,8 @@ pub struct Reimbursement {
     pub wallet_settlement_delta_isk: Option<Decimal>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "contract_type", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum ContractType {
     ItemExchange,
@@ -478,7 +403,8 @@ impl FromStr for ContractType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "contract_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum ContractStatus {
     Outstanding,
@@ -555,7 +481,8 @@ impl FromStr for ContractStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "contract_match_state", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum ContractMatchState {
     Pending,
@@ -578,19 +505,6 @@ impl ContractMatchState {
 impl fmt::Display for ContractMatchState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for ContractMatchState {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(ContractMatchState::Pending),
-            "confirmed" => Ok(ContractMatchState::Confirmed),
-            "rejected" => Ok(ContractMatchState::Rejected),
-            "superseded" => Ok(ContractMatchState::Superseded),
-            other => Err(format!("unknown contract match state: {other}")),
-        }
     }
 }
 
@@ -703,7 +617,8 @@ pub struct ResolvedType {
 
 // ── Corp principals ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "principal_kind", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum PrincipalKind {
     User,
@@ -722,17 +637,6 @@ impl PrincipalKind {
 impl fmt::Display for PrincipalKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for PrincipalKind {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "user" => Ok(PrincipalKind::User),
-            "corp" => Ok(PrincipalKind::Corp),
-            other => Err(format!("unknown principal kind: {other}")),
-        }
     }
 }
 

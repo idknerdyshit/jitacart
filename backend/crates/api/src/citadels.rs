@@ -113,7 +113,7 @@ async fn track(
     require_owner(&cur)?;
 
     // Confirm the target is a public, detail-resolved citadel.
-    let row: Option<(String, bool, bool)> = sqlx::query_as(
+    let row: Option<(MarketKind, bool, bool)> = sqlx::query_as(
         "SELECT kind, is_public, (details_synced_at IS NOT NULL) FROM markets WHERE id = $1",
     )
     .bind(body.market_id)
@@ -121,10 +121,7 @@ async fn track(
     .await?;
 
     let (kind, is_public, detailed) = row.ok_or_else(ApiError::not_found)?;
-    let mk = kind
-        .parse::<MarketKind>()
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("bad kind: {e}")))?;
-    if mk != MarketKind::PublicStructure || !is_public || !detailed {
+    if kind != MarketKind::PublicStructure || !is_public || !detailed {
         return Err(ApiError::BadRequest(
             "market is not a tracked-eligible public citadel".into(),
         ));

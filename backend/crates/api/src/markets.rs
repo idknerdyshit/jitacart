@@ -33,11 +33,7 @@ async fn list_global(
     .fetch_all(&state.pool)
     .await?;
 
-    Ok(Json(
-        rows.into_iter()
-            .map(MarketRow::into_market)
-            .collect::<anyhow::Result<Vec<_>>>()?,
-    ))
+    Ok(Json(rows.into_iter().map(MarketRow::into_market).collect()))
 }
 
 #[derive(Serialize)]
@@ -89,14 +85,14 @@ async fn list_for_group(
     Ok(Json(
         rows.into_iter()
             .map(GroupMarketRow::into_group_market)
-            .collect::<anyhow::Result<Vec<_>>>()?,
+            .collect(),
     ))
 }
 
 #[derive(sqlx::FromRow)]
-pub struct MarketRow {
+pub(crate) struct MarketRow {
     pub id: Uuid,
-    pub kind: String,
+    pub kind: MarketKind,
     pub esi_location_id: i64,
     pub region_id: Option<i64>,
     pub name: Option<String>,
@@ -106,28 +102,24 @@ pub struct MarketRow {
 }
 
 impl MarketRow {
-    pub fn into_market(self) -> anyhow::Result<Market> {
-        let kind = self
-            .kind
-            .parse::<MarketKind>()
-            .map_err(anyhow::Error::msg)?;
-        Ok(Market {
+    pub fn into_market(self) -> Market {
+        Market {
             id: self.id,
-            kind,
+            kind: self.kind,
             esi_location_id: self.esi_location_id,
             region_id: self.region_id,
             name: self.name,
             short_label: self.short_label,
             is_hub: self.is_hub,
             is_public: self.is_public,
-        })
+        }
     }
 }
 
 #[derive(sqlx::FromRow)]
 struct GroupMarketRow {
     id: Uuid,
-    kind: String,
+    kind: MarketKind,
     esi_location_id: i64,
     region_id: Option<i64>,
     name: Option<String>,
@@ -141,15 +133,11 @@ struct GroupMarketRow {
 }
 
 impl GroupMarketRow {
-    fn into_group_market(self) -> anyhow::Result<GroupMarket> {
-        let kind = self
-            .kind
-            .parse::<MarketKind>()
-            .map_err(anyhow::Error::msg)?;
-        Ok(GroupMarket {
+    fn into_group_market(self) -> GroupMarket {
+        GroupMarket {
             market: Market {
                 id: self.id,
-                kind,
+                kind: self.kind,
                 esi_location_id: self.esi_location_id,
                 region_id: self.region_id,
                 name: self.name,
@@ -161,6 +149,6 @@ impl GroupMarketRow {
             untrackable_until: self.untrackable_until,
             accessing_character_id: self.accessing_character_id,
             accessing_character_name: self.accessing_character_name,
-        })
+        }
     }
 }

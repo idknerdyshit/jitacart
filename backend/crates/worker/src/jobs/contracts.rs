@@ -15,19 +15,34 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use nea_esi::{EsiContract, EsiError};
-use rust_decimal::prelude::FromPrimitive;
-use rust_decimal::Decimal;
 use serde_json::Value;
 use settlement::ContractUpsert;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use super::contracts_common::{
+    build_principal_index, find_user_for_principal, handle_contract_terminal, UpsertedContract,
+};
+use super::{isk_or_zero, jitter_secs, JobFuture, JobSlot};
+
 use domain::principals::{resolve_contract_parties, EsiContractParties};
 
-use super::corp_contracts::{build_principal_index, find_user_for_principal};
+use crate::{Ctx, WorkerConfig};
 
-use crate::Ctx;
+pub struct Job;
+
+impl JobSlot for Job {
+    fn name(&self) -> &'static str {
+        "contracts"
+    }
+    fn interval_secs(&self, cfg: &WorkerConfig) -> u64 {
+        cfg.worker.tick_secs
+    }
+    fn run<'a>(&'a self, ctx: &'a Ctx) -> JobFuture<'a> {
+        Box::pin(run(ctx))
+    }
+}
 
 pub(crate) mod r#match;
 
@@ -124,13 +139,13 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
 
     let synced_ids = sync_pending_items(ctx).await?;
 
-    // Run matcher on upserted contracts plus any whose items just landed.
-    let mut candidate_ids: Vec<Uuid> = upserts.iter().map(|u| u.contract_id).collect();
-    for id in &synced_ids {
-        if !candidate_ids.contains(id) {
-            candidate_ids.push(*id);
-        }
-    }
+    let candidate_ids: Vec<Uuid> = upserts
+        .iter()
+        .map(|u| u.contract_id)
+        .chain(synced_ids.iter().copied())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     if !candidate_ids.is_empty() {
         if let Err(e) = r#match::run_for_contracts(&ctx.pool, &candidate_ids).await {
             tracing::warn!(error = ?e, "contract matcher failed");
@@ -141,7 +156,7 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
         if !u.status_changed {
             continue;
         }
-        if let Err(e) = handle_terminal_transition(ctx, &u).await {
+        if let Err(e) = handle_contract_terminal(ctx, &u).await {
             tracing::warn!(
                 error = ?e,
                 esi_contract_id = u.esi_contract_id,
@@ -157,14 +172,6 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
 struct DueRow {
     id: Uuid,
     character_id: i64,
-}
-
-#[derive(Clone)]
-struct UpsertedContract {
-    contract_id: Uuid,
-    esi_contract_id: i64,
-    status: String,
-    status_changed: bool,
 }
 
 async fn poll_one_character(
@@ -226,9 +233,15 @@ async fn poll_one_character(
     let mut out: Vec<UpsertedContract> = Vec::new();
     let mut tx = pool.begin().await?;
     for c in &contracts {
-        if c.contract_type != "item_exchange" {
+        let Ok(contract_type) = c.contract_type.parse::<domain::ContractType>() else {
+            continue;
+        };
+        if contract_type != domain::ContractType::ItemExchange {
             continue;
         }
+        let Ok(status) = c.status.parse::<domain::ContractStatus>() else {
+            continue;
+        };
 
         let parties = resolve_contract_parties(
             &EsiContractParties {
@@ -262,11 +275,11 @@ async fn poll_one_character(
             assignee_user_id,
             issuer_principal_id: parties.issuer_principal_id,
             assignee_principal_id: parties.assignee_principal_id,
-            contract_type: c.contract_type.clone(),
-            status: c.status.clone(),
-            price_isk: Decimal::from_f64(c.price.unwrap_or(0.0)).unwrap_or(Decimal::ZERO),
-            reward_isk: Decimal::from_f64(c.reward.unwrap_or(0.0)).unwrap_or(Decimal::ZERO),
-            collateral_isk: Decimal::from_f64(c.collateral.unwrap_or(0.0)).unwrap_or(Decimal::ZERO),
+            contract_type,
+            status,
+            price_isk: isk_or_zero(c.price.unwrap_or(0.0)),
+            reward_isk: isk_or_zero(c.reward.unwrap_or(0.0)),
+            collateral_isk: isk_or_zero(c.collateral.unwrap_or(0.0)),
             date_issued: c.date_issued,
             date_expired: Some(c.date_expired),
             date_accepted: c.date_accepted,
@@ -317,15 +330,6 @@ async fn advance_cursor(
     .execute(pool)
     .await?;
     Ok(())
-}
-
-fn jitter_secs(base: u64) -> i64 {
-    if base == 0 {
-        return 0;
-    }
-    let span = (base / 10).max(1) as i64;
-    let r = rand::random::<u32>() as i64;
-    r.rem_euclid(2 * span + 1) - span
 }
 
 /// Sync items for contracts that still have `items_synced_at IS NULL`.
@@ -511,37 +515,4 @@ async fn sync_items_for(
 
     let _ = token_store.persist_rotations(token_rotation_char).await;
     Ok(true)
-}
-
-async fn handle_terminal_transition(ctx: &Ctx, u: &UpsertedContract) -> anyhow::Result<()> {
-    let parsed: domain::ContractStatus = match u.status.parse() {
-        Ok(s) => s,
-        Err(_) => return Ok(()),
-    };
-
-    if parsed.is_terminal_success() {
-        let mut tx = ctx.pool.begin().await?;
-        let bound: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM reimbursements WHERE contract_id = $1 AND status = 'pending'",
-        )
-        .bind(u.contract_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let settled = if bound > 0 {
-            settlement::settle_via_contract(&mut tx, u.contract_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("settle_via_contract: {e}"))?
-        } else {
-            vec![]
-        };
-        tx.commit().await?;
-        super::webhooks::fire_settlement_webhooks(&ctx.pool, &ctx.webhook_http, settled).await;
-    } else if parsed.is_terminal_failure() {
-        let mut tx = ctx.pool.begin().await?;
-        settlement::unbind_contract(&mut tx, u.contract_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("unbind_contract: {e}"))?;
-        tx.commit().await?;
-    }
-    Ok(())
 }

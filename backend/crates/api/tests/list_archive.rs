@@ -33,7 +33,7 @@ async fn archive_list_blocks_item_add(pool: PgPool) {
         .unwrap();
 
     // The status was applied at the DB level.
-    let status: String = sqlx::query_scalar("SELECT status FROM lists WHERE id = $1")
+    let status: String = sqlx::query_scalar("SELECT status::text FROM lists WHERE id = $1")
         .bind(ids.list_id)
         .fetch_one(&pool)
         .await
@@ -77,7 +77,7 @@ async fn unarchive_list_restores_mutability(pool: PgPool) {
         .await
         .unwrap();
 
-    let status: String = sqlx::query_scalar("SELECT status FROM lists WHERE id = $1")
+    let status: String = sqlx::query_scalar("SELECT status::text FROM lists WHERE id = $1")
         .bind(ids.list_id)
         .fetch_one(&pool)
         .await

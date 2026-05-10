@@ -9,9 +9,27 @@
 
 use auth_tokens::reencrypt_stale;
 
-use crate::Ctx;
+use super::{JobFuture, JobSlot};
+use crate::{Ctx, WorkerConfig};
 
 const BATCH: i64 = 100;
+/// Hourly sweep cadence. Active characters get rewritten on refresh; this
+/// drains the dormant tail.
+const INTERVAL_SECS: u64 = 3600;
+
+pub struct Job;
+
+impl JobSlot for Job {
+    fn name(&self) -> &'static str {
+        "token_reencrypt"
+    }
+    fn interval_secs(&self, _cfg: &WorkerConfig) -> u64 {
+        INTERVAL_SECS
+    }
+    fn run<'a>(&'a self, ctx: &'a Ctx) -> JobFuture<'a> {
+        Box::pin(run(ctx))
+    }
+}
 
 pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
     let cipher = ctx.token_store.cipher();

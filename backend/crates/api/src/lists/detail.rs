@@ -27,7 +27,7 @@ pub(crate) async fn load_list_detail(
     .await?
     .ok_or_else(ApiError::not_found)?;
     let group_id = list_row.group_id;
-    let list = list_row.into_list()?;
+    let list = list_row.into_list();
 
     let item_rows: Vec<ListItemRow> = sqlx::query_as(
         "SELECT id, list_id, type_id, type_name, qty_requested, qty_fulfilled, \
@@ -38,10 +38,7 @@ pub(crate) async fn load_list_detail(
     .bind(list_id)
     .fetch_all(&state.pool)
     .await?;
-    let items = item_rows
-        .into_iter()
-        .map(ListItemRow::into_item)
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let items: Vec<ListItem> = item_rows.into_iter().map(ListItemRow::into_item).collect();
 
     let market_rows: Vec<MarketWithPrimaryRow> = sqlx::query_as(
         "SELECT m.id, m.kind, m.esi_location_id, m.region_id, m.name, m.short_label, \
@@ -56,10 +53,10 @@ pub(crate) async fn load_list_detail(
         .iter()
         .find_map(|r| if r.is_primary { Some(r.id) } else { None })
         .ok_or_else(|| ApiError::internal(anyhow::anyhow!("list has no primary market")))?;
-    let markets = market_rows
+    let markets: Vec<Market> = market_rows
         .into_iter()
         .map(MarketWithPrimaryRow::into_market)
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect();
 
     let market_ids: Vec<Uuid> = markets.iter().map(|m| m.id).collect();
     let accessible: Vec<Uuid> = accessible_market_ids(&state.pool, group_id, &market_ids)
@@ -111,10 +108,7 @@ pub(crate) async fn load_list_detail(
     .bind(list_id)
     .fetch_all(&state.pool)
     .await?;
-    let claims = claim_rows
-        .into_iter()
-        .map(ClaimRow::into_claim)
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let claims: Vec<Claim> = claim_rows.into_iter().map(ClaimRow::into_claim).collect();
 
     // Non-reversed fulfillments only.
     let fulfillment_rows: Vec<FulfillmentRow> = sqlx::query_as(
@@ -136,10 +130,10 @@ pub(crate) async fn load_list_detail(
     .bind(list_id)
     .fetch_all(&state.pool)
     .await?;
-    let fulfillments = fulfillment_rows
+    let fulfillments: Vec<Fulfillment> = fulfillment_rows
         .into_iter()
         .map(FulfillmentRow::into_fulfillment)
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect();
 
     let reimbursement_rows: Vec<ReimbursementRow> = sqlx::query_as(
         r#"
@@ -171,10 +165,10 @@ pub(crate) async fn load_list_detail(
     .bind(list_id)
     .fetch_all(&state.pool)
     .await?;
-    let reimbursements = reimbursement_rows
+    let reimbursements: Vec<Reimbursement> = reimbursement_rows
         .into_iter()
         .map(ReimbursementRow::into_reimbursement)
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect();
 
     let last_hauler_character_id: Option<Uuid> = sqlx::query_scalar(
         r#"
@@ -220,7 +214,7 @@ struct ListRow {
     created_by_user_id: Uuid,
     destination_label: Option<String>,
     notes: Option<String>,
-    status: String,
+    status: ListStatus,
     total_estimate_isk: Decimal,
     tip_pct: Decimal,
     created_at: DateTime<Utc>,
@@ -230,25 +224,21 @@ struct ListRow {
 }
 
 impl ListRow {
-    fn into_list(self) -> anyhow::Result<List> {
-        let status = self
-            .status
-            .parse::<ListStatus>()
-            .map_err(anyhow::Error::msg)?;
-        Ok(List {
+    fn into_list(self) -> List {
+        List {
             id: self.id,
             group_id: self.group_id,
             created_by_user_id: self.created_by_user_id,
             destination_label: self.destination_label,
             notes: self.notes,
-            status,
+            status: self.status,
             total_estimate_isk: self.total_estimate_isk,
             tip_pct: self.tip_pct,
             created_at: self.created_at,
             updated_at: self.updated_at,
             payer_corp_id: self.payer_corp_id,
             payer_division: self.payer_division,
-        })
+        }
     }
 }
 
@@ -262,18 +252,14 @@ struct ListItemRow {
     qty_fulfilled: i64,
     est_unit_price_isk: Option<Decimal>,
     est_priced_market_id: Option<Uuid>,
-    status: String,
+    status: ListItemStatus,
     source_line_no: Option<i32>,
     requested_by_user_id: Uuid,
 }
 
 impl ListItemRow {
-    fn into_item(self) -> anyhow::Result<ListItem> {
-        let status = self
-            .status
-            .parse::<ListItemStatus>()
-            .map_err(anyhow::Error::msg)?;
-        Ok(ListItem {
+    fn into_item(self) -> ListItem {
+        ListItem {
             id: self.id,
             list_id: self.list_id,
             type_id: self.type_id,
@@ -282,17 +268,17 @@ impl ListItemRow {
             qty_fulfilled: self.qty_fulfilled,
             est_unit_price_isk: self.est_unit_price_isk,
             est_priced_market_id: self.est_priced_market_id,
-            status,
+            status: self.status,
             source_line_no: self.source_line_no,
             requested_by_user_id: self.requested_by_user_id,
-        })
+        }
     }
 }
 
 #[derive(sqlx::FromRow)]
 struct MarketWithPrimaryRow {
     id: Uuid,
-    kind: String,
+    kind: MarketKind,
     esi_location_id: i64,
     region_id: Option<i64>,
     name: Option<String>,
@@ -303,21 +289,17 @@ struct MarketWithPrimaryRow {
 }
 
 impl MarketWithPrimaryRow {
-    fn into_market(self) -> anyhow::Result<Market> {
-        let kind = self
-            .kind
-            .parse::<MarketKind>()
-            .map_err(anyhow::Error::msg)?;
-        Ok(Market {
+    fn into_market(self) -> Market {
+        Market {
             id: self.id,
-            kind,
+            kind: self.kind,
             esi_location_id: self.esi_location_id,
             region_id: self.region_id,
             name: self.name,
             short_label: self.short_label,
             is_hub: self.is_hub,
             is_public: self.is_public,
-        })
+        }
     }
 }
 
@@ -352,7 +334,7 @@ pub(crate) struct ClaimRow {
     pub list_id: Uuid,
     pub hauler_user_id: Uuid,
     pub hauler_display_name: String,
-    pub status: String,
+    pub status: ClaimStatus,
     pub note: Option<String>,
     pub item_ids: Option<Vec<Uuid>>,
     pub created_at: DateTime<Utc>,
@@ -360,22 +342,18 @@ pub(crate) struct ClaimRow {
 }
 
 impl ClaimRow {
-    pub(crate) fn into_claim(self) -> anyhow::Result<Claim> {
-        let status = self
-            .status
-            .parse::<ClaimStatus>()
-            .map_err(anyhow::Error::msg)?;
-        Ok(Claim {
+    pub(crate) fn into_claim(self) -> Claim {
+        Claim {
             id: self.id,
             list_id: self.list_id,
             hauler_user_id: self.hauler_user_id,
             hauler_display_name: self.hauler_display_name,
-            status,
+            status: self.status,
             note: self.note,
             item_ids: self.item_ids.unwrap_or_default(),
             created_at: self.created_at,
             released_at: self.released_at,
-        })
+        }
     }
 }
 
@@ -386,7 +364,7 @@ pub(crate) struct FulfillmentRow {
     pub claim_id: Option<Uuid>,
     pub hauler_user_id: Uuid,
     pub hauler_character_id: Option<Uuid>,
-    pub source: String,
+    pub source: FulfillmentSource,
     pub qty: i64,
     pub unit_price_isk: Decimal,
     pub bought_at_market_id: Option<Uuid>,
@@ -398,19 +376,15 @@ pub(crate) struct FulfillmentRow {
 }
 
 impl FulfillmentRow {
-    pub(crate) fn into_fulfillment(self) -> anyhow::Result<Fulfillment> {
-        let source = self
-            .source
-            .parse::<FulfillmentSource>()
-            .map_err(anyhow::Error::msg)?;
-        Ok(Fulfillment {
+    pub(crate) fn into_fulfillment(self) -> Fulfillment {
+        Fulfillment {
             id: self.id,
             list_item_id: self.list_item_id,
             claim_id: self.claim_id,
             hauler_user_id: self.hauler_user_id,
             hauler_character_id: self.hauler_character_id,
             hauler_character_name: self.hauler_character_name,
-            source,
+            source: self.source,
             qty: self.qty,
             unit_price_isk: self.unit_price_isk,
             bought_at_market_id: self.bought_at_market_id,
@@ -418,7 +392,7 @@ impl FulfillmentRow {
             bought_at_note: self.bought_at_note,
             bought_at: self.bought_at,
             reversed_at: self.reversed_at,
-        })
+        }
     }
 }
 
@@ -431,7 +405,7 @@ pub(crate) struct ReimbursementRow {
     pub subtotal_isk: Decimal,
     pub tip_isk: Decimal,
     pub total_isk: Decimal,
-    pub status: String,
+    pub status: ReimbursementStatus,
     pub settled_at: Option<DateTime<Utc>>,
     pub settled_by_user_id: Option<Uuid>,
     pub contract_id: Option<Uuid>,
@@ -440,7 +414,7 @@ pub(crate) struct ReimbursementRow {
     pub requester_display_name: String,
     pub hauler_display_name: String,
     pub contract_esi_contract_id: Option<i64>,
-    pub contract_status: Option<String>,
+    pub contract_status: Option<domain::ContractStatus>,
     pub contract_price_isk: Option<Decimal>,
     pub contract_expected_total_isk: Option<Decimal>,
     pub contract_settlement_delta_isk: Option<Decimal>,
@@ -453,32 +427,23 @@ pub(crate) struct ReimbursementRow {
 }
 
 impl ReimbursementRow {
-    pub(crate) fn into_reimbursement(self) -> anyhow::Result<Reimbursement> {
-        let status = self
-            .status
-            .parse::<ReimbursementStatus>()
-            .map_err(anyhow::Error::msg)?;
+    pub(crate) fn into_reimbursement(self) -> Reimbursement {
         let contract = match (
             self.contract_esi_contract_id,
-            self.contract_status.as_deref(),
+            self.contract_status,
             self.contract_price_isk,
         ) {
-            (Some(esi_id), Some(status_str), Some(price)) => {
-                let cstatus = status_str
-                    .parse::<domain::ContractStatus>()
-                    .map_err(anyhow::Error::msg)?;
-                Some(domain::ContractSummary {
-                    esi_contract_id: esi_id,
-                    status: cstatus,
-                    price_isk: price,
-                    expected_total_isk: self.contract_expected_total_isk,
-                    settlement_delta_isk: self.contract_settlement_delta_isk,
-                    date_completed: self.contract_date_completed,
-                })
-            }
+            (Some(esi_id), Some(cstatus), Some(price)) => Some(domain::ContractSummary {
+                esi_contract_id: esi_id,
+                status: cstatus,
+                price_isk: price,
+                expected_total_isk: self.contract_expected_total_isk,
+                settlement_delta_isk: self.contract_settlement_delta_isk,
+                date_completed: self.contract_date_completed,
+            }),
             _ => None,
         };
-        Ok(Reimbursement {
+        Reimbursement {
             id: self.id,
             list_id: self.list_id,
             requester_user_id: self.requester_user_id,
@@ -488,7 +453,7 @@ impl ReimbursementRow {
             subtotal_isk: self.subtotal_isk,
             tip_isk: self.tip_isk,
             total_isk: self.total_isk,
-            status,
+            status: self.status,
             settled_at: self.settled_at,
             settled_by_user_id: self.settled_by_user_id,
             contract_id: self.contract_id,
@@ -500,6 +465,6 @@ impl ReimbursementRow {
             is_corp_funded: self.is_corp_funded,
             verified_by_wallet: self.verified_by_wallet,
             wallet_settlement_delta_isk: self.wallet_settlement_delta_isk,
-        })
+        }
     }
 }

@@ -89,9 +89,10 @@ async fn create(
     }
     let group = group_row.ok_or_else(invite_exhausted)?.into_group();
 
-    sqlx::query("INSERT INTO group_memberships (user_id, group_id, role) VALUES ($1, $2, 'owner')")
+    sqlx::query("INSERT INTO group_memberships (user_id, group_id, role) VALUES ($1, $2, $3)")
         .bind(user_id)
         .bind(group.id)
+        .bind(GroupRole::Owner)
         .execute(&mut *tx)
         .await?;
 
@@ -120,9 +121,7 @@ async fn list(
     .await?;
 
     Ok(Json(
-        rows.into_iter()
-            .map(GroupListRow::into_summary)
-            .collect::<anyhow::Result<Vec<_>>>()?,
+        rows.into_iter().map(GroupListRow::into_summary).collect(),
     ))
 }
 
@@ -152,10 +151,10 @@ async fn detail(
     let (group, member_rows) = tokio::try_join!(group_q, members_q)?;
     let group = group.ok_or_else(ApiError::not_found)?.into_group();
 
-    let members = member_rows
+    let members: Vec<GroupMember> = member_rows
         .into_iter()
         .map(MemberRow::into_member)
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect();
 
     Ok(Json(GroupDetail {
         group,
@@ -182,15 +181,13 @@ async fn leave(
     let role = memberships
         .iter()
         .find(|m| m.user_id == user_id)
-        .map(|m| m.role.as_str())
-        .ok_or_else(|| ApiError::Forbidden("you are not a member of this group".into()))?
-        .parse::<GroupRole>()
-        .map_err(|e| ApiError::internal(anyhow::anyhow!(e)))?;
+        .map(|m| m.role)
+        .ok_or_else(|| ApiError::Forbidden("you are not a member of this group".into()))?;
 
     if role == GroupRole::Owner {
         let other_owners = memberships
             .iter()
-            .filter(|m| m.user_id != user_id && m.role == GroupRole::Owner.as_str())
+            .filter(|m| m.user_id != user_id && m.role == GroupRole::Owner)
             .count();
         if other_owners == 0 {
             return Err(ApiError::BadRequest(
@@ -361,14 +358,13 @@ struct GroupListRow {
     created_by_user_id: Uuid,
     created_at: DateTime<Utc>,
     default_tip_pct: Decimal,
-    role: String,
+    role: GroupRole,
     member_count: i64,
 }
 
 impl GroupListRow {
-    fn into_summary(self) -> anyhow::Result<GroupSummary> {
-        let role = self.role.parse::<GroupRole>().map_err(anyhow::Error::msg)?;
-        Ok(GroupSummary {
+    fn into_summary(self) -> GroupSummary {
+        GroupSummary {
             group: Group {
                 id: self.id,
                 name: self.name,
@@ -377,9 +373,9 @@ impl GroupListRow {
                 created_at: self.created_at,
                 default_tip_pct: self.default_tip_pct,
             },
-            role,
+            role: self.role,
             member_count: self.member_count,
-        })
+        }
     }
 }
 
@@ -387,24 +383,23 @@ impl GroupListRow {
 struct MemberRow {
     user_id: Uuid,
     display_name: String,
-    role: String,
+    role: GroupRole,
     joined_at: DateTime<Utc>,
 }
 
 #[derive(sqlx::FromRow)]
 struct MembershipLockRow {
     user_id: Uuid,
-    role: String,
+    role: GroupRole,
 }
 
 impl MemberRow {
-    fn into_member(self) -> anyhow::Result<GroupMember> {
-        let role = self.role.parse::<GroupRole>().map_err(anyhow::Error::msg)?;
-        Ok(GroupMember {
+    fn into_member(self) -> GroupMember {
+        GroupMember {
             user_id: self.user_id,
             display_name: self.display_name,
-            role,
+            role: self.role,
             joined_at: self.joined_at,
-        })
+        }
     }
 }

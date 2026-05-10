@@ -128,7 +128,8 @@ mod tests {
     #[tokio::test]
     async fn budgeted_preserves_error_value() {
         let g = EsiBudgetGuard::new(10, 5);
-        let v: Result<(), String> = budgeted(&g, async { Err("specific message".to_string()) }).await;
+        let v: Result<(), String> =
+            budgeted(&g, async { Err("specific message".to_string()) }).await;
         assert_eq!(v.unwrap_err(), "specific message");
     }
 }

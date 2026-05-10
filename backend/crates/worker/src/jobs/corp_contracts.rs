@@ -15,18 +15,34 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use nea_esi::{EsiContract, EsiError};
-use rust_decimal::prelude::FromPrimitive;
-use rust_decimal::Decimal;
 use serde_json::Value;
 use settlement::ContractUpsert;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use domain::principals::{resolve_contract_parties, EsiContractParties};
-use domain::{Principal, PrincipalIndex, PrincipalKind};
+use super::contracts_common::{
+    build_principal_index, find_user_for_principal, handle_contract_terminal, UpsertedContract,
+};
+use super::{isk_or_zero, jitter_secs, JobFuture, JobSlot};
 
-use crate::Ctx;
+use domain::principals::{resolve_contract_parties, EsiContractParties};
+
+use crate::{Ctx, WorkerConfig};
+
+pub struct Job;
+
+impl JobSlot for Job {
+    fn name(&self) -> &'static str {
+        "corp_contracts"
+    }
+    fn interval_secs(&self, cfg: &WorkerConfig) -> u64 {
+        cfg.worker.tick_secs
+    }
+    fn run<'a>(&'a self, ctx: &'a Ctx) -> JobFuture<'a> {
+        Box::pin(run(ctx))
+    }
+}
 
 pub(crate) const CORP_CONTRACTS_SCOPE: &str = "esi-contracts.read_corporation_contracts.v1";
 /// Exponential back-off ceiling when all ambassadors fail: 24 hours.
@@ -127,21 +143,15 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
         }
     }
 
-    // Sync items for any contracts still missing them (corp ambassador path).
-    let synced_ids = super::contracts::sync_pending_items(ctx)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = ?e, "corp_contracts items sync failed");
-            Vec::new()
-        });
-
-    // Run matcher for newly-upserted contracts plus those whose items just landed.
-    let mut candidate_ids: Vec<Uuid> = all_upserts.iter().map(|u| u.contract_id).collect();
-    for id in &synced_ids {
-        if !candidate_ids.contains(id) {
-            candidate_ids.push(*id);
-        }
-    }
+    // Items sync is owned by the character-side `contracts::run`, which picks up
+    // any contract with `items_synced_at IS NULL` regardless of source. Items for
+    // corp-discovered contracts will land within one tick of the character job.
+    let candidate_ids: Vec<Uuid> = all_upserts
+        .iter()
+        .map(|u| u.contract_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     if !candidate_ids.is_empty() {
         if let Err(e) =
             super::contracts::r#match::run_for_contracts(&ctx.pool, &candidate_ids).await
@@ -154,7 +164,7 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
         if !u.status_changed {
             continue;
         }
-        if let Err(e) = handle_terminal(ctx, &u).await {
+        if let Err(e) = handle_contract_terminal(ctx, &u).await {
             tracing::warn!(
                 error = ?e,
                 esi_contract_id = u.esi_contract_id,
@@ -164,14 +174,6 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-#[derive(Clone)]
-struct UpsertedContract {
-    contract_id: Uuid,
-    esi_contract_id: i64,
-    status: String,
-    status_changed: bool,
 }
 
 async fn poll_one_corp(
@@ -311,9 +313,15 @@ async fn poll_one_corp(
     let mut tx = pool.begin().await?;
 
     for c in &contracts {
-        if c.contract_type != "item_exchange" {
+        let Ok(contract_type) = c.contract_type.parse::<domain::ContractType>() else {
+            continue;
+        };
+        if contract_type != domain::ContractType::ItemExchange {
             continue;
         }
+        let Ok(status) = c.status.parse::<domain::ContractStatus>() else {
+            continue;
+        };
 
         // Affiliation guard: keep contracts where the polled corp is issuer OR assignee
         // (a hauler may issue a contract *to* the corp for corp-funded reimbursements).
@@ -358,11 +366,11 @@ async fn poll_one_corp(
             assignee_user_id,
             issuer_principal_id: parties.issuer_principal_id,
             assignee_principal_id: parties.assignee_principal_id,
-            contract_type: c.contract_type.clone(),
-            status: c.status.clone(),
-            price_isk: Decimal::from_f64(c.price.unwrap_or(0.0)).unwrap_or(Decimal::ZERO),
-            reward_isk: Decimal::from_f64(c.reward.unwrap_or(0.0)).unwrap_or(Decimal::ZERO),
-            collateral_isk: Decimal::from_f64(c.collateral.unwrap_or(0.0)).unwrap_or(Decimal::ZERO),
+            contract_type,
+            status,
+            price_isk: isk_or_zero(c.price.unwrap_or(0.0)),
+            reward_isk: isk_or_zero(c.reward.unwrap_or(0.0)),
+            collateral_isk: isk_or_zero(c.collateral.unwrap_or(0.0)),
             date_issued: c.date_issued,
             date_expired: Some(c.date_expired),
             date_accepted: c.date_accepted,
@@ -408,141 +416,5 @@ async fn advance_corp_cursor(
     .bind(corp_id)
     .execute(pool)
     .await?;
-    Ok(())
-}
-
-fn jitter_secs(base: u64) -> i64 {
-    if base == 0 {
-        return 0;
-    }
-    let span = (base / 10).max(1) as i64;
-    let r = rand::random::<u32>() as i64;
-    r.rem_euclid(2 * span + 1) - span
-}
-
-/// Build a lightweight `PrincipalIndex` for a slice of EVE entity ids.
-pub(crate) async fn build_principal_index(
-    pool: &PgPool,
-    eve_ids: &[i64],
-) -> anyhow::Result<PrincipalIndex> {
-    let mut idx = PrincipalIndex::default();
-    if eve_ids.is_empty() {
-        return Ok(idx);
-    }
-
-    // Characters → users.
-    let char_rows: Vec<(i64, Uuid)> = sqlx::query_as(
-        "SELECT character_id, user_id FROM characters WHERE character_id = ANY($1::bigint[])",
-    )
-    .bind(eve_ids)
-    .fetch_all(pool)
-    .await?;
-
-    let user_ids: Vec<Uuid> = char_rows.iter().map(|(_, uid)| *uid).collect();
-    let user_principals: Vec<(Uuid, Uuid)> = if user_ids.is_empty() {
-        Vec::new()
-    } else {
-        sqlx::query_as(
-            "SELECT id, user_id FROM principals \
-             WHERE kind = 'user' AND user_id = ANY($1::uuid[])",
-        )
-        .bind(&user_ids)
-        .fetch_all(pool)
-        .await?
-    };
-
-    for (char_id, user_id) in char_rows {
-        if let Some((pid, _)) = user_principals.iter().find(|(_, uid)| *uid == user_id) {
-            idx.add_user(
-                char_id,
-                user_id,
-                Principal {
-                    id: *pid,
-                    kind: PrincipalKind::User,
-                    user_id: Some(user_id),
-                    corp_id: None,
-                },
-            );
-        }
-    }
-
-    // Corps.
-    let corp_rows: Vec<(i64, Uuid)> = sqlx::query_as(
-        "SELECT esi_corporation_id, id FROM corps \
-         WHERE esi_corporation_id = ANY($1::bigint[])",
-    )
-    .bind(eve_ids)
-    .fetch_all(pool)
-    .await?;
-
-    let corp_ids: Vec<Uuid> = corp_rows.iter().map(|(_, cid)| *cid).collect();
-    let corp_principals: Vec<(Uuid, Uuid)> = if corp_ids.is_empty() {
-        Vec::new()
-    } else {
-        sqlx::query_as(
-            "SELECT id, corp_id FROM principals \
-             WHERE kind = 'corp' AND corp_id = ANY($1::uuid[])",
-        )
-        .bind(&corp_ids)
-        .fetch_all(pool)
-        .await?
-    };
-
-    for (esi_corp_id, corp_id) in corp_rows {
-        if let Some((pid, _)) = corp_principals.iter().find(|(_, cid)| *cid == corp_id) {
-            idx.add_corp(
-                esi_corp_id,
-                corp_id,
-                Principal {
-                    id: *pid,
-                    kind: PrincipalKind::Corp,
-                    user_id: None,
-                    corp_id: Some(corp_id),
-                },
-            );
-        }
-    }
-
-    Ok(idx)
-}
-
-pub(crate) fn find_user_for_principal(idx: &PrincipalIndex, principal_id: Uuid) -> Option<Uuid> {
-    idx.principal_by_user_id
-        .values()
-        .find(|p| p.id == principal_id)
-        .and_then(|p| p.user_id)
-}
-
-async fn handle_terminal(ctx: &Ctx, u: &UpsertedContract) -> anyhow::Result<()> {
-    let parsed: domain::ContractStatus = match u.status.parse() {
-        Ok(s) => s,
-        Err(_) => return Ok(()),
-    };
-
-    if parsed.is_terminal_success() {
-        let mut tx = ctx.pool.begin().await?;
-        let bound: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM reimbursements \
-             WHERE contract_id = $1 AND status = 'pending'",
-        )
-        .bind(u.contract_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let settled = if bound > 0 {
-            settlement::settle_via_contract(&mut tx, u.contract_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("settle_via_contract: {e}"))?
-        } else {
-            vec![]
-        };
-        tx.commit().await?;
-        super::webhooks::fire_settlement_webhooks(&ctx.pool, &ctx.webhook_http, settled).await;
-    } else if parsed.is_terminal_failure() {
-        let mut tx = ctx.pool.begin().await?;
-        settlement::unbind_contract(&mut tx, u.contract_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("unbind_contract: {e}"))?;
-        tx.commit().await?;
-    }
     Ok(())
 }

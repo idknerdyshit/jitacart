@@ -58,9 +58,10 @@ pub async fn insert_group(pool: &PgPool, owner: Uuid, name: &str) -> Uuid {
     .fetch_one(pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO group_memberships (user_id, group_id, role) VALUES ($1, $2, 'owner')")
+    sqlx::query("INSERT INTO group_memberships (user_id, group_id, role) VALUES ($1, $2, $3)")
         .bind(owner)
         .bind(id)
+        .bind(domain::GroupRole::Owner)
         .execute(pool)
         .await
         .unwrap();
@@ -181,7 +182,7 @@ pub async fn insert_fulfillment(
 }
 
 pub async fn set_item_status(pool: &PgPool, item_id: Uuid, status: &str) {
-    sqlx::query("UPDATE list_items SET status = $1 WHERE id = $2")
+    sqlx::query("UPDATE list_items SET status = $1::list_item_status WHERE id = $2")
         .bind(status)
         .bind(item_id)
         .execute(pool)
@@ -190,7 +191,7 @@ pub async fn set_item_status(pool: &PgPool, item_id: Uuid, status: &str) {
 }
 
 pub async fn get_item_status(pool: &PgPool, item_id: Uuid) -> String {
-    sqlx::query_scalar("SELECT status FROM list_items WHERE id = $1")
+    sqlx::query_scalar("SELECT status::text FROM list_items WHERE id = $1")
         .bind(item_id)
         .fetch_one(pool)
         .await
@@ -198,7 +199,7 @@ pub async fn get_item_status(pool: &PgPool, item_id: Uuid) -> String {
 }
 
 pub async fn get_reimb_status(pool: &PgPool, id: Uuid) -> String {
-    sqlx::query_scalar("SELECT status FROM reimbursements WHERE id = $1")
+    sqlx::query_scalar("SELECT status::text FROM reimbursements WHERE id = $1")
         .bind(id)
         .fetch_one(pool)
         .await
@@ -218,16 +219,12 @@ pub async fn insert_contract(
     issuer_user_id: Uuid,
     assignee_user_id: Uuid,
     price_isk: Decimal,
-    status: &str,
+    status: domain::ContractStatus,
     items_synced: bool,
 ) -> ContractFixture {
     let esi_id: i64 = chrono::Utc::now().timestamp_micros() & 0x7fff_ffff_ffff_ffff;
     let now = chrono::Utc::now();
-    let date_completed = matches!(
-        status,
-        "finished" | "finished_issuer" | "finished_contractor"
-    )
-    .then_some(now);
+    let date_completed = status.is_terminal_success().then_some(now);
 
     // Look up principals for the test users.
     let issuer_pid = get_user_principal_id(pool, issuer_user_id).await;
@@ -241,8 +238,8 @@ pub async fn insert_contract(
         assignee_user_id: Some(assignee_user_id),
         issuer_principal_id: Some(issuer_pid),
         assignee_principal_id: Some(assignee_pid),
-        contract_type: "item_exchange".into(),
-        status: status.into(),
+        contract_type: domain::ContractType::ItemExchange,
+        status,
         price_isk,
         reward_isk: Decimal::ZERO,
         collateral_isk: Decimal::ZERO,
@@ -295,7 +292,7 @@ pub async fn insert_suggestion(
     sqlx::query_scalar(
         "INSERT INTO contract_match_suggestions \
          (contract_id, reimbursement_id, score, exact_match, state) \
-         VALUES ($1, $2, 1.0, true, $3) RETURNING id",
+         VALUES ($1, $2, 1.0, true, $3::contract_match_state) RETURNING id",
     )
     .bind(contract_id)
     .bind(reimbursement_id)

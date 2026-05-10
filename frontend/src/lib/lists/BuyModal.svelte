@@ -96,13 +96,37 @@
         useOther = true;
         selectedMarketId = null;
     }
+
+    let firstInputEl = $state<HTMLInputElement | null>(null);
+    function onModalMount(node: HTMLDivElement) {
+        // Defer to after layout so the input is in the DOM.
+        queueMicrotask(() => firstInputEl?.focus());
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') {
+                e.stopPropagation();
+                onClose();
+            }
+        };
+        node.addEventListener('keydown', onKey);
+        return {
+            destroy: () => node.removeEventListener('keydown', onKey)
+        };
+    }
 </script>
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="backdrop" onclick={onClose}>
-    <div class="modal" onclick={(e) => e.stopPropagation()}>
-        <h2>Record buy: {item.type_name}</h2>
+    <div
+        class="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="buy-modal-title"
+        tabindex="-1"
+        use:onModalMount
+        onclick={(e) => e.stopPropagation()}
+    >
+        <h2 id="buy-modal-title">Record buy: {item.type_name}</h2>
         <p class="muted">Remaining: {remaining.toLocaleString()} × {item.type_name}</p>
 
         {#if errMsg}
@@ -111,7 +135,13 @@
 
         <label>
             Qty bought
-            <input type="number" min="1" max={remaining} bind:value={qty} />
+            <input
+                type="number"
+                min="1"
+                max={remaining}
+                bind:value={qty}
+                bind:this={firstInputEl}
+            />
         </label>
 
         <label>

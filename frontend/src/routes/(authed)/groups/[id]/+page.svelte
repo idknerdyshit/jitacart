@@ -24,29 +24,37 @@
     let tipInput = $state('');
     let savingTip = $state(false);
 
-    let webhook = $state<WebhookConfig | null>(null);
+    const emptyDraft = (): WebhookConfig => ({
+        webhook_url: '',
+        notify_list_created: true,
+        notify_list_claimed: true,
+        notify_list_delivered: true,
+        notify_reimbursement_settled: true
+    });
+
     let webhookLoaded = $state(false);
-    let webhookUrl = $state('');
-    let whListCreated = $state(true);
-    let whListClaimed = $state(true);
-    let whListDelivered = $state(true);
-    let whReimbSettled = $state(true);
     let savingWebhook = $state(false);
+    let draft = $state<WebhookConfig>(emptyDraft());
+    let savedSnapshot = $state<WebhookConfig | null>(null);
+    const dirty = $derived(
+        savedSnapshot === null
+            ? draft.webhook_url.trim().length > 0
+            : draft.webhook_url !== savedSnapshot.webhook_url ||
+              draft.notify_list_created !== savedSnapshot.notify_list_created ||
+              draft.notify_list_claimed !== savedSnapshot.notify_list_claimed ||
+              draft.notify_list_delivered !== savedSnapshot.notify_list_delivered ||
+              draft.notify_reimbursement_settled !== savedSnapshot.notify_reimbursement_settled
+    );
 
     const groupId = $derived(page.params.id);
 
     async function load() {
         error = null;
-        const res = await fetch(`/api/groups/${groupId}`, { credentials: 'include' });
-        if (res.status === 401) {
-            goto('/');
-            return;
+        try {
+            detail = await api<Detail>(`/groups/${groupId}`);
+        } catch (e) {
+            error = (e as Error).message;
         }
-        if (!res.ok) {
-            error = `HTTP ${res.status}`;
-            return;
-        }
-        detail = await res.json();
     }
 
     onMount(async () => {
@@ -55,12 +63,8 @@
             try {
                 const cfg = await api<WebhookConfig | null>(`/groups/${groupId}/webhook`);
                 if (cfg) {
-                    webhook = cfg;
-                    webhookUrl = cfg.webhook_url;
-                    whListCreated = cfg.notify_list_created;
-                    whListClaimed = cfg.notify_list_claimed;
-                    whListDelivered = cfg.notify_list_delivered;
-                    whReimbSettled = cfg.notify_reimbursement_settled;
+                    savedSnapshot = cfg;
+                    draft = { ...cfg };
                 }
             } catch {
                 // non-fatal
@@ -82,31 +86,26 @@
     async function rotateInvite() {
         if (!detail) return;
         if (!confirm('Rotate the invite code? Existing links will stop working.')) return;
-        const res = await fetch(`/api/groups/${groupId}/rotate-invite`, {
-            method: 'POST',
-            credentials: 'include'
-        });
-        if (!res.ok) {
-            error = await res.text();
-            return;
+        try {
+            const updated = await api<Group>(`/groups/${groupId}/rotate-invite`, {
+                method: 'POST'
+            });
+            detail = { ...detail, group: updated };
+            toast.success('Invite code rotated');
+        } catch (e) {
+            error = (e as Error).message;
         }
-        const updated: Group = await res.json();
-        detail = { ...detail, group: updated };
-        toast.success('Invite code rotated');
     }
 
     async function leave() {
         if (!detail) return;
         if (!confirm(`Leave "${detail.group.name}"?`)) return;
-        const res = await fetch(`/api/groups/${groupId}/leave`, {
-            method: 'POST',
-            credentials: 'include'
-        });
-        if (!res.ok) {
-            error = await res.text();
-            return;
+        try {
+            await api(`/groups/${groupId}/leave`, { method: 'POST' });
+            goto('/groups');
+        } catch (e) {
+            error = (e as Error).message;
         }
-        goto('/groups');
     }
 
     async function deleteGroup() {
@@ -118,15 +117,12 @@
         ) {
             return;
         }
-        const res = await fetch(`/api/groups/${groupId}`, {
-            method: 'DELETE',
-            credentials: 'include'
-        });
-        if (!res.ok) {
-            error = await res.text();
-            return;
+        try {
+            await api(`/groups/${groupId}`, { method: 'DELETE' });
+            goto('/groups');
+        } catch (e) {
+            error = (e as Error).message;
         }
-        goto('/groups');
     }
 
     function startEditTip() {
@@ -139,17 +135,13 @@
         if (savingWebhook) return;
         savingWebhook = true;
         try {
-            webhook = await api<WebhookConfig>(`/groups/${groupId}/webhook`, {
+            const saved = await api<WebhookConfig>(`/groups/${groupId}/webhook`, {
                 method: 'PUT',
                 headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({
-                    webhook_url: webhookUrl,
-                    notify_list_created: whListCreated,
-                    notify_list_claimed: whListClaimed,
-                    notify_list_delivered: whListDelivered,
-                    notify_reimbursement_settled: whReimbSettled
-                })
+                body: JSON.stringify(draft)
             });
+            savedSnapshot = saved;
+            draft = { ...saved };
             toast.success('Webhook saved');
         } catch (e) {
             error = (e as Error).message;
@@ -163,8 +155,8 @@
         if (!confirm('Remove the Discord webhook?')) return;
         try {
             await api(`/groups/${groupId}/webhook`, { method: 'DELETE' });
-            webhook = null;
-            webhookUrl = '';
+            savedSnapshot = null;
+            draft = emptyDraft();
             toast.success('Webhook removed');
         } catch (e) {
             error = (e as Error).message;
@@ -272,21 +264,25 @@
                 <input
                     type="text"
                     placeholder="https://discord.com/api/webhooks/..."
-                    bind:value={webhookUrl}
+                    bind:value={draft.webhook_url}
                     class="wh-url"
                 />
             </label>
             <div class="wh-toggles">
-                <label><input type="checkbox" bind:checked={whListCreated} /> List created</label>
-                <label><input type="checkbox" bind:checked={whListClaimed} /> List claimed</label>
-                <label><input type="checkbox" bind:checked={whListDelivered} /> List delivered</label>
-                <label><input type="checkbox" bind:checked={whReimbSettled} /> Reimbursement settled</label>
+                <label><input type="checkbox" bind:checked={draft.notify_list_created} /> List created</label>
+                <label><input type="checkbox" bind:checked={draft.notify_list_claimed} /> List claimed</label>
+                <label><input type="checkbox" bind:checked={draft.notify_list_delivered} /> List delivered</label>
+                <label><input type="checkbox" bind:checked={draft.notify_reimbursement_settled} /> Reimbursement settled</label>
             </div>
             <div class="actions">
-                <button class="primary" disabled={savingWebhook || !webhookUrl.trim()} onclick={saveWebhook}>
+                <button
+                    class="primary"
+                    disabled={savingWebhook || !draft.webhook_url.trim() || !dirty}
+                    onclick={saveWebhook}
+                >
                     {savingWebhook ? 'Saving…' : 'Save'}
                 </button>
-                {#if webhook}
+                {#if savedSnapshot}
                     <button class="danger" onclick={removeWebhook}>Remove</button>
                 {/if}
             </div>

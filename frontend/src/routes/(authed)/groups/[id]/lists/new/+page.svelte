@@ -1,18 +1,18 @@
 <script lang="ts">
-    import { onMount } from 'svelte';
+    import { onDestroy, onMount } from 'svelte';
     import { goto } from '$app/navigation';
     import { page } from '$app/state';
     import {
         api,
         fmtIsk,
+        isMarketStale,
+        isPriceStale,
         type GroupMarket,
         type PreviewResponse,
         type ListDetail
     } from '$lib/api';
 
     const groupId = $derived(page.params.id);
-    // 2× the citadel-orders cadence (default 600s) is the staleness gate.
-    const STALE_AFTER_MS = 2 * 600 * 1000;
 
     let markets = $state<GroupMarket[] | null>(null);
     let selectedIds = $state<Set<string>>(new Set());
@@ -41,13 +41,6 @@
         }
     });
 
-    function isStale(m: GroupMarket): boolean {
-        if (!m.is_public) return true;
-        if (m.kind !== 'public_structure') return false;
-        if (!m.last_orders_synced_at) return true;
-        return Date.now() - new Date(m.last_orders_synced_at).getTime() > STALE_AFTER_MS;
-    }
-
     function toggleMarket(id: string) {
         const next = new Set(selectedIds);
         if (next.has(id)) {
@@ -70,6 +63,11 @@
         if (debounceTimer) clearTimeout(debounceTimer);
         debounceTimer = setTimeout(runPreview, 300);
     }
+
+    onDestroy(() => {
+        // Don't fire a debounced preview after the component is gone.
+        if (debounceTimer) clearTimeout(debounceTimer);
+    });
 
     async function runPreview() {
         if (!multibuy.trim() || selectedIds.size === 0) {
@@ -167,11 +165,11 @@
                 <button
                     class="chip"
                     class:selected={selectedIds.has(m.id)}
-                    class:stale={isStale(m)}
+                    class:stale={isMarketStale(m)}
                     onclick={() => toggleMarket(m.id)}
                     type="button"
                     title={m.kind === 'public_structure'
-                        ? `${m.name ?? '(unnamed)'}${m.accessing_character_name ? ` · via ${m.accessing_character_name}` : ''}${isStale(m) ? ' · stale' : ''}`
+                        ? `${m.name ?? '(unnamed)'}${m.accessing_character_name ? ` · via ${m.accessing_character_name}` : ''}${isMarketStale(m) ? ' · stale' : ''}`
                         : (m.name ?? '')}
                 >
                     {m.short_label ?? '(unnamed)'}
@@ -278,8 +276,7 @@
                                 {@const p = line.prices[m.id]}
                                 <td
                                     class:cheapest={cheapestPerLine.get(i) === m.id}
-                                    class:stale={isStale(m) || (p?.computed_at &&
-                                        Date.now() - new Date(p.computed_at).getTime() > STALE_AFTER_MS)}
+                                    class:stale={isMarketStale(m) || isPriceStale(p?.computed_at)}
                                 >
                                     {#if p == null || p.best_sell == null}
                                         <span class="muted">no offers</span>
@@ -290,7 +287,7 @@
                                         {:else}
                                             <span class="muted vol">vol {p.sell_volume.toLocaleString()}</span>
                                         {/if}
-                                        {#if isStale(m)}<span class="muted">·stale</span>{/if}
+                                        {#if isMarketStale(m)}<span class="muted">·stale</span>{/if}
                                     {/if}
                                 </td>
                             {/if}

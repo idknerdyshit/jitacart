@@ -20,11 +20,22 @@ export async function loadMe(force = false): Promise<Me | null> {
             meStore.set(m);
             return m;
         })
-        .catch(() => null)
+        .catch((e: unknown) => {
+            // 401 surfaces via api() which already redirects; the throw lets
+            // us return null cleanly. Other errors (network/5xx) should
+            // bubble — silently swallowing them masks real outages.
+            const msg = e instanceof Error ? e.message : '';
+            if (msg === 'unauthenticated') return null;
+            throw e;
+        })
         .finally(() => {
             inflight = null;
         });
     return inflight;
+}
+
+export function hydrateMe(m: Me | null): void {
+    meStore.set(m);
 }
 
 export const me: Readable<Me | null> = meStore;

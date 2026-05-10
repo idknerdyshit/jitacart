@@ -80,7 +80,10 @@
 </script>
 
 {#if errMsg}
-    <span class="err" title={errMsg}>!</span>
+    <span class="err" role="alert" title={errMsg} aria-label={`Error: ${errMsg}`}>
+        <span class="err-icon" aria-hidden="true">⚠</span>
+        <span class="visually-hidden">{errMsg}</span>
+    </span>
 {/if}
 
 {#if isOther && itemClaim}
@@ -139,5 +142,22 @@
         color: #f87171;
         font-size: 0.75rem;
         margin-right: 0.25rem;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.15rem;
+    }
+    .err-icon {
+        font-size: 0.8rem;
+    }
+    .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
     }
 </style>

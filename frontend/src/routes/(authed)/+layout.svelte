@@ -1,8 +1,15 @@
 <script lang="ts">
-    import { me } from '$lib/stores/me';
+    import { me, hydrateMe } from '$lib/stores/me';
     import { activeCharacter, setActiveCharacter } from '$lib/stores/activeCharacter';
 
-    let { children } = $props();
+    let { data, children } = $props();
+
+    // Hydrate the client store from the server-validated payload so the
+    // client doesn't re-fetch /api/me on first render. $effect re-runs if
+    // the server payload changes (e.g. after a hot navigation).
+    $effect(() => {
+        hydrateMe(data.me);
+    });
 
     let pickerOpen = $state(false);
     let switching = $state(false);

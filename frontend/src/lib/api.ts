@@ -3,11 +3,18 @@ import { goto } from '$app/navigation';
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     const res = await fetch(`/api${path}`, { credentials: 'include', ...init });
     if (res.status === 401) {
+        // 401 means the session is gone or never existed — redirect to login.
+        // The thrown error gives callers a way to early-return; toasts should
+        // not surface it.
         goto('/');
         throw new Error('unauthenticated');
     }
     if (!res.ok) {
-        throw new Error(`${res.status}: ${await res.text()}`);
+        // Non-401 errors get the upstream body, but cap it so a sprawling
+        // server stack trace doesn't end up in a toast.
+        const body = await res.text();
+        const trimmed = body.length > 200 ? `${body.slice(0, 200)}…` : body;
+        throw new Error(`${res.status}: ${trimmed}`);
     }
     return res.status === 204 ? (undefined as T) : res.json();
 }
@@ -47,6 +54,20 @@ export type GroupMarket = Market & {
     accessing_character_id: string | null;
     accessing_character_name: string | null;
 };
+
+export const STALE_AFTER_MS = 2 * 600 * 1000;
+
+export function isMarketStale(m: Pick<GroupMarket, 'is_public' | 'kind' | 'last_orders_synced_at'>): boolean {
+    if (!m.is_public) return true;
+    if (m.kind !== 'public_structure') return false;
+    if (!m.last_orders_synced_at) return true;
+    return Date.now() - new Date(m.last_orders_synced_at).getTime() > STALE_AFTER_MS;
+}
+
+export function isPriceStale(computed_at: string | null | undefined): boolean {
+    if (!computed_at) return false;
+    return Date.now() - new Date(computed_at).getTime() > STALE_AFTER_MS;
+}
 
 export type ListStatus = 'open' | 'closed' | 'archived';
 
@@ -256,6 +277,8 @@ export type RunSummary = {
     my_active_claim_id: string | null;
 };
 
+export type GroupRole = 'owner' | 'member';
+
 export type Group = {
     id: string;
     name: string;
@@ -263,6 +286,11 @@ export type Group = {
     created_by_user_id: string;
     created_at: string;
     default_tip_pct: string;
+};
+
+export type GroupSummary = Group & {
+    role: GroupRole;
+    member_count: number;
 };
 
 export type PreviewPrice = {

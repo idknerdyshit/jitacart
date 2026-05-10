@@ -6,6 +6,8 @@
         api,
         fmtIsk,
         fmtPct,
+        isMarketStale,
+        isPriceStale,
         type ListDetail,
         type ListStatus,
         type LiveItemPrice,
@@ -20,7 +22,6 @@
     import { toast } from 'svelte-sonner';
 
     const listId = $derived(page.params.id);
-    const STALE_AFTER_MS = 2 * 600 * 1000;
 
     let detail = $state<ListDetail | null>(null);
     let allMarkets = $state<GroupMarket[] | null>(null);
@@ -162,17 +163,37 @@
         }
     }
 
-    async function updateQty(itemId: string, qty: number) {
+    const qtyTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    let qtyInflightIds = $state<string[]>([]);
+    function setInflight(id: string, on: boolean) {
+        const cur = new Set(qtyInflightIds);
+        if (on) cur.add(id);
+        else cur.delete(id);
+        qtyInflightIds = Array.from(cur);
+    }
+    const isQtyInflight = (id: string) => qtyInflightIds.includes(id);
+    function updateQty(itemId: string, qty: number) {
         if (qty <= 0) return;
-        try {
-            detail = await api<ListDetail>(`/lists/${listId}/items/${itemId}`, {
-                method: 'PATCH',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ qty_requested: qty })
-            });
-        } catch (e) {
-            error = (e as Error).message;
-        }
+        const existing = qtyTimers.get(itemId);
+        if (existing) clearTimeout(existing);
+        qtyTimers.set(
+            itemId,
+            setTimeout(async () => {
+                qtyTimers.delete(itemId);
+                setInflight(itemId, true);
+                try {
+                    detail = await api<ListDetail>(`/lists/${listId}/items/${itemId}`, {
+                        method: 'PATCH',
+                        headers: { 'content-type': 'application/json' },
+                        body: JSON.stringify({ qty_requested: qty })
+                    });
+                } catch (e) {
+                    error = (e as Error).message;
+                } finally {
+                    setInflight(itemId, false);
+                }
+            }, 300)
+        );
     }
 
     async function markDelivered(itemId: string) {
@@ -216,11 +237,7 @@
 
     function isStaleMarket(mid: string): boolean {
         const m = allMarkets?.find((x) => x.id === mid);
-        if (!m) return false;
-        if (!m.is_public) return true;
-        if (m.kind !== 'public_structure') return false;
-        if (!m.last_orders_synced_at) return true;
-        return Date.now() - new Date(m.last_orders_synced_at).getTime() > STALE_AFTER_MS;
+        return m ? isMarketStale(m) : false;
     }
 
     function isCitadel(mid: string): boolean {
@@ -466,11 +483,11 @@
                                     type="number"
                                     min="1"
                                     value={it.qty_requested}
-                                    disabled={it.status !== 'open'}
+                                    disabled={it.status !== 'open' || isQtyInflight(it.id)}
                                     title={it.status !== 'open'
                                         ? 'Release the claim or reverse fulfillments to edit'
                                         : ''}
-                                    onchange={(e) =>
+                                    oninput={(e) =>
                                         updateQty(
                                             it.id,
                                             Number((e.currentTarget as HTMLInputElement).value)
@@ -493,8 +510,7 @@
                             <td data-label="Saved unit">{fmtIsk(it.est_unit_price_isk)}</td>
                             {#each detail.markets as m (m.id)}
                                 {@const lp = priceFor(it.id, m.id)}
-                                {@const cellStale = isStaleMarket(m.id) ||
-                                    (lp?.computed_at != null && Date.now() - new Date(lp.computed_at).getTime() > STALE_AFTER_MS)}
+                                {@const cellStale = isStaleMarket(m.id) || isPriceStale(lp?.computed_at)}
                                 <td
                                     data-label={m.short_label ?? 'Price'}
                                     class:stale={cellStale}

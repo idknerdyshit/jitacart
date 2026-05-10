@@ -1,33 +1,19 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { goto } from '$app/navigation';
+    import { api, type Group, type GroupSummary } from '$lib/api';
 
-    type Group = {
-        id: string;
-        name: string;
-        invite_code: string;
-        created_by_user_id: string;
-        created_at: string;
-        role: 'owner' | 'member';
-        member_count: number;
-    };
-
-    let groups = $state<Group[] | null>(null);
+    let groups = $state<GroupSummary[] | null>(null);
     let error = $state<string | null>(null);
     let newName = $state('');
     let creating = $state(false);
 
     async function load() {
-        const res = await fetch('/api/groups', { credentials: 'include' });
-        if (res.status === 401) {
-            goto('/');
-            return;
+        try {
+            groups = await api<GroupSummary[]>('/groups');
+        } catch (e) {
+            error = String(e);
         }
-        if (!res.ok) {
-            error = `HTTP ${res.status}`;
-            return;
-        }
-        groups = await res.json();
     }
 
     onMount(load);
@@ -38,18 +24,14 @@
         creating = true;
         error = null;
         try {
-            const res = await fetch('/api/groups', {
+            const g = await api<Group>('/groups', {
                 method: 'POST',
-                credentials: 'include',
                 headers: { 'content-type': 'application/json' },
                 body: JSON.stringify({ name: newName.trim() })
             });
-            if (!res.ok) {
-                error = await res.text();
-                return;
-            }
-            const g: { id: string } = await res.json();
             goto(`/groups/${g.id}`);
+        } catch (e) {
+            error = String(e);
         } finally {
             creating = false;
         }

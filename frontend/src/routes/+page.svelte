@@ -1,11 +1,8 @@
 <script lang="ts">
     import { onMount } from 'svelte';
+    import { api, type Me } from '$lib/api';
 
     type Health = { status?: string; db?: boolean };
-    type Me = {
-        user: { id: string; display_name: string; created_at: string };
-        characters: Array<{ id: string; character_id: number; character_name: string }>;
-    };
 
     let health = $state<Health | null>(null);
     let healthError = $state<string | null>(null);
@@ -13,20 +10,18 @@
 
     onMount(async () => {
         const [healthRes, meRes] = await Promise.allSettled([
-            fetch('/api/healthz'),
-            fetch('/api/me', { credentials: 'include' })
+            fetch('/api/healthz').then((r) => (r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))),
+            api<Me>('/me').catch(() => null)
         ]);
 
-        if (healthRes.status === 'fulfilled' && healthRes.value.ok) {
-            health = await healthRes.value.json();
-        } else if (healthRes.status === 'fulfilled') {
-            healthError = `HTTP ${healthRes.value.status}`;
+        if (healthRes.status === 'fulfilled') {
+            health = healthRes.value;
         } else {
             healthError = String(healthRes.reason);
         }
 
-        if (meRes.status === 'fulfilled' && meRes.value.ok) {
-            me = await meRes.value.json();
+        if (meRes.status === 'fulfilled' && meRes.value) {
+            me = meRes.value;
         }
     });
 

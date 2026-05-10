@@ -40,9 +40,13 @@
         error = null;
         try {
             detail = await api<GroupDetail>(`/groups/${groupId}`);
-            if (detail.role === 'owner') {
-                tracked = await api<Tracked[]>(`/groups/${groupId}/tracked-markets`);
-            }
+        } catch (e) {
+            error = e instanceof Error ? e.message : String(e);
+            return;
+        }
+        if (detail.role !== 'owner') return;
+        try {
+            tracked = await api<Tracked[]>(`/groups/${groupId}/tracked-markets`);
         } catch (e) {
             error = e instanceof Error ? e.message : String(e);
         }

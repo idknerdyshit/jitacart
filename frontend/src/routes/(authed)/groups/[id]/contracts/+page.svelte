@@ -38,7 +38,7 @@
 
     onMount(load);
 
-    async function confirm(s: ContractSuggestion) {
+    async function acceptSuggestion(s: ContractSuggestion) {
         if (busy) return;
         busy = s.id;
         try {
@@ -149,7 +149,7 @@
                         <button
                             class="primary"
                             disabled={busy === s.id}
-                            onclick={() => confirm(s)}
+                            onclick={() => acceptSuggestion(s)}
                         >
                             {busy === s.id ? '…' : 'Confirm match'}
                         </button>

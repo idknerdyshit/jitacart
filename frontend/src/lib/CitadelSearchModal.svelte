@@ -79,7 +79,19 @@
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div class="overlay" onclick={onClose} role="presentation">
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions a11y_interactive_supports_focus -->
-    <div class="modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
+    <div
+        class="modal"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => {
+            if (e.key === 'Escape') {
+                e.stopPropagation();
+                onClose();
+            }
+        }}
+        role="dialog"
+        aria-modal="true"
+        tabindex="-1"
+    >
         <h2>Add a citadel</h2>
         <p class="muted">
             Searches public structures already discovered by ESI. If yours isn't here, a member

@@ -101,6 +101,9 @@
                             <strong>{r.hauler_display_name}</strong>
                         </span>
                         <span class="pill" class:pill-settled={r.status === 'settled'} class:pill-cancelled={r.status === 'cancelled'}>
+                            <span class="pill-icon" aria-hidden="true">
+                                {r.status === 'settled' ? '✓' : r.status === 'cancelled' ? '✕' : '◔'}
+                            </span>
                             {r.status}
                         </span>
                     </div>

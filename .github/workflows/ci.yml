@@ -110,9 +110,12 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Belt-and-braces: catch a real .env that gitleaks somehow misses
-      # by grepping for long, all-caps, =value lines outside the example.
-      - name: grep for committed .env-style secrets
+      # Belt-and-braces: refuse a tracked file literally named `.env`
+      # (or `.env.<env>`), in case gitleaks' ruleset somehow doesn't
+      # flag it. Gitleaks already handles entropy-based secret
+      # detection inside other files, so we don't try to second-guess
+      # it with a grep here.
+      - name: refuse tracked .env files
         run: |
           set -e
           if git ls-files \
@@ -120,15 +123,6 @@ jobs:
               | grep -vE '\.env\.(example|sample|template)$' \
               | grep .; then
               echo "Real .env file checked in — refuse." >&2
-              exit 1
-          fi
-          # Long high-entropy KEY=VALUE outside .env.example.
-          if git ls-files \
-              | grep -vE '(^|/)\.env\.(example|sample|template)$' \
-              | grep -vE '(^|/)Caddyfile$' \
-              | xargs -r grep -lE '^[A-Z][A-Z0-9_]+=.{32,}$' 2>/dev/null \
-              | grep .; then
-              echo "Found a long uppercase KEY=VALUE outside .env.example — looks like a leaked secret." >&2
               exit 1
           fi
 

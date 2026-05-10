@@ -14,8 +14,6 @@
 //! rotation flips primary. [`reencrypt_stale`] handles the long-tail of
 //! dormant characters.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
@@ -48,9 +46,14 @@ struct Inner {
 
 struct CachedClient {
     client: Arc<EsiClient>,
-    /// FNV-style hash of the most recently persisted refresh token. Used to
-    /// detect rotation without copying the secret out for comparison.
+    /// blake3 hash truncated to u64 of the most recently persisted refresh
+    /// token. Used to detect rotation without copying the secret out for
+    /// comparison. Never escapes this process.
     last_refresh_hash: std::sync::atomic::AtomicU64,
+    /// EVE character_id (i64) for this row. Used as AAD when re-encrypting
+    /// rotated tokens so a row-level write can't transplant ciphertexts
+    /// across characters.
+    eve_character_id: i64,
 }
 
 impl CharacterTokenStore {
@@ -123,6 +126,7 @@ impl CharacterTokenStore {
             last_refresh_hash: std::sync::atomic::AtomicU64::new(hash_secret(
                 row.refresh_token.expose_secret(),
             )),
+            eve_character_id: row.eve_character_id,
         };
         self.inner.clients.insert(character_id, cached);
         Ok(client)
@@ -147,14 +151,15 @@ impl CharacterTokenStore {
         if prior == new_hash {
             return Ok(());
         }
+        let aad = entry.eve_character_id.to_be_bytes();
         let (rt_ct, rt_nonce, kid) = self
             .inner
             .cipher
-            .encrypt(tokens.refresh_token.expose_secret().as_bytes())?;
+            .encrypt(tokens.refresh_token.expose_secret().as_bytes(), &aad)?;
         let (at_ct, at_nonce, _) = self
             .inner
             .cipher
-            .encrypt(tokens.access_token.expose_secret().as_bytes())?;
+            .encrypt(tokens.access_token.expose_secret().as_bytes(), &aad)?;
         sqlx::query(
             "UPDATE characters SET \
                 refresh_token_ciphertext = $1, refresh_token_nonce = $2, \
@@ -179,6 +184,7 @@ impl CharacterTokenStore {
     async fn load_tokens(&self, character_id: Uuid) -> anyhow::Result<LoadedTokens> {
         #[derive(sqlx::FromRow)]
         struct Row {
+            character_id: i64,
             refresh_token_ciphertext: Vec<u8>,
             refresh_token_nonce: Vec<u8>,
             access_token_ciphertext: Option<Vec<u8>>,
@@ -187,7 +193,7 @@ impl CharacterTokenStore {
             token_key_id: String,
         }
         let row: Row = sqlx::query_as(
-            "SELECT refresh_token_ciphertext, refresh_token_nonce, \
+            "SELECT character_id, refresh_token_ciphertext, refresh_token_nonce, \
                     access_token_ciphertext, access_token_nonce, access_token_expires_at, \
                     token_key_id \
              FROM characters WHERE id = $1",
@@ -198,10 +204,12 @@ impl CharacterTokenStore {
         .context("loading character tokens")?
         .ok_or_else(|| anyhow!("character {character_id} not found"))?;
 
+        let aad = row.character_id.to_be_bytes();
         let refresh_pt = self.inner.cipher.decrypt(
             &row.refresh_token_ciphertext,
             &row.refresh_token_nonce,
             &row.token_key_id,
+            &aad,
         )?;
         let refresh_token = SecretString::from(
             String::from_utf8(refresh_pt).context("refresh token plaintext is not UTF-8")?,
@@ -209,7 +217,10 @@ impl CharacterTokenStore {
 
         let access_token = match (row.access_token_ciphertext, row.access_token_nonce) {
             (Some(ct), Some(nonce)) => {
-                let pt = self.inner.cipher.decrypt(&ct, &nonce, &row.token_key_id)?;
+                let pt = self
+                    .inner
+                    .cipher
+                    .decrypt(&ct, &nonce, &row.token_key_id, &aad)?;
                 Some(SecretString::from(
                     String::from_utf8(pt).context("access token plaintext is not UTF-8")?,
                 ))
@@ -221,6 +232,7 @@ impl CharacterTokenStore {
             refresh_token,
             access_token,
             access_token_expires_at: row.access_token_expires_at,
+            eve_character_id: row.character_id,
         })
     }
 }
@@ -229,12 +241,15 @@ struct LoadedTokens {
     refresh_token: SecretString,
     access_token: Option<SecretString>,
     access_token_expires_at: Option<DateTime<Utc>>,
+    eve_character_id: i64,
 }
 
+/// blake3 hash truncated to u64. Used only for in-process comparison of
+/// refresh-token rotation; the value never leaves this process.
 fn hash_secret(s: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
+    let h = blake3::hash(s.as_bytes());
+    let bytes = h.as_bytes();
+    u64::from_le_bytes(bytes[..8].try_into().expect("blake3 produces >= 8 bytes"))
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -258,6 +273,7 @@ pub async fn reencrypt_stale(
     #[derive(sqlx::FromRow)]
     struct Row {
         id: Uuid,
+        character_id: i64,
         refresh_token_ciphertext: Vec<u8>,
         refresh_token_nonce: Vec<u8>,
         access_token_ciphertext: Option<Vec<u8>>,
@@ -267,7 +283,7 @@ pub async fn reencrypt_stale(
 
     let primary = cipher.primary_kid().to_string();
     let stale: Vec<Row> = sqlx::query_as(
-        "SELECT id, refresh_token_ciphertext, refresh_token_nonce, \
+        "SELECT id, character_id, refresh_token_ciphertext, refresh_token_nonce, \
                 access_token_ciphertext, access_token_nonce, token_key_id \
          FROM characters \
          WHERE token_key_id != $1 \
@@ -282,24 +298,31 @@ pub async fn reencrypt_stale(
 
     let scanned = stale.len();
     let mut rewritten = 0;
-    let mut tx = pool.begin().await.context("opening reencrypt transaction")?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("opening reencrypt transaction")?;
     for row in stale {
+        let aad = row.character_id.to_be_bytes();
         let rt_pt = cipher
             .decrypt(
                 &row.refresh_token_ciphertext,
                 &row.refresh_token_nonce,
                 &row.token_key_id,
+                &aad,
             )
             .with_context(|| format!("decrypting refresh token for character {}", row.id))?;
-        let (rt_ct, rt_nonce, _) = cipher.encrypt(&rt_pt)?;
+        let (rt_ct, rt_nonce, _) = cipher.encrypt(&rt_pt, &aad)?;
 
         let (at_ct, at_nonce): (Option<Vec<u8>>, Option<Vec<u8>>) =
             match (row.access_token_ciphertext, row.access_token_nonce) {
                 (Some(ct), Some(nonce)) => {
-                    let pt = cipher.decrypt(&ct, &nonce, &row.token_key_id).with_context(
-                        || format!("decrypting access token for character {}", row.id),
-                    )?;
-                    let (ct, nonce, _) = cipher.encrypt(&pt)?;
+                    let pt = cipher
+                        .decrypt(&ct, &nonce, &row.token_key_id, &aad)
+                        .with_context(|| {
+                            format!("decrypting access token for character {}", row.id)
+                        })?;
+                    let (ct, nonce, _) = cipher.encrypt(&pt, &aad)?;
                     (Some(ct), Some(nonce))
                 }
                 _ => (None, None),
@@ -327,7 +350,9 @@ pub async fn reencrypt_stale(
             rewritten += 1;
         }
     }
-    tx.commit().await.context("committing reencrypt transaction")?;
+    tx.commit()
+        .await
+        .context("committing reencrypt transaction")?;
 
     Ok(ReencryptOutcome { scanned, rewritten })
 }

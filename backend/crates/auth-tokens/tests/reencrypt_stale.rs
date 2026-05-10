@@ -27,13 +27,11 @@ fn cipher(keys: &[(&str, &str)], primary: &str) -> MultiKeyCipher {
 }
 
 async fn insert_user(pool: &PgPool, name: &str) -> Uuid {
-    sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO users (display_name) VALUES ($1) RETURNING id",
-    )
-    .bind(name)
-    .fetch_one(pool)
-    .await
-    .unwrap()
+    sqlx::query_scalar::<_, Uuid>("INSERT INTO users (display_name) VALUES ($1) RETURNING id")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 /// Insert a character row with both refresh and access tokens encrypted
@@ -46,8 +44,9 @@ async fn insert_character(
 ) -> (Uuid, Vec<u8>, Vec<u8>) {
     let refresh_pt = b"refresh-token-blob".to_vec();
     let access_pt = b"access-token-blob".to_vec();
-    let (rt_ct, rt_nonce, kid) = c.encrypt(&refresh_pt).unwrap();
-    let (at_ct, at_nonce, _) = c.encrypt(&access_pt).unwrap();
+    let aad = eve_char.to_be_bytes();
+    let (rt_ct, rt_nonce, kid) = c.encrypt(&refresh_pt, &aad).unwrap();
+    let (at_ct, at_nonce, _) = c.encrypt(&access_pt, &aad).unwrap();
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO characters \
          (user_id, character_id, character_name, owner_hash, \
@@ -105,9 +104,15 @@ async fn sweeper_rewrites_stale_rows(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(row.token_key_id, "v2");
+    let aad = 1001_i64.to_be_bytes();
     assert_eq!(
-        post.decrypt(&row.refresh_token_ciphertext, &row.refresh_token_nonce, "v2")
-            .unwrap(),
+        post.decrypt(
+            &row.refresh_token_ciphertext,
+            &row.refresh_token_nonce,
+            "v2",
+            &aad,
+        )
+        .unwrap(),
         refresh_pt
     );
     assert_eq!(
@@ -115,6 +120,7 @@ async fn sweeper_rewrites_stale_rows(pool: PgPool) {
             &row.access_token_ciphertext.unwrap(),
             &row.access_token_nonce.unwrap(),
             "v2",
+            &aad,
         )
         .unwrap(),
         access_pt
@@ -140,7 +146,8 @@ async fn sweeper_handles_row_without_access_token(pool: PgPool) {
     let pre = cipher(&[("v1", &v1)], "v1");
 
     let refresh_pt = b"r".to_vec();
-    let (rt_ct, rt_nonce, kid) = pre.encrypt(&refresh_pt).unwrap();
+    let aad = 2002_i64.to_be_bytes();
+    let (rt_ct, rt_nonce, kid) = pre.encrypt(&refresh_pt, &aad).unwrap();
     let user = insert_user(&pool, "u").await;
     let cid: Uuid = sqlx::query_scalar(
         "INSERT INTO characters \
@@ -205,9 +212,7 @@ async fn sweeper_errors_when_kid_unknown(pool: PgPool) {
     let err = reencrypt_stale(&pool, &runtime, 10).await.unwrap_err();
     assert!(
         err.to_string().contains("unknown kid")
-            || err
-                .chain()
-                .any(|c| c.to_string().contains("unknown kid")),
+            || err.chain().any(|c| c.to_string().contains("unknown kid")),
         "expected unknown-kid error, got: {err:#}"
     );
 }

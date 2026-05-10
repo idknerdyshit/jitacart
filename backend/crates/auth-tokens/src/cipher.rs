@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, KeyInit, OsRng, Payload},
     AeadCore, Aes256Gcm, Key, Nonce,
 };
 use anyhow::{anyhow, Context};
@@ -48,8 +48,7 @@ pub fn build_cipher(
 }
 
 /// Kid assigned to legacy single-key configurations (`token_enc_key`).
-/// Mirrored as the SQL default for `characters.token_key_id` in
-/// `migrations/20261201000000_phase9_token_kid.sql`.
+/// Mirrored as the SQL default for `characters.token_key_id`.
 pub const LEGACY_KID: &str = "v1";
 
 #[derive(Clone)]
@@ -71,10 +70,7 @@ impl std::fmt::Debug for MultiKeyCipher {
 impl MultiKeyCipher {
     /// Build from `(kid -> base64-32-bytes)` pairs and a chosen primary kid.
     /// Errors if `primary` is not in the map, or any key is the wrong length.
-    pub fn from_keys(
-        keys_b64: HashMap<String, String>,
-        primary: String,
-    ) -> anyhow::Result<Self> {
+    pub fn from_keys(keys_b64: HashMap<String, String>, primary: String) -> anyhow::Result<Self> {
         if keys_b64.is_empty() {
             return Err(anyhow!("token_enc.keys must not be empty"));
         }
@@ -121,30 +117,54 @@ impl MultiKeyCipher {
     }
 
     /// Encrypt with the primary key. Returns `(ciphertext, nonce, kid)`.
-    pub fn encrypt(&self, plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>, String)> {
+    /// `aad` is bound into the AEAD tag — decryption will fail if a row's
+    /// ciphertext is moved between characters (or whatever scope `aad` carries).
+    pub fn encrypt(
+        &self,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> anyhow::Result<(Vec<u8>, Vec<u8>, String)> {
         let cipher = self
             .keys
             .get(&self.primary)
             .expect("primary kid validated at construction");
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ct = cipher
-            .encrypt(&nonce, plaintext)
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|e| anyhow!("AES-GCM encrypt failed: {e}"))?;
         Ok((ct, nonce.to_vec(), self.primary.clone()))
     }
 
-    /// Decrypt with the key named by `kid`. Unknown kid is a hard error.
-    pub fn decrypt(&self, ciphertext: &[u8], nonce: &[u8], kid: &str) -> anyhow::Result<Vec<u8>> {
+    /// Decrypt with the key named by `kid`. Unknown kid or AAD mismatch is a
+    /// hard error.
+    pub fn decrypt(
+        &self,
+        ciphertext: &[u8],
+        nonce: &[u8],
+        kid: &str,
+        aad: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
         if nonce.len() != 12 {
             return Err(anyhow!("nonce must be 12 bytes, got {}", nonce.len()));
         }
-        let cipher = self
-            .keys
-            .get(kid)
-            .ok_or_else(|| anyhow!("token row encrypted with unknown kid {kid:?}; check token_enc config"))?;
+        let cipher = self.keys.get(kid).ok_or_else(|| {
+            anyhow!("token row encrypted with unknown kid {kid:?}; check token_enc config")
+        })?;
         let nonce = Nonce::from_slice(nonce);
         cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
             .map_err(|e| anyhow!("AES-GCM decrypt failed for kid {kid:?}: {e}"))
     }
 }
@@ -168,15 +188,18 @@ mod tests {
         MultiKeyCipher::from_keys(map, primary.to_string()).unwrap()
     }
 
+    const AAD_A: &[u8] = b"character-1";
+    const AAD_B: &[u8] = b"character-2";
+
     #[test]
     fn round_trip_single_key() {
         let v1 = fresh_key_b64();
         let c = cipher_with(&[("v1", &v1)], "v1");
         let pt = b"refresh-token-blob";
-        let (ct, nonce, kid) = c.encrypt(pt).unwrap();
+        let (ct, nonce, kid) = c.encrypt(pt, AAD_A).unwrap();
         assert_eq!(kid, "v1");
         assert_ne!(ct.as_slice(), pt);
-        let recovered = c.decrypt(&ct, &nonce, &kid).unwrap();
+        let recovered = c.decrypt(&ct, &nonce, &kid, AAD_A).unwrap();
         assert_eq!(recovered, pt);
     }
 
@@ -184,9 +207,9 @@ mod tests {
     fn legacy_loader_uses_v1() {
         let c = MultiKeyCipher::from_legacy_b64(&fresh_key_b64()).unwrap();
         assert_eq!(c.primary_kid(), "v1");
-        let (ct, nonce, kid) = c.encrypt(b"x").unwrap();
+        let (ct, nonce, kid) = c.encrypt(b"x", AAD_A).unwrap();
         assert_eq!(kid, "v1");
-        assert_eq!(c.decrypt(&ct, &nonce, "v1").unwrap(), b"x");
+        assert_eq!(c.decrypt(&ct, &nonce, "v1", AAD_A).unwrap(), b"x");
     }
 
     #[test]
@@ -196,16 +219,16 @@ mod tests {
 
         // Encrypt under the old key (primary=v1).
         let old = cipher_with(&[("v1", &v1)], "v1");
-        let (ct, nonce, kid) = old.encrypt(b"secret").unwrap();
+        let (ct, nonce, kid) = old.encrypt(b"secret", AAD_A).unwrap();
         assert_eq!(kid, "v1");
 
         // Now config has both keys, primary=v2. We can still decrypt the
         // legacy ciphertext under v1, and new encrypts go under v2.
         let rotated = cipher_with(&[("v1", &v1), ("v2", &v2)], "v2");
         assert_eq!(rotated.primary_kid(), "v2");
-        let recovered = rotated.decrypt(&ct, &nonce, "v1").unwrap();
+        let recovered = rotated.decrypt(&ct, &nonce, "v1", AAD_A).unwrap();
         assert_eq!(recovered, b"secret");
-        let (_, _, new_kid) = rotated.encrypt(b"fresh").unwrap();
+        let (_, _, new_kid) = rotated.encrypt(b"fresh", AAD_A).unwrap();
         assert_eq!(new_kid, "v2");
     }
 
@@ -213,8 +236,11 @@ mod tests {
     fn unknown_kid_is_error() {
         let v1 = fresh_key_b64();
         let c = cipher_with(&[("v1", &v1)], "v1");
-        let (ct, nonce, _) = c.encrypt(b"x").unwrap();
-        let err = c.decrypt(&ct, &nonce, "v99").unwrap_err().to_string();
+        let (ct, nonce, _) = c.encrypt(b"x", AAD_A).unwrap();
+        let err = c
+            .decrypt(&ct, &nonce, "v99", AAD_A)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unknown kid"), "got: {err}");
     }
 
@@ -239,8 +265,22 @@ mod tests {
     fn tamper_fails() {
         let v1 = fresh_key_b64();
         let c = cipher_with(&[("v1", &v1)], "v1");
-        let (mut ct, nonce, kid) = c.encrypt(b"abc").unwrap();
+        let (mut ct, nonce, kid) = c.encrypt(b"abc", AAD_A).unwrap();
         ct[0] ^= 1;
-        assert!(c.decrypt(&ct, &nonce, &kid).is_err());
+        assert!(c.decrypt(&ct, &nonce, &kid, AAD_A).is_err());
+    }
+
+    /// Transplant attempt: a ciphertext encrypted bound to AAD_A must not
+    /// decrypt against AAD_B. This is the property that prevents a row-level
+    /// write from moving a ciphertext to a different character.
+    #[test]
+    fn aad_mismatch_fails() {
+        let v1 = fresh_key_b64();
+        let c = cipher_with(&[("v1", &v1)], "v1");
+        let (ct, nonce, kid) = c.encrypt(b"refresh", AAD_A).unwrap();
+        assert!(c.decrypt(&ct, &nonce, &kid, AAD_B).is_err());
+        assert!(c.decrypt(&ct, &nonce, &kid, b"").is_err());
+        // Same AAD still works.
+        assert_eq!(c.decrypt(&ct, &nonce, &kid, AAD_A).unwrap(), b"refresh");
     }
 }

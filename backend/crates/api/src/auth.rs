@@ -529,8 +529,11 @@ async fn upsert_character(
         }
     }
 
-    let (rt_ct, rt_nonce, kid) = cipher.encrypt(tokens.refresh_token.expose_secret().as_bytes())?;
-    let (at_ct, at_nonce, _) = cipher.encrypt(tokens.access_token.expose_secret().as_bytes())?;
+    let aad = character_id.to_be_bytes();
+    let (rt_ct, rt_nonce, kid) =
+        cipher.encrypt(tokens.refresh_token.expose_secret().as_bytes(), &aad)?;
+    let (at_ct, at_nonce, _) =
+        cipher.encrypt(tokens.access_token.expose_secret().as_bytes(), &aad)?;
 
     sqlx::query(
         r#"

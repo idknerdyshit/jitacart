@@ -1,0 +1,35 @@
+# Build override: restores the `build:` blocks that docker-compose.yml
+# omits, and tags each built image with the same GHCR ref the prod
+# compose file pulls. Use only when CI can't publish for you (hotfix
+# from a non-CI box, dev iteration on a Dockerfile).
+#
+#     docker compose -f docker-compose.yml -f docker-compose.build.yml build
+#
+# `JC_IMAGE_OWNER` / `JC_IMAGE_TAG` default the same way as the prod
+# file, so a plain `up -d` after a build picks up the locally-tagged
+# image without touching the registry.
+
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:${JC_IMAGE_TAG:-latest}
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:${JC_IMAGE_TAG:-latest}
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:${JC_IMAGE_TAG:-latest}
+
+  backup:
+    build:
+      context: ./backup
+      dockerfile: Dockerfile
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backup:${JC_IMAGE_TAG:-latest}

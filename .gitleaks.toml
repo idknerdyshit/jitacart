@@ -1,0 +1,16 @@
+# Minimal gitleaks config: keep the default ruleset, allow-list known
+# placeholder/example files so the scanner doesn't trip on documented
+# blanks (TOKEN_ENC_KEY=, TURNSTILE__SECRET_KEY=, …).
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "example/template configs and the public Caddyfile"
+paths = [
+    '''(^|/)\.env\.example$''',
+    '''(^|/)\.env\.sample$''',
+    '''(^|/)\.env\.template$''',
+    '''(^|/)Caddyfile$''',
+    '''(^|/)backup/rclone\.conf\.example$''',
+]

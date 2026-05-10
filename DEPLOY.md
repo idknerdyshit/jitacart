@@ -52,18 +52,36 @@ Five services in `docker-compose.yml`. Local dev keeps just postgres via
    # TOKEN_ENC_KEY, POSTGRES_PASSWORD, TURNSTILE__*, and flip
    # TURNSTILE__DISABLED=false.
    ```
-6. **Bring it up**:
+6. **Pin and bring it up**:
    ```sh
-   docker compose up -d --build
+   # In .env, pin a known-good tag:
+   #   JC_IMAGE_TAG=sha-<short>   # exact commit on main
+   #   JC_IMAGE_TAG=0.2.0         # released semver
+   #   JC_IMAGE_TAG=latest        # tracks most recent release tag
+   docker compose pull
+   docker compose up -d
    ```
-   First build takes ~10 minutes (Rust release build). Subsequent
-   builds reuse the BuildKit cache and finish in seconds when only
-   sources changed.
+   The compose file is image-only — every service points at a published
+   `ghcr.io/<owner>/jitacart-*:<tag>` image, so `pull` does the work and
+   `up -d` just (re)creates containers. No toolchain on the host.
 7. **First-time TLS**: Caddy obtains a Let's Encrypt cert on first
    request. Watch `docker compose logs -f caddy` until you see
    `certificate obtained successfully`. If the host's :80 isn't
    reachable from the internet, ACME will fail loudly — fix DNS /
    firewall and `docker compose restart caddy`.
+
+### Installing the local pre-commit guard
+
+Once per clone, on every dev machine:
+
+```sh
+bash scripts/install-git-hooks.sh
+```
+
+That points `core.hooksPath` at `scripts/git-hooks/`, so a stray
+`git add .env` is rejected before it ever leaves your laptop. CI has
+its own scan as a backstop, but the local hook keeps secrets out of
+the object database in the first place.
 
 ## Day 2 — common operations
 
@@ -105,12 +123,33 @@ output (`/var/lib/docker/containers/<id>/<id>-json.log`).
 ### Update + redeploy
 
 ```sh
-git pull
-docker compose build api worker frontend       # parallel
-docker compose up -d                            # rolling restart of changed services
+# Bump the tag in .env to the new sha-/semver/latest, then:
+docker compose pull
+docker compose up -d            # rolling restart of changed services
+docker image prune -f           # optional: drop the previous image
 ```
 
-`postgres` and `caddy` images are pinned tags; they don't get rebuilt.
+`postgres` and `caddy` are pinned by digest in the compose file, so
+`pull` is a no-op for them on every redeploy.
+
+### Building images locally
+
+The compose file is image-only by default; you don't need a working
+Rust or Node toolchain on the host. The build override exists for the
+rare case of producing an image off-CI (hotfix, dev iteration on a
+Dockerfile):
+
+```sh
+JC_IMAGE_OWNER=local JC_IMAGE_TAG=dev \
+    docker compose -f docker-compose.yml -f docker-compose.build.yml build
+JC_IMAGE_OWNER=local JC_IMAGE_TAG=dev \
+    docker compose -f docker-compose.yml up -d
+```
+
+The override re-tags each built image with the same `ghcr.io/...`
+reference the prod compose pulls, so a local build slots into the
+prod stack without further config changes. Don't push these to GHCR
+unless you want to override what CI publishes.
 
 ### Database backups
 
@@ -181,7 +220,10 @@ Useful when iterating on the Caddyfile or Dockerfile without a real
 domain:
 
 ```sh
-JC_DOMAIN=:80 docker compose up -d --build
+JC_IMAGE_OWNER=local JC_IMAGE_TAG=dev \
+    docker compose -f docker-compose.yml -f docker-compose.build.yml build
+JC_DOMAIN=:80 JC_IMAGE_OWNER=local JC_IMAGE_TAG=dev \
+    docker compose -f docker-compose.yml up -d
 # Visit http://localhost
 ```
 

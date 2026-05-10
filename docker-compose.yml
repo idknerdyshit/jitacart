@@ -1,11 +1,14 @@
 # Production stack: postgres + api + worker + frontend + caddy.
 #
+# Image-only by design. CI publishes built images to GHCR; prod just
+# pulls and restarts:
+#     docker compose pull && docker compose up -d
+#
+# To build images locally (hotfix from a non-CI box, dev iteration):
+#     docker compose -f docker-compose.yml -f docker-compose.build.yml build
+#
 # For local Postgres-only development, use the dev override:
 #     docker compose -f docker-compose.dev.yml up
-#
-# For prod:
-#     cp .env.example .env  # then fill in real secrets
-#     docker compose up -d --build
 #
 # All services restart unless stopped, log via the json-file driver
 # with rotation, and the app processes run as non-root.
@@ -34,10 +37,7 @@ services:
     logging: *default-logging
 
   api:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    image: jitacart/backend:latest
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:${JC_IMAGE_TAG:-latest}
     restart: unless-stopped
     depends_on:
       postgres:
@@ -59,10 +59,7 @@ services:
     logging: *default-logging
 
   worker:
-    image: jitacart/backend:latest
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:${JC_IMAGE_TAG:-latest}
     command: ["jitacart-worker"]
     restart: unless-stopped
     depends_on:
@@ -87,10 +84,7 @@ services:
     logging: *default-logging
 
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    image: jitacart/frontend:latest
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:${JC_IMAGE_TAG:-latest}
     restart: unless-stopped
     depends_on:
       api:
@@ -130,10 +124,7 @@ services:
   # Bring it up alongside the rest with `docker compose --profile backup up -d`.
   backup:
     profiles: [backup]
-    build:
-      context: ./backup
-      dockerfile: Dockerfile
-    image: jitacart/backup:latest
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backup:${JC_IMAGE_TAG:-latest}
     restart: unless-stopped
     depends_on:
       postgres:

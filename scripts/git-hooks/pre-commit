@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Refuse a commit that adds a real `.env` file. `.env.example`,
+# `.env.sample`, and `.env.template` are allowed through.
+set -euo pipefail
+
+added=$(git diff --cached --name-only --diff-filter=A)
+
+violations=()
+while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    [[ "$path" =~ ^(.*/)?\.env($|\.[^.]+$) ]] || continue
+    [[ "$path" =~ \.env\.(example|sample|template)$ ]] && continue
+    violations+=("$path")
+done <<< "$added"
+
+if (( ${#violations[@]} > 0 )); then
+    echo "pre-commit: refusing to commit a real .env file:" >&2
+    printf '  - %s\n' "${violations[@]}" >&2
+    echo "Rename to .env.example with placeholder values, or run" >&2
+    echo "  git rm --cached <path>" >&2
+    echo "if it was staged by accident." >&2
+    exit 1
+fi

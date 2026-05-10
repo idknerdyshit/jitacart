@@ -70,8 +70,7 @@ async fn search(
     .bind(group_id)
     .bind(&pattern)
     .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     Ok(Json(
         rows.into_iter()
@@ -119,8 +118,7 @@ async fn track(
     )
     .bind(body.market_id)
     .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     let (kind, is_public, detailed) = row.ok_or_else(ApiError::not_found)?;
     let mk = kind
@@ -140,8 +138,7 @@ async fn track(
     .bind(body.market_id)
     .bind(cur.user_id)
     .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     Ok(StatusCode::CREATED)
 }
@@ -156,8 +153,7 @@ async fn untrack(
         .bind(cur.group_id)
         .bind(market_id)
         .execute(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+        .await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
@@ -207,8 +203,7 @@ async fn list(
     )
     .bind(group_id)
     .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     Ok(Json(
         rows.into_iter()
@@ -251,4 +246,3 @@ fn require_owner(cur: &CurrentGroup) -> Result<(), ApiError> {
         Err(ApiError::Forbidden("owner only".into()))
     }
 }
-

@@ -108,8 +108,7 @@ async fn list_suggestions(
     .bind(group_id)
     .bind(user_id)
     .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     Ok(Json(rows))
 }
@@ -156,8 +155,7 @@ async fn list_contracts(
     .bind(group_id)
     .bind(user_id)
     .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     Ok(Json(rows))
 }
@@ -194,7 +192,7 @@ pub async fn do_confirm(
     ),
     ApiError,
 > {
-    let mut tx = pool.begin().await.map_err(ApiError::internal)?;
+    let mut tx = pool.begin().await?;
 
     let row: Option<LinkLockRow> = sqlx::query_as(
         r#"
@@ -223,8 +221,7 @@ pub async fn do_confirm(
     )
     .bind(suggestion_id)
     .fetch_optional(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
     let row = row.ok_or_else(ApiError::not_found)?;
 
     if row.suggestion_state.as_deref() != Some("pending") {
@@ -249,7 +246,7 @@ pub async fn do_confirm(
 
     let (settled, webhook_info) = finalize_link(&mut tx, &ctx).await?;
 
-    tx.commit().await.map_err(ApiError::internal)?;
+    tx.commit().await?;
 
     Ok((
         SuggestionDecision {
@@ -293,9 +290,7 @@ async fn validate_link(
     user_id: Uuid,
 ) -> Result<(), ApiError> {
     if ctx.contract_type != "item_exchange" {
-        return Err(ApiError::Conflict(
-            "contract is not item_exchange".into(),
-        ));
+        return Err(ApiError::Conflict("contract is not item_exchange".into()));
     }
     if ctx.reimbursement_status != "pending" || ctx.reimbursement_contract_id.is_some() {
         return Err(ApiError::Conflict(
@@ -328,8 +323,7 @@ async fn validate_link(
     .bind(ctx.group_id)
     .bind(user_id)
     .fetch_one(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
     if !is_member {
         return Err(ApiError::forbidden());
     }
@@ -347,12 +341,13 @@ async fn finalize_link(
         .bind(ctx.contract_id)
         .bind(ctx.reimbursement_id)
         .execute(&mut **tx)
-        .await
-        .map_err(ApiError::internal)?;
+        .await?;
 
     settlement::recompute_contract_expected_total(tx, ctx.contract_id)
         .await
-        .map_err(|e| ApiError::internal(anyhow::anyhow!("recompute_contract_expected_total: {e}")))?;
+        .map_err(|e| {
+            ApiError::internal(anyhow::anyhow!("recompute_contract_expected_total: {e}"))
+        })?;
 
     let already_finished = ctx
         .contract_status
@@ -374,9 +369,7 @@ fn map_confirmed_dup(e: sqlx::Error) -> ApiError {
         sqlx::Error::Database(db)
             if db.constraint() == Some("one_confirmed_suggestion_per_reimbursement") =>
         {
-            ApiError::Conflict(
-                "reimbursement already confirmed against another contract".into(),
-            )
+            ApiError::Conflict("reimbursement already confirmed against another contract".into())
         }
         other => ApiError::internal(other),
     }
@@ -402,7 +395,7 @@ pub async fn do_reject(
     user_id: Uuid,
     suggestion_id: Uuid,
 ) -> Result<SuggestionDecision, ApiError> {
-    let mut tx = pool.begin().await.map_err(ApiError::internal)?;
+    let mut tx = pool.begin().await?;
     let row: Option<(String, Option<Uuid>)> = sqlx::query_as(
         "SELECT s.state, c.issuer_user_id \
          FROM contract_match_suggestions s \
@@ -411,8 +404,7 @@ pub async fn do_reject(
     )
     .bind(suggestion_id)
     .fetch_optional(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     let (cur_state, issuer_user_id) = row.ok_or_else(ApiError::not_found)?;
     if cur_state != "pending" {
@@ -431,9 +423,8 @@ pub async fn do_reject(
     .bind(user_id)
     .bind(suggestion_id)
     .execute(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
-    tx.commit().await.map_err(ApiError::internal)?;
+    .await?;
+    tx.commit().await?;
     Ok(SuggestionDecision {
         suggestion_id,
         state: "rejected".into(),
@@ -481,7 +472,7 @@ pub async fn do_manual_link(
     ),
     ApiError,
 > {
-    let mut tx = pool.begin().await.map_err(ApiError::internal)?;
+    let mut tx = pool.begin().await?;
 
     let row: Option<LinkLockRow> = sqlx::query_as(
         r#"
@@ -511,8 +502,7 @@ pub async fn do_manual_link(
     .bind(contract_id)
     .bind(reimbursement_id)
     .fetch_optional(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
     let ctx = row.ok_or_else(ApiError::not_found)?;
     validate_link(&mut tx, &ctx, user_id).await?;
 
@@ -534,7 +524,7 @@ pub async fn do_manual_link(
 
     let (settled, webhook_info) = finalize_link(&mut tx, &ctx).await?;
 
-    tx.commit().await.map_err(ApiError::internal)?;
+    tx.commit().await?;
 
     Ok((
         SuggestionDecision {
@@ -559,14 +549,13 @@ pub async fn do_unlink(
     user_id: Uuid,
     contract_id: Uuid,
 ) -> Result<SuggestionDecision, ApiError> {
-    let mut tx = pool.begin().await.map_err(ApiError::internal)?;
+    let mut tx = pool.begin().await?;
 
     let row: Option<(Option<Uuid>, String)> =
         sqlx::query_as("SELECT issuer_user_id, status FROM contracts WHERE id = $1 FOR UPDATE")
             .bind(contract_id)
             .fetch_optional(&mut *tx)
-            .await
-            .map_err(ApiError::internal)?;
+            .await?;
     let (issuer_user_id, status) = row.ok_or_else(ApiError::not_found)?;
 
     if issuer_user_id != Some(user_id) {
@@ -588,8 +577,7 @@ pub async fn do_unlink(
     )
     .bind(contract_id)
     .execute(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
     sqlx::query(
         "UPDATE contract_match_suggestions \
          SET state = 'superseded', decided_at = now() \
@@ -597,17 +585,17 @@ pub async fn do_unlink(
     )
     .bind(contract_id)
     .execute(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
     settlement::recompute_contract_expected_total(&mut tx, contract_id)
         .await
-        .map_err(|e| ApiError::internal(anyhow::anyhow!("recompute_contract_expected_total: {e}")))?;
+        .map_err(|e| {
+            ApiError::internal(anyhow::anyhow!("recompute_contract_expected_total: {e}"))
+        })?;
 
-    tx.commit().await.map_err(ApiError::internal)?;
+    tx.commit().await?;
     Ok(SuggestionDecision {
         suggestion_id: contract_id,
         state: "unlinked".into(),
         settled: false,
     })
 }
-

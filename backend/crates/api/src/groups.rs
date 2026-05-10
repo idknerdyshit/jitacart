@@ -59,14 +59,12 @@ async fn create(
 ) -> Result<Json<Group>, ApiError> {
     let name = body.name.trim();
     if name.is_empty() || name.len() > 80 {
-        return Err(ApiError::BadRequest(
-            "name must be 1–80 characters".into(),
-        ));
+        return Err(ApiError::BadRequest("name must be 1–80 characters".into()));
     }
 
     require_group_quota(&state, user_id).await?;
 
-    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let mut tx = state.pool.begin().await?;
     let mut group_row: Option<GroupRow> = None;
     for _ in 0..MAX_INVITE_GEN_ATTEMPTS {
         let code = random_invite_code();
@@ -95,10 +93,9 @@ async fn create(
         .bind(user_id)
         .bind(group.id)
         .execute(&mut *tx)
-        .await
-        .map_err(ApiError::internal)?;
+        .await?;
 
-    tx.commit().await.map_err(ApiError::internal)?;
+    tx.commit().await?;
     Ok(Json(group))
 }
 
@@ -120,14 +117,13 @@ async fn list(
     )
     .bind(user_id)
     .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
-    rows.into_iter()
-        .map(GroupListRow::into_summary)
-        .collect::<anyhow::Result<Vec<_>>>()
-        .map(Json)
-        .map_err(ApiError::internal)
+    Ok(Json(
+        rows.into_iter()
+            .map(GroupListRow::into_summary)
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    ))
 }
 
 async fn detail(
@@ -153,14 +149,13 @@ async fn detail(
     .bind(group_id)
     .fetch_all(&state.pool);
 
-    let (group, member_rows) = tokio::try_join!(group_q, members_q).map_err(ApiError::internal)?;
+    let (group, member_rows) = tokio::try_join!(group_q, members_q)?;
     let group = group.ok_or_else(ApiError::not_found)?.into_group();
 
     let members = member_rows
         .into_iter()
         .map(MemberRow::into_member)
-        .collect::<anyhow::Result<Vec<_>>>()
-        .map_err(ApiError::internal)?;
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(Json(GroupDetail {
         group,
@@ -175,15 +170,14 @@ async fn leave(
         user_id, group_id, ..
     }: CurrentGroup,
 ) -> Result<StatusCode, ApiError> {
-    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let mut tx = state.pool.begin().await?;
 
     let memberships = sqlx::query_as::<_, MembershipLockRow>(
         "SELECT user_id, role FROM group_memberships WHERE group_id = $1 FOR UPDATE",
     )
     .bind(group_id)
     .fetch_all(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     let role = memberships
         .iter()
@@ -209,10 +203,9 @@ async fn leave(
         .bind(user_id)
         .bind(group_id)
         .execute(&mut *tx)
-        .await
-        .map_err(ApiError::internal)?;
+        .await?;
 
-    tx.commit().await.map_err(ApiError::internal)?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -227,8 +220,7 @@ async fn delete_group(
     let result = sqlx::query("DELETE FROM groups WHERE id = $1")
         .bind(group_id)
         .execute(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+        .await?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("group not found".into()));
@@ -292,8 +284,7 @@ async fn join(
     .bind(&code)
     .bind(user_id)
     .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?
+    .await?
     .ok_or_else(|| ApiError::NotFound("invite is invalid or expired".into()))?
     .into_group();
 
@@ -316,8 +307,7 @@ pub async fn check_group_quota(
         sqlx::query_scalar("SELECT count(*) FROM group_memberships WHERE user_id = $1")
             .bind(user_id)
             .fetch_one(pool)
-            .await
-            .map_err(ApiError::internal)?;
+            .await?;
     if count >= cap {
         return Err(ApiError::QuotaExceeded(format!(
             "you are already a member of {count} groups (limit {cap})"
@@ -418,4 +408,3 @@ impl MemberRow {
         })
     }
 }
-

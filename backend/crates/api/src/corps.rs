@@ -113,9 +113,7 @@ async fn list_corps(
         role,
     }: CurrentGroup,
 ) -> Result<Json<CorpsResponse>, ApiError> {
-    let corps = list_corps_inner(&state.pool, group_id, user_id, role)
-        .await
-        .map_err(ApiError::internal)?;
+    let corps = list_corps_inner(&state.pool, group_id, user_id, role).await?;
     Ok(Json(CorpsResponse { corps, role }))
 }
 
@@ -146,8 +144,7 @@ async fn link_corp(
     .bind(body.character_id)
     .bind(user_id)
     .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     let (char_uuid, granted_scopes) = char_row.ok_or(ApiError::BadRequest(
         "character not found or not yours".into(),
@@ -176,7 +173,7 @@ async fn link_corp(
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
 
-    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let mut tx = state.pool.begin().await?;
 
     // Upsert corp row.
     let corp_id: Uuid = sqlx::query_scalar(
@@ -195,8 +192,7 @@ async fn link_corp(
     .bind(&corp_info.name)
     .bind(&corp_info.ticker)
     .fetch_one(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     // Upsert corp principal.
     sqlx::query(
@@ -208,8 +204,7 @@ async fn link_corp(
     )
     .bind(corp_id)
     .execute(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     // Link corp to group. One row per pair: activate (clear unlinked_at) on relink.
     sqlx::query(
@@ -229,8 +224,7 @@ async fn link_corp(
     .bind(corp_id)
     .bind(user_id)
     .execute(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     // Upsert ambassador.
     sqlx::query(
@@ -247,15 +241,12 @@ async fn link_corp(
     .bind(char_uuid)
     .bind(&granted_scopes)
     .execute(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
-    tx.commit().await.map_err(ApiError::internal)?;
+    tx.commit().await?;
 
     // Return updated corp dto.
-    let corps = list_corps_inner(&state.pool, group_id, user_id, role)
-        .await
-        .map_err(ApiError::internal)?;
+    let corps = list_corps_inner(&state.pool, group_id, user_id, role).await?;
     let dto = corps
         .into_iter()
         .find(|c| c.id == corp_id)
@@ -287,8 +278,7 @@ async fn add_ambassador(
     .bind(body.character_id)
     .bind(user_id)
     .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     let (char_uuid, granted_scopes) = char_row.ok_or(ApiError::BadRequest(
         "character not found or not yours".into(),
@@ -311,7 +301,7 @@ async fn add_ambassador(
     .bind(group_id)
     .execute(&state.pool)
     .await
-    .map_err(ApiError::internal)?;
+    ?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -333,8 +323,7 @@ async fn remove_ambassador(
     .bind(corp_id)
     .bind(character_id)
     .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -349,7 +338,7 @@ async fn unlink_corp(
     }
     require_corp_in_group(&state.pool, group_id, corp_id).await?;
 
-    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let mut tx = state.pool.begin().await?;
 
     sqlx::query(
         "UPDATE group_corps SET unlinked_at = now() \
@@ -358,8 +347,7 @@ async fn unlink_corp(
     .bind(group_id)
     .bind(corp_id)
     .execute(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     // Disable ambassadors contributed through this group.
     sqlx::query(
@@ -369,8 +357,7 @@ async fn unlink_corp(
     .bind(corp_id)
     .bind(group_id)
     .execute(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     // If no other group links this corp, disable it (stop polling).
     let other_links: i64 = sqlx::query_scalar(
@@ -379,18 +366,16 @@ async fn unlink_corp(
     )
     .bind(corp_id)
     .fetch_one(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     if other_links == 0 {
         sqlx::query("UPDATE corps SET disabled_at = now() WHERE id = $1")
             .bind(corp_id)
             .execute(&mut *tx)
-            .await
-            .map_err(ApiError::internal)?;
+            .await?;
     }
 
-    tx.commit().await.map_err(ApiError::internal)?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -429,8 +414,7 @@ async fn list_journal(
     .bind(corp_id)
     .bind(user_id)
     .fetch_one(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     let is_owner: bool = sqlx::query_scalar(
         "SELECT EXISTS(
@@ -441,8 +425,7 @@ async fn list_journal(
     .bind(group_id)
     .bind(user_id)
     .fetch_one(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     let full_visibility = is_ambassador || is_owner;
     if !full_visibility {
@@ -484,8 +467,7 @@ async fn list_journal(
     .bind(q.limit.min(500))
     .bind(q.division)
     .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     let entries = rows
         .into_iter()
@@ -545,8 +527,7 @@ async fn patch_list_payer(
     .bind(list_id)
     .bind(user_id)
     .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     let group_id = row.ok_or_else(ApiError::forbidden)?.0;
 
@@ -557,8 +538,7 @@ async fn patch_list_payer(
     .bind(group_id)
     .bind(user_id)
     .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
     let actual_role: GroupRole = role_str
         .as_deref()
         .and_then(|s| s.parse().ok())
@@ -569,8 +549,7 @@ async fn patch_list_payer(
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM reimbursements WHERE list_id = $1)")
             .bind(list_id)
             .fetch_one(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
+            .await?;
 
     if has_reimbs {
         return Err(ApiError::Conflict(
@@ -588,8 +567,7 @@ async fn patch_list_payer(
         .bind(body.payer_corp_id)
         .bind(body.payer_division)
         .execute(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+        .await?;
 
     let detail = load_list_detail(&state, list_id, user_id, actual_role).await?;
     Ok(Json(detail))
@@ -609,8 +587,7 @@ async fn require_corp_in_group(
     .bind(group_id)
     .bind(corp_id)
     .fetch_one(pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     if !exists {
         return Err(ApiError::not_found());
@@ -748,4 +725,3 @@ async fn list_corps_inner(
 
     Ok(result)
 }
-

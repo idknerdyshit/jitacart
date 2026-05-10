@@ -31,14 +31,13 @@ async fn list_global(
          ORDER BY is_hub DESC, short_label",
     )
     .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
-    rows.into_iter()
-        .map(MarketRow::into_market)
-        .collect::<anyhow::Result<Vec<_>>>()
-        .map(Json)
-        .map_err(ApiError::internal)
+    Ok(Json(
+        rows.into_iter()
+            .map(MarketRow::into_market)
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    ))
 }
 
 #[derive(Serialize)]
@@ -85,14 +84,13 @@ async fn list_for_group(
     )
     .bind(group_id)
     .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
-    rows.into_iter()
-        .map(GroupMarketRow::into_group_market)
-        .collect::<anyhow::Result<Vec<_>>>()
-        .map(Json)
-        .map_err(ApiError::internal)
+    Ok(Json(
+        rows.into_iter()
+            .map(GroupMarketRow::into_group_market)
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    ))
 }
 
 #[derive(sqlx::FromRow)]
@@ -166,4 +164,3 @@ impl GroupMarketRow {
         })
     }
 }
-

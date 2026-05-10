@@ -79,7 +79,9 @@ async fn login(
         // First-time login: require a Turnstile token. Existing-user
         // re-logins pass through here too, but the captcha cost is
         // one-per-fresh-browser, not one-per-session-cookie-expiry.
-        let token = q.cf.as_deref().ok_or(ApiError::Forbidden("captcha verification required for new accounts".into()))?;
+        let token = q.cf.as_deref().ok_or(ApiError::Forbidden(
+            "captcha verification required for new accounts".into(),
+        ))?;
         let result = crate::turnstile::verify(
             &state.webhook_http,
             &state.config.turnstile.secret_key,
@@ -92,7 +94,9 @@ async fn login(
                 error_codes = ?result.error_codes,
                 "turnstile verification failed"
             );
-            return Err(ApiError::Forbidden("captcha verification required for new accounts".into()));
+            return Err(ApiError::Forbidden(
+                "captcha verification required for new accounts".into(),
+            ));
         }
     }
 
@@ -217,7 +221,10 @@ async fn callback(
         .await
         .map_err(|e| ApiError::Internal(anyhow!("exchange_code: {e}")))?;
 
-    let claims = state.jwks.verify(tokens.access_token.expose_secret()).await?;
+    let claims = state
+        .jwks
+        .verify(tokens.access_token.expose_secret())
+        .await?;
 
     if let Some(target) = pending.target_character_id {
         let returned = claims.character_id()?;
@@ -377,10 +384,7 @@ pub async fn do_set_active_character(
 /// the caller's `users.id` — for personal-data review or self-service
 /// off-boarding. Token plaintext is *never* included; only metadata
 /// like character names, scopes, and expiry timestamps.
-pub async fn do_export_me(
-    pool: &PgPool,
-    user_id: Uuid,
-) -> anyhow::Result<serde_json::Value> {
+pub async fn do_export_me(pool: &PgPool, user_id: Uuid) -> anyhow::Result<serde_json::Value> {
     let user: serde_json::Value = sqlx::query_scalar(
         "SELECT to_jsonb(u) - 'active_character_id' \
          FROM (SELECT id, display_name, created_at, active_character_id FROM users \
@@ -465,10 +469,7 @@ async fn export_me(
     State(state): State<AppState>,
     CurrentUser(user_id): CurrentUser,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    do_export_me(&state.pool, user_id)
-        .await
-        .map(Json)
-        .map_err(ApiError::internal)
+    Ok(Json(do_export_me(&state.pool, user_id).await?))
 }
 
 async fn upsert_character(
@@ -517,11 +518,10 @@ async fn upsert_character(
         Some((_, uid, _)) => *uid != target_user_id,
     };
     if would_add_new {
-        let count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM characters WHERE user_id = $1")
-                .bind(target_user_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM characters WHERE user_id = $1")
+            .bind(target_user_id)
+            .fetch_one(&mut *tx)
+            .await?;
         if count >= characters_cap {
             return Err(ApiError::QuotaExceeded(format!(
                 "you already have {count} linked characters (cap {characters_cap})"

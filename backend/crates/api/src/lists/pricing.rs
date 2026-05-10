@@ -35,16 +35,30 @@ pub(super) async fn fetch_prices_for_markets(
         .poll_intervals_secs
         .citadel_orders
         .saturating_mul(2) as i64;
-    let futs = markets.iter().map(|m| async move {
-        let map = match m.kind {
-            MarketKind::NpcHub => {
-                market::get_or_refresh_prices(&state.pool, &state.esi, m, type_ids, npc_ttl).await?
-            }
-            MarketKind::PublicStructure => {
-                read_group_citadel_prices(state, group_id, m, type_ids, citadel_ttl).await?
-            }
-        };
-        Ok::<_, anyhow::Error>((m.id, map))
+    let citadel_ids: Vec<Uuid> = markets
+        .iter()
+        .filter(|m| matches!(m.kind, MarketKind::PublicStructure))
+        .map(|m| m.id)
+        .collect();
+    let accessible = if citadel_ids.is_empty() {
+        HashSet::new()
+    } else {
+        accessible_market_ids(&state.pool, group_id, &citadel_ids).await?
+    };
+    let futs = markets.iter().map(|m| {
+        let accessible = &accessible;
+        async move {
+            let map = match m.kind {
+                MarketKind::NpcHub => {
+                    market::get_or_refresh_prices(&state.pool, &state.esi, m, type_ids, npc_ttl)
+                        .await?
+                }
+                MarketKind::PublicStructure => {
+                    read_group_citadel_prices(state, m, type_ids, citadel_ttl, accessible).await?
+                }
+            };
+            Ok::<_, anyhow::Error>((m.id, map))
+        }
     });
     let results = futures_util::future::try_join_all(futs).await?;
     Ok(results.into_iter().collect())
@@ -52,16 +66,12 @@ pub(super) async fn fetch_prices_for_markets(
 
 pub(super) async fn read_group_citadel_prices(
     state: &AppState,
-    group_id: Uuid,
     market: &Market,
     type_ids: &[i64],
     ttl_secs: i64,
+    accessible: &HashSet<Uuid>,
 ) -> anyhow::Result<HashMap<i64, market::PriceAggregate>> {
-    if !market.is_public || type_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let accessible = accessible_market_ids(&state.pool, group_id, &[market.id]).await?;
-    if !accessible.contains(&market.id) {
+    if !market.is_public || type_ids.is_empty() || !accessible.contains(&market.id) {
         return Ok(HashMap::new());
     }
     read_cached_prices(&state.pool, market.id, type_ids, ttl_secs).await
@@ -200,7 +210,7 @@ pub(super) async fn recompute_estimates(
         let markets: Vec<domain::Market> = market_rows
             .into_iter()
             .map(MarketRow::into_market)
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect();
 
         let items: Vec<(Uuid, i64)> =
             sqlx::query_as("SELECT id, type_id FROM list_items WHERE list_id = $1")
@@ -226,21 +236,54 @@ pub(super) async fn recompute_estimates(
             continue;
         }
 
-        let mut total: Decimal = Decimal::ZERO;
+        // Build the (id, est_unit, est_market) triples then push them in one
+        // round-trip via UNNEST. RETURNING gives us the qty per item so we
+        // can fold into the running total without a second SELECT.
+        let mut item_ids: Vec<Uuid> = Vec::with_capacity(items.len());
+        let mut est_units: Vec<Option<Decimal>> = Vec::with_capacity(items.len());
+        let mut est_markets: Vec<Option<Uuid>> = Vec::with_capacity(items.len());
         for (item_id, type_id) in &items {
             let (est_unit, est_market) = pick_cheapest(&markets, &prices_by_market, *type_id);
-            let qty: i64 = sqlx::query_scalar(
-                "UPDATE list_items \
-                 SET est_unit_price_isk = $1, est_priced_market_id = $2 \
-                 WHERE id = $3 RETURNING qty_requested",
+            item_ids.push(*item_id);
+            est_units.push(est_unit);
+            est_markets.push(est_market);
+        }
+
+        #[derive(sqlx::FromRow)]
+        struct UpdRow {
+            id: Uuid,
+            qty_requested: i64,
+        }
+        let updated: Vec<UpdRow> = if items.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_as(
+                "UPDATE list_items li \
+                 SET est_unit_price_isk = src.est_unit, \
+                     est_priced_market_id = src.est_market \
+                 FROM UNNEST($1::uuid[], $2::numeric[], $3::uuid[]) \
+                     AS src(id, est_unit, est_market) \
+                 WHERE li.id = src.id \
+                 RETURNING li.id, li.qty_requested",
             )
-            .bind(est_unit)
-            .bind(est_market)
-            .bind(item_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if let Some(u) = est_unit {
-                total += u * Decimal::from(qty);
+            .bind(&item_ids)
+            .bind(&est_units)
+            .bind(&est_markets)
+            .fetch_all(&mut *tx)
+            .await?
+        };
+
+        // RETURNING order isn't guaranteed; index est_unit by item_id so the
+        // total is computed deterministically.
+        let est_by_id: HashMap<Uuid, Option<Decimal>> = item_ids
+            .iter()
+            .copied()
+            .zip(est_units.iter().copied())
+            .collect();
+        let mut total: Decimal = Decimal::ZERO;
+        for r in &updated {
+            if let Some(Some(u)) = est_by_id.get(&r.id) {
+                total += *u * Decimal::from(r.qty_requested);
             }
         }
 

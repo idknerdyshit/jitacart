@@ -1,13 +1,30 @@
 //! NPC-hub price refresh tick. Logic preserved from the pre-refactor worker.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use anyhow::anyhow;
 use auth_tokens::budgeted;
 use domain::{Market, MarketKind};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::Ctx;
+use crate::{Ctx, WorkerConfig};
+
+use super::{JobFuture, JobSlot};
+
+pub struct Job;
+
+impl JobSlot for Job {
+    fn name(&self) -> &'static str {
+        "npc_hubs"
+    }
+    fn interval_secs(&self, cfg: &WorkerConfig) -> u64 {
+        cfg.worker.tick_secs
+    }
+    fn run<'a>(&'a self, ctx: &'a Ctx) -> JobFuture<'a> {
+        Box::pin(run(ctx))
+    }
+}
 
 pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
     if !ctx.budget.has_budget() {
@@ -50,17 +67,13 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
 
     let mut by_market: HashMap<Uuid, (Market, Vec<i64>)> = HashMap::new();
     for r in rows {
-        let kind = r
-            .kind
-            .parse::<MarketKind>()
-            .map_err(|e| anyhow!("bad market kind: {e}"))?;
         by_market
             .entry(r.market_id)
             .or_insert_with(|| {
                 (
                     Market {
                         id: r.market_id,
-                        kind,
+                        kind: r.kind,
                         esi_location_id: r.esi_location_id,
                         region_id: r.region_id,
                         name: r.name.clone(),
@@ -81,19 +94,27 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
     let pool = &ctx.pool;
     let esi = ctx.esi_anon.as_ref();
     let budget = &ctx.budget;
-    let refreshes = by_market.into_iter().map(|(_, (m, type_ids))| async move {
-        let label = m.short_label.clone().unwrap_or_else(|| "(unnamed)".into());
-        let inner = type_ids.into_iter().map(|type_id| {
-            let m = m.clone();
-            async move {
-                let r = budgeted(budget, market::refresh_one(pool, esi, &m, type_id)).await;
-                (type_id, r)
-            }
-        });
-        let results = futures_util::future::join_all(inner).await;
-        for (type_id, res) in results {
-            if let Err(e) = res {
-                tracing::warn!(error = ?e, market = %label, type_id, "market refresh failed");
+    // Cap (market × type_id) fan-out so a list with N markets and M items
+    // doesn't open N*M concurrent ESI calls.
+    let sem = Arc::new(Semaphore::new(ctx.config.worker.npc_hub_concurrency));
+    let refreshes = by_market.into_iter().map(|(_, (m, type_ids))| {
+        let sem = sem.clone();
+        async move {
+            let label = m.short_label.clone().unwrap_or_else(|| "(unnamed)".into());
+            let inner = type_ids.into_iter().map(|type_id| {
+                let m = m.clone();
+                let sem = sem.clone();
+                async move {
+                    let _permit = sem.acquire().await.expect("semaphore not closed");
+                    let r = budgeted(budget, market::refresh_one(pool, esi, &m, type_id)).await;
+                    (type_id, r)
+                }
+            });
+            let results = futures_util::future::join_all(inner).await;
+            for (type_id, res) in results {
+                if let Err(e) = res {
+                    tracing::warn!(error = ?e, market = %label, type_id, "market refresh failed");
+                }
             }
         }
     });
@@ -104,7 +125,7 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
 #[derive(sqlx::FromRow)]
 struct TickRow {
     market_id: Uuid,
-    kind: String,
+    kind: MarketKind,
     esi_location_id: i64,
     region_id: Option<i64>,
     name: Option<String>,

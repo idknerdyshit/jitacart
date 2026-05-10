@@ -88,7 +88,7 @@ pub(super) struct ListForGroupQuery {
 struct ListSummaryRow {
     id: Uuid,
     destination_label: Option<String>,
-    status: String,
+    status: ListStatus,
     total_estimate_isk: Decimal,
     created_at: DateTime<Utc>,
     item_count: i64,
@@ -96,20 +96,16 @@ struct ListSummaryRow {
 }
 
 impl ListSummaryRow {
-    fn into_summary(self) -> anyhow::Result<ListSummary> {
-        let status = self
-            .status
-            .parse::<ListStatus>()
-            .map_err(anyhow::Error::msg)?;
-        Ok(ListSummary {
+    fn into_summary(self) -> ListSummary {
+        ListSummary {
             id: self.id,
             destination_label: self.destination_label,
-            status,
+            status: self.status,
             item_count: self.item_count,
             total_estimate_isk: self.total_estimate_isk,
             primary_market_short_label: self.primary_short_label,
             created_at: self.created_at,
-        })
+        }
     }
 }
 
@@ -379,12 +375,17 @@ pub(super) async fn list_for_group(
                l.status,
                l.total_estimate_isk,
                l.created_at,
-               (SELECT count(*) FROM list_items li WHERE li.list_id = l.id) AS item_count,
+               COALESCE(agg.item_count, 0) AS item_count,
                (SELECT m.short_label
                   FROM list_markets lm JOIN markets m ON m.id = lm.market_id
                   WHERE lm.list_id = l.id AND lm.is_primary
                   LIMIT 1) AS primary_short_label
         FROM lists l
+        LEFT JOIN (
+            SELECT list_id, count(*) AS item_count
+            FROM list_items
+            GROUP BY list_id
+        ) agg ON agg.list_id = l.id
         WHERE l.group_id = $1 AND ($2 OR l.status <> 'archived')
         ORDER BY l.created_at DESC
         "#,
@@ -395,9 +396,7 @@ pub(super) async fn list_for_group(
     .await?;
 
     Ok(Json(
-        rows.into_iter()
-            .map(ListSummaryRow::into_summary)
-            .collect::<anyhow::Result<Vec<_>>>()?,
+        rows.into_iter().map(ListSummaryRow::into_summary).collect(),
     ))
 }
 
@@ -423,12 +422,10 @@ pub(super) async fn patch_list(
         return Err(ApiError::BadRequest("nothing to update".into()));
     }
     if body.status.is_none() {
-        cur.require_mutable()
-            .map_err(|_| ApiError::Conflict("list is archived; no changes can be made".into()))?;
+        cur.require_mutable()?;
     }
     if body.status.is_some() {
-        cur.require_can_manage()
-            .map_err(|_| ApiError::forbidden())?;
+        cur.require_can_manage()?;
     }
     let CurrentList {
         list_id,
@@ -448,7 +445,7 @@ pub(super) async fn patch_list(
     }
     if let Some(status) = body.status {
         q.push(", status = ");
-        q.push_bind(status.as_str());
+        q.push_bind(status);
     }
     q.push(" WHERE id = ");
     q.push_bind(list_id);
@@ -480,8 +477,7 @@ pub(super) async fn replace_markets(
     cur: CurrentList,
     Json(body): Json<ReplaceMarketsBody>,
 ) -> Result<Json<ListDetail>, ApiError> {
-    cur.require_mutable()
-        .map_err(|_| ApiError::Conflict("list is archived; no changes can be made".into()))?;
+    cur.require_mutable()?;
     let CurrentList {
         list_id,
         group_id,

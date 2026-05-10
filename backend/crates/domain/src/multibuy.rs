@@ -49,8 +49,12 @@ pub fn parse_multibuy(input: &str) -> ParsedMultibuy {
     let mut order: Vec<String> = Vec::new();
     let mut errors: Vec<LineError> = Vec::new();
 
+    const MAX_LINE_NOS_PER_KEY: usize = 1024;
     for (idx, raw) in input.lines().enumerate() {
-        let line_no: u32 = (idx as u32) + 1;
+        // u32 saturates at 4B lines — saturating cast keeps a pathological
+        // input from wrapping line numbers around to small positive values.
+        let idx_capped: u32 = u32::try_from(idx).unwrap_or(u32::MAX);
+        let line_no: u32 = idx_capped.saturating_add(1);
         let normalized = raw.replace('\u{00A0}', " ");
         let trimmed = normalized.trim();
         if trimmed.is_empty() {
@@ -77,7 +81,9 @@ pub fn parse_multibuy(input: &str) -> ParsedMultibuy {
                 match agg.get_mut(&key) {
                     Some(existing) => {
                         existing.qty = existing.qty.saturating_add(qty);
-                        existing.line_nos.push(line_no);
+                        if existing.line_nos.len() < MAX_LINE_NOS_PER_KEY {
+                            existing.line_nos.push(line_no);
+                        }
                     }
                     None => {
                         order.push(key.clone());

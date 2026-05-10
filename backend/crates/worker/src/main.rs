@@ -5,10 +5,7 @@
 //! detail/orders). The shared `EsiBudgetGuard` is consulted before every
 //! batch.
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
@@ -19,6 +16,8 @@ use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::time::{interval, MissedTickBehavior};
+
+use jobs::JobSlot;
 
 mod jobs;
 
@@ -140,6 +139,8 @@ pub struct WorkerSection {
     pub corp_contracts_concurrency: usize,
     #[serde(default = "default_corp_wallet_concurrency")]
     pub corp_wallet_concurrency: usize,
+    #[serde(default = "default_npc_hub_concurrency")]
+    pub npc_hub_concurrency: usize,
 }
 
 impl Default for WorkerSection {
@@ -153,6 +154,7 @@ impl Default for WorkerSection {
             contracts_concurrency: default_contracts_concurrency(),
             corp_contracts_concurrency: default_corp_contracts_concurrency(),
             corp_wallet_concurrency: default_corp_wallet_concurrency(),
+            npc_hub_concurrency: default_npc_hub_concurrency(),
         }
     }
 }
@@ -175,6 +177,9 @@ fn default_citadel_orders_concurrency() -> usize {
 }
 fn default_contracts_concurrency() -> usize {
     4
+}
+fn default_npc_hub_concurrency() -> usize {
+    8
 }
 
 pub struct Ctx {
@@ -204,11 +209,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("connecting to postgres")?;
 
-    let cipher = auth_tokens::build_cipher(
-        config.token_enc.as_ref(),
-        config.token_enc_key.as_deref(),
-    )
-    .context("building token-at-rest cipher")?;
+    let cipher =
+        auth_tokens::build_cipher(config.token_enc.as_ref(), config.token_enc_key.as_deref())
+            .context("building token-at-rest cipher")?;
 
     let token_store = CharacterTokenStore::new(
         pool.clone(),
@@ -236,79 +239,39 @@ async fn main() -> anyhow::Result<()> {
 
     spawn_healthz(&ctx).await?;
 
-    let intervals = &ctx.config.esi.poll_intervals_secs;
-
-    let mut hub_prices = mk_interval(ctx.config.worker.tick_secs);
-    let mut citadel_discovery = mk_interval(intervals.citadel_discovery);
-    let mut citadel_details = mk_interval(intervals.citadel_details.min(300));
-    let mut citadel_orders = mk_interval(intervals.citadel_orders);
-    // Contracts polls a per-character cursor, so we tick at the worker cadence
-    // and let the cursor's `next_poll_at` decide which characters are due.
-    let mut contracts = mk_interval(ctx.config.worker.tick_secs);
-    // Corp pollers also tick at worker cadence; their per-corp cursors decide
-    // which corps are due each tick.
-    let mut corp_contracts = mk_interval(ctx.config.worker.tick_secs);
-    let mut corp_wallet = mk_interval(ctx.config.worker.tick_secs);
-    let mut budget_reset = mk_interval(60);
-    // Hourly drain of any character rows still encrypted with a non-primary kid.
-    let mut token_reencrypt = mk_interval(3600);
-    let hub_prices_running = Arc::new(AtomicBool::new(false));
-    let citadel_discovery_running = Arc::new(AtomicBool::new(false));
-    let citadel_details_running = Arc::new(AtomicBool::new(false));
-    let citadel_orders_running = Arc::new(AtomicBool::new(false));
-    let contracts_running = Arc::new(AtomicBool::new(false));
-    let corp_contracts_running = Arc::new(AtomicBool::new(false));
-    let corp_wallet_running = Arc::new(AtomicBool::new(false));
-    let token_reencrypt_running = Arc::new(AtomicBool::new(false));
-
-    loop {
-        tokio::select! {
-            _ = hub_prices.tick() => spawn_guarded(&ctx, &hub_prices_running, "npc_hubs", |c| async move {
-                jobs::npc_hubs::run(&c).await
-            }),
-            _ = citadel_discovery.tick() => spawn_guarded(&ctx, &citadel_discovery_running, "citadel_discovery", |c| async move {
-                jobs::citadel_discovery::run(&c).await
-            }),
-            _ = citadel_details.tick() => spawn_guarded(&ctx, &citadel_details_running, "citadel_details", |c| async move {
-                jobs::citadel_details::run(&c).await
-            }),
-            _ = citadel_orders.tick() => spawn_guarded(&ctx, &citadel_orders_running, "citadel_orders", |c| async move {
-                jobs::citadel_orders::run(&c).await
-            }),
-            _ = contracts.tick() => spawn_guarded(&ctx, &contracts_running, "contracts", |c| async move {
-                jobs::contracts::run(&c).await
-            }),
-            _ = corp_contracts.tick() => spawn_guarded(&ctx, &corp_contracts_running, "corp_contracts", |c| async move {
-                jobs::corp_contracts::run(&c).await
-            }),
-            _ = corp_wallet.tick() => spawn_guarded(&ctx, &corp_wallet_running, "corp_wallet", |c| async move {
-                jobs::corp_wallet::run(&c).await
-            }),
-            _ = token_reencrypt.tick() => spawn_guarded(&ctx, &token_reencrypt_running, "token_reencrypt", |c| async move {
-                jobs::token_reencrypt::run(&c).await
-            }),
-            _ = budget_reset.tick() => ctx.budget.reset(),
-        }
+    // One driver task per slot — each owns its interval and runs the job
+    // inline, so a long tick naturally back-pressures only its own slot
+    // (MissedTickBehavior::Delay). The "previous tick still running" guard the
+    // old `select!` loop needed disappears with this layout.
+    for slot in jobs::registry() {
+        let ctx_for_slot = Arc::clone(&ctx);
+        tokio::spawn(drive_slot(slot, ctx_for_slot));
     }
-}
 
-fn spawn_guarded<F, Fut>(ctx: &Arc<Ctx>, running: &Arc<AtomicBool>, label: &'static str, job: F)
-where
-    F: FnOnce(Arc<Ctx>) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
-{
-    if running.swap(true, Ordering::AcqRel) {
-        tracing::warn!("{label} tick skipped: previous run still active");
-        return;
-    }
-    let ctx = Arc::clone(ctx);
-    let running = Arc::clone(running);
+    // Budget reset isn't a job — it just pokes the rate-limit window.
+    let budget_ctx = Arc::clone(&ctx);
     tokio::spawn(async move {
-        let _g = RunningGuard(running);
-        if let Err(e) = job(ctx).await {
-            tracing::error!(error = ?e, "{label} tick failed");
+        let mut t = mk_interval(60);
+        loop {
+            t.tick().await;
+            budget_ctx.budget.reset();
         }
     });
+
+    // Park forever; ctrl-c takes the runtime down.
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+async fn drive_slot(slot: Box<dyn JobSlot>, ctx: Arc<Ctx>) {
+    let secs = slot.interval_secs(&ctx.config);
+    let mut t = mk_interval(secs);
+    loop {
+        t.tick().await;
+        if let Err(e) = slot.run(&ctx).await {
+            tracing::error!(error = ?e, slot = slot.name(), "tick failed");
+        }
+    }
 }
 
 fn mk_interval(secs: u64) -> tokio::time::Interval {
@@ -356,12 +319,4 @@ async fn spawn_healthz(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
         }
     });
     Ok(())
-}
-
-struct RunningGuard(Arc<AtomicBool>);
-
-impl Drop for RunningGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
 }

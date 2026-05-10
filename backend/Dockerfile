@@ -13,7 +13,7 @@
 # stubs vs. real sources, and the cache mount alone gives us most of
 # the win on second builds.
 
-FROM rust:1.95-slim-bookworm AS builder
+FROM rust:1.95-slim-bookworm@sha256:b8ecdb97c5b9c1ae058249f72710dbe33d4da19f7b8d911bd3c72e5f048af251 AS builder
 WORKDIR /build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -31,7 +31,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/jitacart-worker /usr/local/bin/jitacart-worker
 
 # ── Runtime image ──────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:67b30a61dc87758f0caf819646104f29ecbda97d920aaf5edc834128ac8493d3 AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tini \
     && rm -rf /var/lib/apt/lists/* \

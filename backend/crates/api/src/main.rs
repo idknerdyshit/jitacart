@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{anyhow, Context};
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{extract::DefaultBodyLimit, extract::State, routing::get, Json, Router};
 use nea_esi::EsiClient;
 use secrecy::SecretString;
 use sqlx::postgres::PgPoolOptions;
@@ -37,11 +37,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("running migrations")?;
 
-    let cipher = auth_tokens::build_cipher(
-        config.token_enc.as_ref(),
-        config.token_enc_key.as_deref(),
-    )
-    .context("building token-at-rest cipher")?;
+    let cipher =
+        auth_tokens::build_cipher(config.token_enc.as_ref(), config.token_enc_key.as_deref())
+            .context("building token-at-rest cipher")?;
 
     let http = reqwest::Client::builder()
         .user_agent(&config.esi.user_agent)
@@ -64,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("running tower-sessions migrations")?;
     let session_layer = SessionManagerLayer::new(session_store)
-        .with_secure(false)
+        .with_secure(config.server.cookie_secure)
         .with_http_only(true)
         .with_same_site(tower_sessions::cookie::SameSite::Lax)
         .with_expiry(Expiry::OnInactivity(TimeDuration::days(30)));
@@ -149,6 +147,10 @@ async fn main() -> anyhow::Result<()> {
     //   PropagateRequestId — copies the id into the response header
     let app = auth_routes
         .merge(other_routes)
+        // 256 KiB is generous for our largest expected payload (multibuy
+        // pastes); anything larger is almost certainly a misconfigured
+        // client or an abuse attempt. Json/extractors inherit this.
+        .layer(DefaultBodyLimit::max(256 * 1024))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(session_layer)
         .layer(

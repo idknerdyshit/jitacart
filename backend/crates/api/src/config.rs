@@ -122,6 +122,14 @@ pub struct TurnstileConfig {
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
     pub bind: String,
+    /// Set the `Secure` flag on the session cookie. Defaults to true; tests
+    /// and local docker setups can override via `JITACART_SERVER__COOKIE_SECURE=false`.
+    #[serde(default = "default_cookie_secure")]
+    pub cookie_secure: bool,
+}
+
+fn default_cookie_secure() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]

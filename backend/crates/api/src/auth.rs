@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Context};
 use axum::{
     extract::{Query, State},
+    http::HeaderMap,
     response::Redirect,
     routing::{get, patch, post},
     Json, Router,
@@ -68,6 +69,7 @@ struct LoginQuery {
 async fn login(
     State(state): State<AppState>,
     session: Session,
+    headers: HeaderMap,
     Query(q): Query<LoginQuery>,
 ) -> Result<Redirect, ApiError> {
     let session_user: Option<Uuid> = session.get(SESSION_KEY_USER).await?;
@@ -82,11 +84,19 @@ async fn login(
         let token = q.cf.as_deref().ok_or(ApiError::Forbidden(
             "captcha verification required for new accounts".into(),
         ))?;
+        // X-Forwarded-For is set by the trusted reverse proxy (Caddy); take
+        // the first hop. Behind a misconfigured proxy this is None, which
+        // Turnstile accepts.
+        let remote_ip: Option<&str> = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim);
         let result = crate::turnstile::verify(
             &state.webhook_http,
             &state.config.turnstile.secret_key,
             token,
-            None,
+            remote_ip,
         )
         .await?;
         if !result.success {

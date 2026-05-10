@@ -32,8 +32,10 @@ log() {
 require() {
     local var="$1"
     if [[ -z "${!var:-}" ]]; then
-        log warn "missing required env var: $var; skipping this run"
-        exit 0
+        log error "missing required env var: $var; aborting"
+        # Non-zero exit so the container restart loop surfaces a missing
+        # config to operators rather than silently succeeding.
+        exit 1
     fi
 }
 

@@ -18,7 +18,7 @@ x-logging: &default-logging
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
     restart: unless-stopped
     environment:
       POSTGRES_USER: jitacart
@@ -75,7 +75,7 @@ services:
         required: false
     environment:
       DATABASE_URL: postgres://jitacart:${POSTGRES_PASSWORD}@postgres:5432/jitacart
-      WORKER__HEALTHZ_BIND: 0.0.0.0:9091
+      WORKER__HEALTHZ_BIND: 127.0.0.1:9091
     expose:
       - "9091"
     healthcheck:
@@ -106,7 +106,7 @@ services:
     logging: *default-logging
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
     restart: unless-stopped
     depends_on:
       api:

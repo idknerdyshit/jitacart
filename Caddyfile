@@ -12,17 +12,31 @@
 {$JC_DOMAIN} {
     encode zstd gzip
 
-    # Trust the proxy chain in front of us, if any (none by default).
-    # For real internet exposure, leave this commented; Caddy is the edge.
+    # Security headers. The CSP is intentionally narrow:
+    # - script-src 'self' allows the SvelteKit hydration bundle.
+    # - img-src adds images.evetech.net (EVE icons) and data: for inline
+    #   SVGs the SvelteKit bundle inlines.
+    # - connect-src 'self' covers the api fetches.
+    # - frame-ancestors 'none' is a defence-in-depth alongside X-Frame-Options.
+    header {
+        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://images.evetech.net; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        # Strip Caddy's own banner so it's not leaked.
+        -Server
+    }
 
     @api path /api/*
     handle @api {
         # Strip the /api prefix before forwarding.
         uri strip_prefix /api
         reverse_proxy api:8080 {
-            # Forward original client info; the API doesn't currently
-            # consume these but tower-governor's IP extractor benefits.
+            # Forward original client info; api/auth login uses
+            # X-Forwarded-For when calling Cloudflare Turnstile.
             header_up X-Real-IP {http.request.remote.host}
+            header_up X-Forwarded-For {http.request.remote.host}
         }
     }
 

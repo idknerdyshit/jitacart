@@ -135,7 +135,8 @@ pub async fn do_delete_webhook(
 
 // ── Fire-and-forget webhook delivery ────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
 pub enum WebhookEvent {
     ListCreated {
         list_destination: String,

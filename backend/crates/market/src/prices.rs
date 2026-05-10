@@ -159,13 +159,13 @@ pub async fn refresh_one(
         .filter(|o| o.location_id == market.esi_location_id)
     {
         if o.is_buy_order {
-            buy_volume += o.volume_remain;
+            buy_volume = buy_volume.saturating_add(o.volume_remain);
             best_buy_f = Some(match best_buy_f {
                 Some(c) => c.max(o.price),
                 None => o.price,
             });
         } else {
-            sell_volume += o.volume_remain;
+            sell_volume = sell_volume.saturating_add(o.volume_remain);
             best_sell_f = Some(match best_sell_f {
                 Some(c) => c.min(o.price),
                 None => o.price,
@@ -250,10 +250,7 @@ pub async fn refresh_many_for_citadel(
         .await
         .map_err(|_| anyhow::anyhow!("ESI semaphore closed"))?;
 
-    let orders = esi
-        .structure_orders(structure_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("ESI structure_orders({structure_id}): {e}"))?;
+    let orders = esi.structure_orders(structure_id).await?;
     let total_orders = orders.len();
 
     let wanted: HashSet<i64> = type_ids.iter().copied().collect();

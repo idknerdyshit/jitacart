@@ -11,13 +11,30 @@
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use nea_esi::EsiError;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::jobs::csa::{self, AccessDimension};
-use crate::Ctx;
+use crate::{Ctx, WorkerConfig};
+
+use super::{JobFuture, JobSlot};
 
 const BATCH: i64 = 50;
+
+pub struct Job;
+
+impl JobSlot for Job {
+    fn name(&self) -> &'static str {
+        "citadel_orders"
+    }
+    fn interval_secs(&self, cfg: &WorkerConfig) -> u64 {
+        cfg.esi.poll_intervals_secs.citadel_orders
+    }
+    fn run<'a>(&'a self, ctx: &'a Ctx) -> JobFuture<'a> {
+        Box::pin(run(ctx))
+    }
+}
 
 pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
     if !ctx.budget.has_budget() {
@@ -149,30 +166,38 @@ async fn refresh_one(
                 break;
             }
             Err(e) => {
-                let msg = format!("{e}");
                 budget.record_non_2xx();
-                let lower = msg.to_ascii_lowercase();
-                if lower.contains("403") || lower.contains("forbidden") {
-                    access_denied_count += 1;
-                    csa::upsert_access(
-                        pool,
-                        *cid,
-                        row.market_id,
-                        "forbidden",
-                        AccessDimension::Market,
-                    )
-                    .await?;
-                } else if lower.contains("404") {
-                    sqlx::query("UPDATE markets SET is_public = false WHERE id = $1")
-                        .bind(row.market_id)
-                        .execute(pool)
+                let esi_status = e.downcast_ref::<EsiError>().and_then(|e| match e {
+                    EsiError::Api { status, .. } => Some(*status),
+                    _ => None,
+                });
+                match esi_status {
+                    Some(403) => {
+                        access_denied_count += 1;
+                        csa::upsert_access(
+                            pool,
+                            *cid,
+                            row.market_id,
+                            "forbidden",
+                            AccessDimension::Market,
+                        )
                         .await?;
-                    return Err(anyhow!("structure 404, marked non-public"));
-                } else {
-                    transient_count += 1;
+                        last_status = Some("403 Forbidden".to_string());
+                        continue;
+                    }
+                    Some(404) => {
+                        sqlx::query("UPDATE markets SET is_public = false WHERE id = $1")
+                            .bind(row.market_id)
+                            .execute(pool)
+                            .await?;
+                        return Err(anyhow!("structure 404, marked non-public"));
+                    }
+                    _ => {
+                        transient_count += 1;
+                        last_status = Some(format!("{e}"));
+                        continue;
+                    }
                 }
-                last_status = Some(msg);
-                continue;
             }
         }
     }

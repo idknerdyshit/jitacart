@@ -10,6 +10,7 @@
 //!   because the contract finishing in EVE is itself proof of delivery.
 
 use chrono::{DateTime, Utc};
+use domain::{ContractStatus, ContractType, ReimbursementStatus};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{Postgres, Transaction};
@@ -20,7 +21,7 @@ pub enum SettlementError {
     #[error("settlement target not found")]
     NotFound,
     #[error("not in pending state: {0}")]
-    NotPending(String),
+    NotPending(ReimbursementStatus),
     #[error("items still owe delivery: {count}")]
     NotDelivered { count: i64 },
     #[error("database error: {0}")]
@@ -41,8 +42,8 @@ pub struct ContractUpsert {
     // Principal-id fields (may be None if resolution failed).
     pub issuer_principal_id: Option<Uuid>,
     pub assignee_principal_id: Option<Uuid>,
-    pub contract_type: String,
-    pub status: String,
+    pub contract_type: ContractType,
+    pub status: ContractStatus,
     pub price_isk: Decimal,
     pub reward_isk: Decimal,
     pub collateral_isk: Decimal,
@@ -62,16 +63,16 @@ pub struct ContractUpsert {
 pub struct ContractUpsertOutcome {
     pub contract_id: Uuid,
     /// Previous status row before the upsert, if the contract was already known.
-    pub prior_status: Option<String>,
+    pub prior_status: Option<ContractStatus>,
     /// Status persisted after the upsert.
-    pub current_status: String,
+    pub current_status: ContractStatus,
     /// Items have not yet been fetched into `contract_items`.
     pub needs_items: bool,
 }
 
 impl ContractUpsertOutcome {
     pub fn status_changed(&self) -> bool {
-        self.prior_status.as_deref() != Some(self.current_status.as_str())
+        self.prior_status != Some(self.current_status)
     }
 }
 
@@ -79,7 +80,7 @@ pub async fn upsert_contract(
     tx: &mut Transaction<'_, Postgres>,
     upsert: &ContractUpsert,
 ) -> Result<ContractUpsertOutcome, SettlementError> {
-    let prior: Option<(Uuid, String, Option<DateTime<Utc>>)> = sqlx::query_as(
+    let prior: Option<(Uuid, ContractStatus, Option<DateTime<Utc>>)> = sqlx::query_as(
         "SELECT id, status, items_synced_at FROM contracts \
          WHERE esi_contract_id = $1 FOR UPDATE",
     )
@@ -119,8 +120,8 @@ pub async fn upsert_contract(
         .bind(upsert.issuer_user_id)
         .bind(upsert.assignee_character_id)
         .bind(upsert.assignee_user_id)
-        .bind(&upsert.contract_type)
-        .bind(&upsert.status)
+        .bind(upsert.contract_type)
+        .bind(upsert.status)
         .bind(upsert.price_isk)
         .bind(upsert.reward_isk)
         .bind(upsert.collateral_isk)
@@ -140,7 +141,7 @@ pub async fn upsert_contract(
         Ok(ContractUpsertOutcome {
             contract_id: id,
             prior_status: Some(prior_status),
-            current_status: upsert.status.clone(),
+            current_status: upsert.status,
             needs_items: items_synced_at.is_none(),
         })
     } else {
@@ -155,8 +156,8 @@ pub async fn upsert_contract(
                 date_issued, date_expired, date_accepted, date_completed,
                 start_location_id, end_location_id, raw_json, source_corp_id
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18, $19, $20
+                $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
             )
             RETURNING id
             "#,
@@ -168,8 +169,8 @@ pub async fn upsert_contract(
         .bind(upsert.assignee_user_id)
         .bind(upsert.issuer_principal_id)
         .bind(upsert.assignee_principal_id)
-        .bind(&upsert.contract_type)
-        .bind(&upsert.status)
+        .bind(upsert.contract_type)
+        .bind(upsert.status)
         .bind(upsert.price_isk)
         .bind(upsert.reward_isk)
         .bind(upsert.collateral_isk)
@@ -187,7 +188,7 @@ pub async fn upsert_contract(
         Ok(ContractUpsertOutcome {
             contract_id: id,
             prior_status: None,
-            current_status: upsert.status.clone(),
+            current_status: upsert.status,
             needs_items: true,
         })
     }
@@ -412,7 +413,7 @@ pub async fn settle_manual(
     reimbursement_id: Uuid,
     settled_by_user_id: Uuid,
 ) -> Result<(), SettlementError> {
-    let row: Option<(Uuid, Option<Uuid>, Uuid, String, bool)> = sqlx::query_as(
+    let row: Option<(Uuid, Option<Uuid>, Uuid, ReimbursementStatus, bool)> = sqlx::query_as(
         "SELECT list_id, requester_user_id, hauler_user_id, status, is_corp_funded \
          FROM reimbursements WHERE id = $1 FOR UPDATE",
     )
@@ -423,7 +424,7 @@ pub async fn settle_manual(
     let (list_id, requester_user_id, hauler_user_id, status, is_corp_funded) =
         row.ok_or(SettlementError::NotFound)?;
 
-    if status != "pending" {
+    if status != ReimbursementStatus::Pending {
         return Err(SettlementError::NotPending(status));
     }
 
@@ -538,15 +539,18 @@ pub async fn settle_manual(
 ///   true` and computes a per-reimbursement `wallet_settlement_delta_isk`.
 ///
 /// If no journal rows match (not yet visible), does nothing — no error.
+///
+/// Runs inside the caller's transaction. The contract row is locked
+/// (FOR UPDATE) so concurrent verifies see a consistent snapshot.
 pub async fn verify_contract_against_journal(
-    pool: &sqlx::PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     contract_id: Uuid,
 ) -> Result<(), SettlementError> {
-    // Fetch esi_contract_id and price_isk for this contract.
+    // Fetch esi_contract_id and price_isk for this contract; lock the row.
     let row: Option<(i64, Decimal)> =
-        sqlx::query_as("SELECT esi_contract_id, price_isk FROM contracts WHERE id = $1")
+        sqlx::query_as("SELECT esi_contract_id, price_isk FROM contracts WHERE id = $1 FOR UPDATE")
             .bind(contract_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut **tx)
             .await?;
 
     let (esi_contract_id, _price_isk) = match row {
@@ -565,7 +569,7 @@ pub async fn verify_contract_against_journal(
          LIMIT 1",
     )
     .bind(contract_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await?;
 
     // Sum journal entries for this ESI contract_id (contract_price ref_type only),
@@ -587,7 +591,7 @@ pub async fn verify_contract_against_journal(
             .bind(esi_contract_id)
             .bind(corp_id)
             .bind(division)
-            .fetch_one(pool)
+            .fetch_one(&mut **tx)
             .await?
         }
         None => {
@@ -603,7 +607,7 @@ pub async fn verify_contract_against_journal(
                 "#,
             )
             .bind(esi_contract_id)
-            .fetch_one(pool)
+            .fetch_one(&mut **tx)
             .await?
         }
     };
@@ -623,7 +627,7 @@ pub async fn verify_contract_against_journal(
     )
     .bind(contract_id)
     .bind(payout_aggregate)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     // Fetch all pending/settled reimbursements bound to this contract.
@@ -632,7 +636,7 @@ pub async fn verify_contract_against_journal(
          WHERE contract_id = $1 AND status IN ('pending','settled')",
     )
     .bind(contract_id)
-    .fetch_all(pool)
+    .fetch_all(&mut **tx)
     .await?;
 
     if reimbs.is_empty() {
@@ -659,7 +663,7 @@ pub async fn verify_contract_against_journal(
         )
         .bind(reimb_id)
         .bind(delta)
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
     }
 

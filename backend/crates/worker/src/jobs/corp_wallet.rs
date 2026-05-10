@@ -13,16 +13,29 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use nea_esi::{EsiError, EsiWalletJournalEntry};
-use rust_decimal::prelude::FromPrimitive;
-use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::Ctx;
+use super::{isk_or_zero, jitter_secs, JobFuture, JobSlot};
+use crate::{Ctx, WorkerConfig};
 
 const CORP_WALLET_SCOPE: &str = "esi-wallet.read_corporation_wallets.v1";
+
+pub struct Job;
+
+impl JobSlot for Job {
+    fn name(&self) -> &'static str {
+        "corp_wallet"
+    }
+    fn interval_secs(&self, cfg: &WorkerConfig) -> u64 {
+        cfg.worker.tick_secs
+    }
+    fn run<'a>(&'a self, ctx: &'a Ctx) -> JobFuture<'a> {
+        Box::pin(run(ctx))
+    }
+}
 
 pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
     if !ctx.budget.has_budget() {
@@ -121,12 +134,34 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
 
     // Trigger wallet verification for any contracts that appeared in journal entries.
     for contract_id in all_contract_ids {
-        if let Err(e) = settlement::verify_contract_against_journal(&ctx.pool, contract_id).await {
-            tracing::warn!(
-                error = ?e,
-                contract_id = %contract_id,
-                "wallet verification failed"
-            );
+        match ctx.pool.begin().await {
+            Ok(mut tx) => {
+                match settlement::verify_contract_against_journal(&mut tx, contract_id).await {
+                    Ok(()) => {
+                        if let Err(e) = tx.commit().await {
+                            tracing::warn!(
+                                error = ?e,
+                                contract_id = %contract_id,
+                                "commit verify_contract_against_journal failed"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            contract_id = %contract_id,
+                            "wallet verification failed"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    contract_id = %contract_id,
+                    "could not start verify tx"
+                );
+            }
         }
     }
 
@@ -215,7 +250,7 @@ async fn poll_one_corp_wallet(
 
         // Upsert division balances.
         for w in &wallets {
-            let balance = Decimal::from_f64(w.balance).unwrap_or(Decimal::ZERO);
+            let balance = isk_or_zero(w.balance);
             sqlx::query(
                 r#"
                 INSERT INTO corp_wallet_divisions (corp_id, division, balance_isk, last_synced_at)
@@ -253,6 +288,14 @@ async fn poll_one_corp_wallet(
                     .execute(pool)
                     .await;
                     budget.record_non_2xx();
+                    tracing::warn!(
+                        corp_id = %corp_id,
+                        ambassador = %amb.character_id,
+                        division = w.division,
+                        "wallet journal 403: ambassador lost wallet scope; \
+                         this corp's wallet coverage is paused until another \
+                         ambassador can fetch"
+                    );
                     return Ok(Vec::new());
                 }
                 Err(e) => {
@@ -262,14 +305,8 @@ async fn poll_one_corp_wallet(
             };
 
             for entry in &journal {
-                let amount = entry
-                    .amount
-                    .and_then(Decimal::from_f64)
-                    .unwrap_or(Decimal::ZERO);
-                let balance = entry
-                    .balance
-                    .and_then(Decimal::from_f64)
-                    .unwrap_or(Decimal::ZERO);
+                let amount = entry.amount.map(isk_or_zero).unwrap_or_default();
+                let balance = entry.balance.map(isk_or_zero).unwrap_or_default();
                 let raw = serde_json::to_value(entry).unwrap_or(Value::Null);
 
                 // Insert; RETURNING tells us if it was newly inserted (non-conflict).
@@ -403,13 +440,4 @@ async fn advance_wallet_cursor(
     .execute(pool)
     .await?;
     Ok(())
-}
-
-fn jitter_secs(base: u64) -> i64 {
-    if base == 0 {
-        return 0;
-    }
-    let span = (base / 10).max(1) as i64;
-    let r = rand::random::<u32>() as i64;
-    r.rem_euclid(2 * span + 1) - span
 }

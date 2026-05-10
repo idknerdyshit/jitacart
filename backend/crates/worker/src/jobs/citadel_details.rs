@@ -13,15 +13,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use nea_esi::{EsiClient, EsiStructureInfo};
+use nea_esi::{EsiClient, EsiError, EsiStructureInfo};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::jobs::csa::{self, AccessDimension};
-use crate::Ctx;
+use crate::{Ctx, WorkerConfig};
+
+use super::{JobFuture, JobSlot};
 
 const REFRESH_BATCH: i64 = 50;
 const BACKFILL_BATCH: i64 = 25;
+
+pub struct Job;
+
+impl JobSlot for Job {
+    fn name(&self) -> &'static str {
+        "citadel_details"
+    }
+    fn interval_secs(&self, cfg: &WorkerConfig) -> u64 {
+        // Cap at 5 min — the per-row `details_synced_at` cursor governs actual
+        // refresh cadence; this ceiling keeps newly-tracked citadels from
+        // waiting a full day.
+        cfg.esi.poll_intervals_secs.citadel_details.min(300)
+    }
+    fn run<'a>(&'a self, ctx: &'a Ctx) -> JobFuture<'a> {
+        Box::pin(run(ctx))
+    }
+}
 
 pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
     if !ctx.budget.has_budget() {
@@ -162,14 +181,16 @@ async fn resolve_one(
                 let _ = token_store.persist_rotations(*cid).await;
                 break;
             }
-            Err(e) => {
-                let msg = format!("{e}");
+            Err(EsiError::Api { status: 403, .. }) => {
                 budget.record_non_2xx();
-                if msg.contains("403") || msg.to_ascii_lowercase().contains("forbidden") {
-                    csa::upsert_access(pool, *cid, row.id, "forbidden", AccessDimension::Details)
-                        .await?;
-                }
-                last_err = Some(msg);
+                csa::upsert_access(pool, *cid, row.id, "forbidden", AccessDimension::Details)
+                    .await?;
+                last_err = Some("403 Forbidden".to_string());
+                continue;
+            }
+            Err(e) => {
+                budget.record_non_2xx();
+                last_err = Some(format!("{e}"));
                 continue;
             }
         }

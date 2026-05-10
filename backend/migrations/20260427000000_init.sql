@@ -534,3 +534,21 @@ CREATE INDEX contract_match_open_idx
 -- Defensive: only one confirmed suggestion may exist per reimbursement.
 CREATE UNIQUE INDEX one_confirmed_suggestion_per_reimbursement
     ON contract_match_suggestions(reimbursement_id) WHERE state = 'confirmed';
+
+-- ── Pending webhooks ────────────────────────────────────────────────────────
+--
+-- Worker contract-settlement is durable: settlement runs in a tx and enqueues
+-- the webhook payload here as part of the same commit. A drainer job reads
+-- ready rows, fires them, deletes on success, and bumps next_attempt_at on
+-- failure. If the api/worker dies between commit and HTTP send, the row stays
+-- pending; nothing is lost.
+CREATE TABLE pending_webhooks (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    group_id        uuid NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    payload         jsonb NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    attempts        int NOT NULL DEFAULT 0,
+    next_attempt_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX pending_webhooks_ready_idx
+    ON pending_webhooks (next_attempt_at);

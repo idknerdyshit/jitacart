@@ -2,10 +2,12 @@
 # Pull + up the prod stack, poll readiness, roll back if it doesn't
 # come up. Intended for the standard release flow:
 #
-#     git pull --ff-only
-#     scripts/bump-image-digests.sh vX.Y.Z
-#     git commit -am "Deploy: pin to vX.Y.Z"
+#     git pull --ff-only      # fetches CI's "Release: pin images to vX.Y.Z" commit
 #     scripts/deploy.sh
+#
+# The digest rewrite is no longer an operator step — CI's pin-digests
+# job lands it on main immediately after each `vX.Y.Z` tag is built.
+# scripts/bump-image-digests.sh exists as a manual escape hatch only.
 #
 # Recovery: this script takes a `git rev-parse HEAD` snapshot before
 # touching anything; on healthcheck failure it `git checkout`s the
@@ -56,11 +58,12 @@ echo "$PREV_SHA" > .deploy-prev-sha
 docker compose config --images > .deploy-prev-images
 
 # 4. Refuse to deploy unpinned or placeholder digests. The compose
-#    file MUST go through scripts/bump-image-digests.sh first, or
-#    `docker compose pull` would happily resolve `:latest` to whatever
-#    is on GHCR right now — defeating the audit-trail-in-git model.
+#    file on `main` is normally pinned by CI's pin-digests job after
+#    each release; if it isn't, `docker compose pull` would happily
+#    resolve `:latest` to whatever is on GHCR right now — defeating
+#    the audit-trail-in-git model.
 if grep -qE '^\s*image:.*jitacart-(backend|frontend|backup):[^@[:space:]]+$' docker-compose.yml; then
-    die "docker-compose.yml has unpinned jitacart images; run scripts/bump-image-digests.sh first"
+    die "docker-compose.yml has unpinned jitacart images; CI's pin-digests job has not yet committed (or you've checked out a pre-release commit). Run 'git pull --ff-only' or scripts/bump-image-digests.sh."
 fi
 if grep -qE '@sha256:0{64}' docker-compose.yml; then
     die "docker-compose.yml still has placeholder digests; run scripts/bump-image-digests.sh first"

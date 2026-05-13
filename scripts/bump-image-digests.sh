@@ -6,10 +6,15 @@
 #     scripts/bump-image-digests.sh v0.3.0
 #     scripts/bump-image-digests.sh latest        # tracks mutable :latest
 #
-# Run after CI publishes a release. The script resolves each tag's
-# multi-arch index digest via `docker buildx imagetools inspect`, edits
-# docker-compose.yml in place, prints the diff, and suggests a commit
-# message. Operator commits + runs scripts/deploy.sh.
+# CI's pin-digests job runs this automatically on every `vX.Y.Z` tag
+# and commits the result to main, so the standard release flow does
+# NOT need an operator to invoke this. Kept as a manual escape hatch
+# for: retargeting a fork's images, pinning to a tag that bypassed CI,
+# hotfix workflows, or recovering when the CI commit failed to push.
+#
+# The script resolves each tag's multi-arch index digest via
+# `docker buildx imagetools inspect`, edits docker-compose.yml in
+# place, prints the diff, and suggests a commit message.
 #
 # Why digests: an `image: ghcr.io/.../X:v0.3.0` reference can be
 # clobbered upstream after release. An `image: ghcr.io/.../X:v0.3.0@sha256:...`
@@ -94,10 +99,10 @@ git --no-pager diff -- "$COMPOSE" || true
 
 cat <<EOF
 
-Suggested commit:
+Suggested commit (manual flow only — CI does this for you on tag push):
 
   git add $COMPOSE
-  git commit -m "Deploy: pin images to ${VERSION}"
+  git commit -m "Release: pin images to ${VERSION}"
 
 Then deploy:
 

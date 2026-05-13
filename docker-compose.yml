@@ -8,10 +8,13 @@
 #
 # Every image line is digest-pinned so `git revert` is the rollback
 # button and the audit trail is in the tree, not in whatever Docker
-# Hub serves today. To take a new release:
-#     scripts/bump-image-digests.sh vX.Y.Z   # rewrites the digests
-#     git commit                              # captures the new state
-#     scripts/deploy.sh                       # pull + up + verify
+# Hub serves today. The pin-digests CI job rewrites the four
+# jitacart-* image lines on `main` immediately after each `vX.Y.Z`
+# tag, so the standard deploy is just:
+#     git pull --ff-only
+#     scripts/deploy.sh
+# (scripts/bump-image-digests.sh is still around as a manual escape
+# hatch — e.g. retargeting a fork's images.)
 #
 # To build images locally (hotfix from a non-CI box, dev iteration):
 #     docker compose -f docker-compose.yml -f docker-compose.build.yml build
@@ -54,8 +57,9 @@ services:
     logging: *default-logging
 
   api:
-    # Digest-pin via scripts/bump-image-digests.sh vX.Y.Z. Until then,
-    # this tracks :latest mutably — first deploy MUST run the script.
+    # CI's pin-digests job rewrites this to vX.Y.Z@sha256:... on each
+    # release. Pre-first-release this tracks :latest mutably and
+    # scripts/deploy.sh will refuse to roll until the first pin lands.
     image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest
     restart: unless-stopped
     depends_on:

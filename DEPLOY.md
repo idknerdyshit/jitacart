@@ -52,20 +52,21 @@ Five services in `docker-compose.yml`. Local dev keeps just postgres via
    # TOKEN_ENC_KEY, POSTGRES_PASSWORD, TURNSTILE__*, and flip
    # TURNSTILE__DISABLED=false.
    ```
-6. **Pin and bring it up**:
+6. **Bring it up**:
    ```sh
-   # Resolve the latest release tag to its multi-arch digest and
-   # rewrite docker-compose.yml in place. `git diff` shows exactly
-   # which digests are about to ship.
-   scripts/bump-image-digests.sh v0.2.0
-   git add docker-compose.yml
-   git commit -m "Deploy: pin images to v0.2.0"
+   git pull --ff-only      # fetches CI's "Release: pin images to vX.Y.Z" commit
    scripts/deploy.sh
    ```
    The compose file is image-only — every service points at a published
    `ghcr.io/<owner>/jitacart-*:vX.Y.Z@sha256:<digest>` image, so `pull`
    produces bit-for-bit identical containers no matter when it runs.
    `git revert` is the rollback button.
+
+   The digest pinning happens in CI's `pin-digests` job on every
+   `vX.Y.Z` tag — it rewrites the four `image:` lines on `main` right
+   after the images are built. Operators do not run
+   `bump-image-digests.sh` in the normal flow. (Forks, hotfixes, or
+   recovering from a failed CI push: see *Manual digest pinning*.)
 7. **First-time TLS**: Caddy obtains a Let's Encrypt cert on first
    request. Watch `docker compose logs -f caddy` until you see
    `certificate obtained successfully`. If the host's :80 isn't
@@ -125,15 +126,11 @@ output (`/var/lib/docker/containers/<id>/<id>-json.log`).
 ### Update + redeploy
 
 ```sh
-# 1. Pull the latest tree (assumes the release tag exists on origin).
+# 1. Pull the latest tree. CI's pin-digests job has already pinned
+#    the four jitacart-* images on main to the latest release tag's
+#    multi-arch digests, so this commit is what you're deploying.
 git pull --ff-only
-# 2. Resolve the new release's multi-arch digests and rewrite
-#    docker-compose.yml. Open the GitHub Release to copy the
-#    `:vX.Y.Z@sha256:...` lines first if you want a paper trail.
-scripts/bump-image-digests.sh v0.3.0
-git add docker-compose.yml
-git commit -m "Deploy: pin images to v0.3.0"
-# 3. Deploy with healthcheck-driven rollback.
+# 2. Deploy with healthcheck-driven rollback.
 scripts/deploy.sh
 ```
 
@@ -145,8 +142,28 @@ fallback path.
 
 `postgres` and `caddy` are pinned by digest in the compose file, so
 `pull` is a no-op for them on every redeploy. `api`, `worker`,
-`frontend`, and `backup` are digest-pinned too — operator runs
-`bump-image-digests.sh` at each release.
+`frontend`, and `backup` are digest-pinned too — CI rewrites those
+lines on `main` after each `vX.Y.Z` tag, so `git pull` is the only
+thing the operator does between releases.
+
+### Manual digest pinning
+
+CI handles this in the normal release flow. Reach for
+`scripts/bump-image-digests.sh` only when:
+
+- You forked the project and CI publishes images under a different
+  GHCR owner (`JC_IMAGE_OWNER=youracct scripts/bump-image-digests.sh vX.Y.Z`).
+- The pin-digests CI job failed to push (e.g. branch protection
+  rejected the bot push) and you need to recover.
+- You're deploying a tag that was built outside CI.
+
+```sh
+scripts/bump-image-digests.sh vX.Y.Z
+git add docker-compose.yml
+git commit -m "Release: pin images to vX.Y.Z"
+git push origin main
+scripts/deploy.sh
+```
 
 ### Building images locally
 

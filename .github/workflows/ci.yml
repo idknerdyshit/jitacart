@@ -193,6 +193,58 @@ jobs:
       - run: |
           echo "digest for jitacart-${{ matrix.name }}: ${{ steps.build.outputs.digest }}"
 
+  pin-digests:
+    name: pin digests to main
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-images]
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      # Land on main and grab full history so we can rebase if a merge
+      # raced this job. We rewrite docker-compose.yml here, not on the
+      # tagged commit — the tag is "intent to release"; the pin commit
+      # that lands on main right after is what `scripts/deploy.sh`
+      # actually consumes.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: bump digests
+        env:
+          TAG: ${{ github.ref_name }}
+          JC_IMAGE_OWNER: ${{ github.repository_owner }}
+        run: scripts/bump-image-digests.sh "$TAG"
+      - name: commit + push
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- docker-compose.yml; then
+            echo "no digest changes — main already pinned to $TAG"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docker-compose.yml
+          # [skip ci] keeps this commit from re-triggering the whole
+          # pipeline — it only touches digest strings, no code paths.
+          git commit -m "Release: pin images to ${TAG} [skip ci]"
+          # If someone pushed to main while build-images was running,
+          # rebase the pin onto their commit. Conflicts here would mean
+          # someone hand-edited image: lines concurrently — bail and let
+          # an operator sort it out.
+          git pull --rebase origin main
+          git push origin main
+
   release:
     name: github release
     runs-on: ubuntu-latest
@@ -228,7 +280,7 @@ jobs:
           {
             echo "## Container images"
             echo
-            echo "Pinned via \`scripts/bump-image-digests.sh ${TAG}\`."
+            echo "These references are also pinned into \`docker-compose.yml\` on \`main\` by the pin-digests CI job."
             echo
             for img in backend frontend backup; do
               ref="ghcr.io/${OWNER}/jitacart-${img}:${VERSION}"

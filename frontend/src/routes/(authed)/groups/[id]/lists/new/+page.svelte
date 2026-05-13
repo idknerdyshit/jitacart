@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onDestroy, onMount } from 'svelte';
+    import { onDestroy } from 'svelte';
     import { goto } from '$app/navigation';
     import { page } from '$app/state';
     import {
@@ -7,16 +7,18 @@
         fmtIsk,
         isMarketStale,
         isPriceStale,
-        type GroupMarket,
         type PreviewResponse,
         type ListDetail
     } from '$lib/api';
     import MarketPicker from '$lib/lists/MarketPicker.svelte';
     import { SvelteSet } from 'svelte/reactivity';
+    import type { PageData } from './$types';
+
+    const { data }: { data: PageData } = $props();
 
     const groupId = $derived(page.params.id);
+    const markets = $derived(data.markets);
 
-    let markets = $state<GroupMarket[] | null>(null);
     let selectedIds = $state<SvelteSet<string>>(new SvelteSet());
     let primaryId = $state<string | null>(null);
     let multibuy = $state<string>('');
@@ -29,17 +31,14 @@
 
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-    onMount(async () => {
-        try {
-            markets = await api<GroupMarket[]>(`/groups/${groupId}/markets`);
-            // Default-select Jita as primary if present.
-            const jita = markets.find((m) => m.short_label === 'Jita');
-            if (jita) {
-                selectedIds = new SvelteSet([jita.id]);
-                primaryId = jita.id;
-            }
-        } catch (e) {
-            error = (e as Error).message;
+    // Default-select Jita as primary if present. Runs once after the
+    // initial server-loaded `data.markets` is in scope.
+    $effect(() => {
+        if (selectedIds.size > 0) return;
+        const jita = markets.find((m) => m.short_label === 'Jita');
+        if (jita) {
+            selectedIds = new SvelteSet([jita.id]);
+            primaryId = jita.id;
         }
     });
 
@@ -156,18 +155,14 @@
 
 <section>
     <h2>Markets</h2>
-    {#if markets}
-        <MarketPicker
-            {markets}
-            selected={selectedIds}
-            primary={primaryId}
-            onToggle={toggleMarket}
-            onSetPrimary={(id) => (primaryId = id)}
-            primaryLabel="Primary (used for snapshot fallback display):"
-        />
-    {:else}
-        <p class="muted">Loading markets…</p>
-    {/if}
+    <MarketPicker
+        {markets}
+        selected={selectedIds}
+        primary={primaryId}
+        onToggle={toggleMarket}
+        onSetPrimary={(id) => (primaryId = id)}
+        primaryLabel="Primary (used for snapshot fallback display):"
+    />
 </section>
 
 <section>

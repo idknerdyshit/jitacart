@@ -17,6 +17,7 @@
     } from '$lib/api';
     import ClaimChips from '$lib/lists/ClaimChips.svelte';
     import BuyModal from '$lib/lists/BuyModal.svelte';
+    import DeleteConfirmModal from '$lib/lists/DeleteConfirmModal.svelte';
     import MarketPicker from '$lib/lists/MarketPicker.svelte';
     import ReimbursementPanel from '$lib/lists/ReimbursementPanel.svelte';
     import Skeleton from '$lib/components/Skeleton.svelte';
@@ -37,6 +38,7 @@
     let newItemQty = $state<number>(1);
 
     let buyModalItem = $state<string | null>(null);
+    let deleteModalOpen = $state(false);
 
     let editingTip = $state(false);
     let tipInput = $state('');
@@ -94,9 +96,14 @@
         }
     }
 
+    function requestDelete() {
+        if (!detail) return;
+        deleteModalOpen = true;
+    }
+
     async function deleteList() {
         if (!detail) return;
-        if (!confirm('Delete this list?')) return;
+        deleteModalOpen = false;
         try {
             const groupId = detail.list.group_id;
             await api(`/lists/${listId}`, { method: 'DELETE' });
@@ -590,7 +597,7 @@
     <ReimbursementPanel {detail} onUpdate={(d) => (detail = d)} />
 
     <section>
-        <button class="danger" onclick={deleteList}>Delete list</button>
+        <button class="danger" onclick={requestDelete}>Delete list</button>
     </section>
 {:else if !error}
     <Skeleton rows={4} columns={5} />
@@ -604,6 +611,15 @@
         onClose={() => (buyModalItem = null)}
     />
 {/if}
+
+<DeleteConfirmModal
+    open={deleteModalOpen}
+    title="Delete list?"
+    message="This permanently removes the list and its claims, fulfillments, and reimbursements. This cannot be undone."
+    confirmLabel="Delete list"
+    onConfirm={deleteList}
+    onCancel={() => (deleteModalOpen = false)}
+/>
 
 <style>
     section {

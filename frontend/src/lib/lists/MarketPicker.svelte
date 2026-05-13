@@ -44,6 +44,7 @@
             onclick={() => onToggle(m.id)}
             type="button"
             aria-pressed={selected.has(m.id)}
+            aria-label={`Toggle ${m.short_label ?? '(unnamed)'} market`}
             title={chipTitle(m)}
         >
             {m.short_label ?? '(unnamed)'}
@@ -62,6 +63,7 @@
                 onclick={() => onSetPrimary(m.id)}
                 type="button"
                 aria-pressed={primary === m.id}
+                aria-label={`Mark ${m.short_label ?? '(unnamed)'} as primary market`}
             >
                 ★ {m.short_label ?? '(unnamed)'}
                 {@render citadelBadge(m)}

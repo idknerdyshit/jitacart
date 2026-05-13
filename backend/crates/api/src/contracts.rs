@@ -601,15 +601,55 @@ pub async fn do_unlink<'c, A>(
 where
     A: sqlx::Acquire<'c, Database = sqlx::Postgres>,
 {
-    let mut tx = acquirer.begin().await?;
-    let row: Option<(Option<Uuid>, ContractStatus)> =
-        sqlx::query_as("SELECT issuer_user_id, status FROM contracts WHERE id = $1 FOR UPDATE")
-            .bind(contract_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let (issuer_user_id, status) = row.ok_or_else(ApiError::not_found)?;
+    #[derive(sqlx::FromRow)]
+    struct UnlinkRow {
+        issuer_user_id: Option<Uuid>,
+        assignee_user_id: Option<Uuid>,
+        source_corp_id: Option<Uuid>,
+        status: ContractStatus,
+    }
 
-    if issuer_user_id != Some(user_id) {
+    let mut tx = acquirer.begin().await?;
+    let row: Option<UnlinkRow> = sqlx::query_as(
+        "SELECT issuer_user_id, assignee_user_id, source_corp_id, status \
+         FROM contracts WHERE id = $1 FOR UPDATE",
+    )
+    .bind(contract_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let UnlinkRow {
+        issuer_user_id,
+        assignee_user_id,
+        source_corp_id,
+        status,
+    } = row.ok_or_else(ApiError::not_found)?;
+
+    // Personal-issued: only the issuer may unlink. Corp-issued (issuer is
+    // NULL): the hauler (assignee) or an ambassador of the source corp may
+    // unlink — mirrors do_reject's auth shape.
+    let allowed = match issuer_user_id {
+        Some(iuid) => iuid == user_id,
+        None => {
+            if assignee_user_id == Some(user_id) {
+                true
+            } else if let Some(corp_id) = source_corp_id {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(\
+                         SELECT 1 FROM corp_ambassadors ca \
+                         JOIN characters ch ON ch.id = ca.character_id \
+                         WHERE ca.corp_id = $1 AND ch.user_id = $2 \
+                           AND ca.disabled_at IS NULL)",
+                )
+                .bind(corp_id)
+                .bind(user_id)
+                .fetch_one(&mut *tx)
+                .await?
+            } else {
+                false
+            }
+        }
+    };
+    if !allowed {
         return Err(ApiError::forbidden());
     }
     let is_finished = status.is_terminal_success();

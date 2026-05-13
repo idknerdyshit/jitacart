@@ -7,7 +7,7 @@
 #
 # The digest rewrite is no longer an operator step — CI's pin-digests
 # job lands it on main immediately after each `vX.Y.Z` tag is built.
-# scripts/bump-image-digests.sh exists as a manual escape hatch only.
+# See DEPLOY.md § Manual digest pinning for the escape-hatch flow.
 #
 # Recovery: this script takes a `git rev-parse HEAD` snapshot before
 # touching anything; on healthcheck failure it `git checkout`s the

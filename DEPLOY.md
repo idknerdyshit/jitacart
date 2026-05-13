@@ -65,8 +65,8 @@ Five services in `docker-compose.yml`. Local dev keeps just postgres via
    The digest pinning happens in CI's `pin-digests` job on every
    `vX.Y.Z` tag — it rewrites the four `image:` lines on `main` right
    after the images are built. Operators do not run
-   `bump-image-digests.sh` in the normal flow. (Forks, hotfixes, or
-   recovering from a failed CI push: see *Manual digest pinning*.)
+   `bump-image-digests.sh` in the normal flow; see *Manual digest
+   pinning* below for the escape-hatch cases.
 7. **First-time TLS**: Caddy obtains a Let's Encrypt cert on first
    request. Watch `docker compose logs -f caddy` until you see
    `certificate obtained successfully`. If the host's :80 isn't

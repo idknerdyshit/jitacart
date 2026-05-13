@@ -13,8 +13,7 @@
 # tag, so the standard deploy is just:
 #     git pull --ff-only
 #     scripts/deploy.sh
-# (scripts/bump-image-digests.sh is still around as a manual escape
-# hatch — e.g. retargeting a fork's images.)
+# See DEPLOY.md § Manual digest pinning for the escape-hatch flow.
 #
 # To build images locally (hotfix from a non-CI box, dev iteration):
 #     docker compose -f docker-compose.yml -f docker-compose.build.yml build

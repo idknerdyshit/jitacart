@@ -1,5 +1,6 @@
 <script lang="ts">
     import { onMount } from 'svelte';
+    import { SvelteSet } from 'svelte/reactivity';
     import { goto } from '$app/navigation';
     import { page } from '$app/state';
     import {
@@ -27,7 +28,7 @@
     let allMarkets = $state<GroupMarket[] | null>(null);
     let error = $state<string | null>(null);
     let editingMarkets = $state<boolean>(false);
-    let editSelected = $state<Set<string>>(new Set());
+    let editSelected = $state<SvelteSet<string>>(new SvelteSet());
     let editPrimary = $state<string | null>(null);
 
     let addingItem = $state<boolean>(false);
@@ -56,7 +57,7 @@
                 : await api<GroupMarket[]>(`/groups/${d.list.group_id}/markets`);
             detail = d;
             allMarkets = all;
-            editSelected = new Set(d.markets.map((m) => m.id));
+            editSelected = new SvelteSet(d.markets.map((m) => m.id));
             editPrimary = d.primary_market_id;
             // Load linked corps for payer picker.
             if (!groupCorps.length) {
@@ -107,7 +108,7 @@
     }
 
     function toggleEditMarket(id: string) {
-        const next = new Set(editSelected);
+        const next = new SvelteSet(editSelected);
         if (next.has(id)) {
             next.delete(id);
             if (editPrimary === id) editPrimary = next.values().next().value ?? null;

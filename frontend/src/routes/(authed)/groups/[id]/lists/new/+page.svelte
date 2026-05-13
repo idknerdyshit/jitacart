@@ -11,11 +11,12 @@
         type PreviewResponse,
         type ListDetail
     } from '$lib/api';
+    import { SvelteSet } from 'svelte/reactivity';
 
     const groupId = $derived(page.params.id);
 
     let markets = $state<GroupMarket[] | null>(null);
-    let selectedIds = $state<Set<string>>(new Set());
+    let selectedIds = $state<SvelteSet<string>>(new SvelteSet());
     let primaryId = $state<string | null>(null);
     let multibuy = $state<string>('');
     let destinationLabel = $state<string>('');
@@ -33,7 +34,7 @@
             // Default-select Jita as primary if present.
             const jita = markets.find((m) => m.short_label === 'Jita');
             if (jita) {
-                selectedIds = new Set([jita.id]);
+                selectedIds = new SvelteSet([jita.id]);
                 primaryId = jita.id;
             }
         } catch (e) {
@@ -42,7 +43,7 @@
     });
 
     function toggleMarket(id: string) {
-        const next = new Set(selectedIds);
+        const next = new SvelteSet(selectedIds);
         if (next.has(id)) {
             next.delete(id);
             if (primaryId === id) primaryId = next.values().next().value ?? null;

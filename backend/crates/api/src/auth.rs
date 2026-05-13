@@ -78,9 +78,20 @@ async fn login(
             return Err(ApiError::Unauthorized);
         }
     } else if session_user.is_none() && !state.config.turnstile.disabled {
-        // First-time login: require a Turnstile token. Existing-user
-        // re-logins pass through here too, but the captcha cost is
-        // one-per-fresh-browser, not one-per-session-cookie-expiry.
+        // Turnstile gates only fresh-browser SSO inits — that is, this branch
+        // requires `session_user.is_none()`. A logged-in user re-initiating
+        // SSO (the `?attach=` "add another character" path, or a re-auth from
+        // an authenticated session) hits the `q.attach` arm above or skips
+        // this branch entirely, because they have already proven they are
+        // human in this session.
+        //
+        // Threat model: the captcha exists to keep automated tools from
+        // burning ESI authorize calls / harvesting state cookies at scale.
+        // Once a session cookie exists we trust it — replaying captcha on
+        // every SSO init for an already-authenticated user would only
+        // friction legitimate flows without changing the attacker's cost.
+        // The cost is therefore one-per-fresh-browser (no session cookie),
+        // not one-per-session-cookie-expiry.
         let token = q.cf.as_deref().ok_or(ApiError::Forbidden(
             "captcha verification required for new accounts".into(),
         ))?;

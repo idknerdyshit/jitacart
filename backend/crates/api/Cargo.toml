@@ -18,6 +18,7 @@ domain = { workspace = true }
 market = { workspace = true }
 auth-tokens = { workspace = true }
 bootstrap = { workspace = true }
+jitacart-config = { workspace = true }
 settlement = { workspace = true }
 webhook-dispatch = { workspace = true }
 rust_decimal = { workspace = true }
@@ -27,6 +28,14 @@ axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tower_governor = { workspace = true }
+
+# Auto-instrumented Prometheus exposition: request count / latency /
+# in-flight per route, no handler edits. Recorder + axum layer.
+# `metrics-exporter-prometheus` is pulled in transitively but we list
+# it explicitly so the `PrometheusHandle` type isn't smuggled in
+# through a private re-export.
+axum-prometheus = "0.10"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 sqlx = { workspace = true }
 

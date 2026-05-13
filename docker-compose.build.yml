@@ -1,7 +1,12 @@
-# Build override: restores the `build:` blocks that docker-compose.yml
-# omits, and tags each built image with the same GHCR ref the prod
-# compose file pulls. Use only when CI can't publish for you (hotfix
-# from a non-CI box, dev iteration on a Dockerfile).
+# Build override: restores the `build:` blocks the prod compose file
+# omits, and re-tags each built image with a mutable ref so dev
+# iteration works against digest-pinned production references.
+#
+# `docker-compose.yml` digest-pins each image (`:vX.Y.Z@sha256:...`)
+# for audit-trail / rollback reasons. Digest-pinned references cannot
+# be retagged — `docker build -t ...@sha256:...` is a hard error — so
+# this override replaces every `image:` field with a plain `:dev` (or
+# `:${JC_IMAGE_TAG}`) tag that a local build can produce.
 #
 #     docker compose -f docker-compose.yml -f docker-compose.build.yml build
 #
@@ -14,22 +19,22 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:${JC_IMAGE_TAG:-latest}
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:${JC_IMAGE_TAG:-dev}
 
   worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:${JC_IMAGE_TAG:-latest}
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:${JC_IMAGE_TAG:-dev}
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:${JC_IMAGE_TAG:-latest}
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:${JC_IMAGE_TAG:-dev}
 
   backup:
     build:
       context: ./backup
       dockerfile: Dockerfile
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backup:${JC_IMAGE_TAG:-latest}
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backup:${JC_IMAGE_TAG:-dev}

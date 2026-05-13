@@ -20,6 +20,8 @@ EXCLUDE=(
     RCLONE_CONFIG         # set by backup environment
     NODE_ENV PORT HOST    # set by frontend Dockerfile
     PATH HOME TZ          # OS-provided
+    JC_IMAGE_TAG          # dev-only; build override (docker-compose.build.yml)
+                          # uses it. Prod docker-compose.yml digest-pins.
 )
 
 is_excluded() {
@@ -55,6 +57,29 @@ if (( ${#missing[@]} > 0 )); then
     printf '  - %s\n' "${missing[@]}" >&2
     echo "Add them (with placeholder values + a one-line comment) or, if they're" >&2
     echo "synthesized at runtime, allow-list in scripts/check-env-example.sh." >&2
+    exit 1
+fi
+
+# Backups run by default in the prod compose file; if any of these
+# four are missing from .env.example the operator has no template to
+# fill in. Caught by the generic missing-var loop above for the two
+# that compose references directly, but RETAIN_DAILY / HOUR_UTC are
+# read only inside backup.sh — pin them explicitly.
+required_backup=(
+    BACKUP_AGE_RECIPIENT
+    BACKUP_RCLONE_REMOTE
+    BACKUP_RETAIN_DAILY
+    BACKUP_HOUR_UTC
+)
+missing_backup=()
+for v in "${required_backup[@]}"; do
+    if ! grep -qx "$v" <<< "$declared"; then
+        missing_backup+=("$v")
+    fi
+done
+if (( ${#missing_backup[@]} > 0 )); then
+    echo "check-env-example: backup vars missing from .env.example (required for production):" >&2
+    printf '  - %s\n' "${missing_backup[@]}" >&2
     exit 1
 fi
 

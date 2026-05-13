@@ -10,7 +10,9 @@
 //!   because the contract finishing in EVE is itself proof of delivery.
 
 use chrono::{DateTime, Utc};
-use domain::{ContractStatus, ContractType, ReimbursementStatus};
+use domain::{
+    ContractStatus, ContractType, EsiCharacterId, EsiContractId, EsiLocationId, ReimbursementStatus,
+};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{Postgres, Transaction};
@@ -32,11 +34,11 @@ pub enum SettlementError {
 /// at the worker's call-site so this crate stays free of nea-esi types.
 #[derive(Debug, Clone)]
 pub struct ContractUpsert {
-    pub esi_contract_id: i64,
-    pub issuer_character_id: i64,
+    pub esi_contract_id: EsiContractId,
+    pub issuer_character_id: EsiCharacterId,
     /// Deprecated: NULL for corp contracts. Use `issuer_principal_id`.
     pub issuer_user_id: Option<Uuid>,
-    pub assignee_character_id: Option<i64>,
+    pub assignee_character_id: Option<EsiCharacterId>,
     /// Deprecated: NULL for corp-assignee contracts. Use `assignee_principal_id`.
     pub assignee_user_id: Option<Uuid>,
     // Principal-id fields (may be None if resolution failed).
@@ -51,8 +53,8 @@ pub struct ContractUpsert {
     pub date_expired: Option<DateTime<Utc>>,
     pub date_accepted: Option<DateTime<Utc>>,
     pub date_completed: Option<DateTime<Utc>>,
-    pub start_location_id: Option<i64>,
-    pub end_location_id: Option<i64>,
+    pub start_location_id: Option<EsiLocationId>,
+    pub end_location_id: Option<EsiLocationId>,
     pub raw_json: Value,
     /// Corp that discovered this contract via the corp contracts endpoint.
     /// None for character-discovered contracts.
@@ -357,6 +359,79 @@ pub async fn settle_via_contract(
     Ok(webhook_info)
 }
 
+// Personal flow: params are ($1 list_id, $2 requester, $3 hauler). The status
+// clause is the only thing that varies between accept_bought=false/true.
+macro_rules! sql_flip_personal {
+    ($status_clause:literal) => {
+        concat!(
+            r#"
+    UPDATE list_items li
+    SET status = 'settled'
+    WHERE li.list_id = $1
+      AND li.requested_by_user_id = $2
+      AND li.status "#,
+            $status_clause,
+            r#"
+      AND EXISTS (
+          SELECT 1 FROM fulfillments f
+          WHERE f.list_item_id = li.id
+            AND f.hauler_user_id = $3
+            AND f.reversed_at IS NULL
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM reimbursements r
+          JOIN fulfillments f2
+            ON f2.list_item_id = li.id
+           AND f2.hauler_user_id = r.hauler_user_id
+           AND f2.reversed_at IS NULL
+          WHERE r.list_id = $1
+            AND r.requester_user_id = $2
+            AND r.hauler_user_id <> $3
+            AND r.status = 'pending'
+      )
+"#
+        )
+    };
+}
+
+// Corp flow: one hauler covers everyone on the list, so no requester predicate
+// and params shift to ($1 list_id, $2 hauler).
+macro_rules! sql_flip_corp {
+    ($status_clause:literal) => {
+        concat!(
+            r#"
+    UPDATE list_items li
+    SET status = 'settled'
+    WHERE li.list_id = $1
+      AND li.status "#,
+            $status_clause,
+            r#"
+      AND EXISTS (
+          SELECT 1 FROM fulfillments f
+          WHERE f.list_item_id = li.id
+            AND f.hauler_user_id = $2
+            AND f.reversed_at IS NULL
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM reimbursements r2
+          JOIN fulfillments f2
+            ON f2.list_item_id = li.id
+           AND f2.hauler_user_id = r2.hauler_user_id
+           AND f2.reversed_at IS NULL
+          WHERE r2.list_id = $1
+            AND r2.hauler_user_id <> $2
+            AND r2.status = 'pending'
+      )
+"#
+        )
+    };
+}
+
+const SQL_FLIP_DELIVERED_ONLY: &str = sql_flip_personal!("= 'delivered'");
+const SQL_FLIP_BOUGHT_OR_DELIVERED: &str = sql_flip_personal!("IN ('bought', 'delivered')");
+const SQL_FLIP_CORP_DELIVERED_ONLY: &str = sql_flip_corp!("= 'delivered'");
+const SQL_FLIP_CORP_BOUGHT_OR_DELIVERED: &str = sql_flip_corp!("IN ('bought', 'delivered')");
+
 /// Promote items to `settled` for a `(list, requester, hauler)` triple,
 /// guarding against premature settlement when another pending reimbursement
 /// from a different hauler still covers the same item. With `accept_bought`,
@@ -369,40 +444,36 @@ async fn flip_items_to_settled(
     hauler_user_id: Uuid,
     accept_bought: bool,
 ) -> Result<(), SettlementError> {
-    let status_filter = if accept_bought {
-        "li.status IN ('bought', 'delivered')"
+    let sql = if accept_bought {
+        SQL_FLIP_BOUGHT_OR_DELIVERED
     } else {
-        "li.status = 'delivered'"
+        SQL_FLIP_DELIVERED_ONLY
     };
-    let sql = format!(
-        r#"
-        UPDATE list_items li
-        SET status = 'settled'
-        WHERE li.list_id = $1
-          AND li.requested_by_user_id = $2
-          AND {status_filter}
-          AND EXISTS (
-              SELECT 1 FROM fulfillments f
-              WHERE f.list_item_id = li.id
-                AND f.hauler_user_id = $3
-                AND f.reversed_at IS NULL
-          )
-          AND NOT EXISTS (
-              SELECT 1 FROM reimbursements r
-              JOIN fulfillments f2
-                ON f2.list_item_id = li.id
-               AND f2.hauler_user_id = r.hauler_user_id
-               AND f2.reversed_at IS NULL
-              WHERE r.list_id = $1
-                AND r.requester_user_id = $2
-                AND r.hauler_user_id <> $3
-                AND r.status = 'pending'
-          )
-        "#
-    );
-    sqlx::query(&sql)
+    sqlx::query(sql)
         .bind(list_id)
         .bind(requester_user_id)
+        .bind(hauler_user_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Corp-funded counterpart to [`flip_items_to_settled`]: a single hauler
+/// covers all items on the list, so there's no `requester_user_id` predicate.
+/// Same accept-bought-or-delivered toggle as the personal variant.
+async fn flip_items_to_settled_corp(
+    tx: &mut Transaction<'_, Postgres>,
+    list_id: Uuid,
+    hauler_user_id: Uuid,
+    accept_bought: bool,
+) -> Result<(), SettlementError> {
+    let sql = if accept_bought {
+        SQL_FLIP_CORP_BOUGHT_OR_DELIVERED
+    } else {
+        SQL_FLIP_CORP_DELIVERED_ONLY
+    };
+    sqlx::query(sql)
+        .bind(list_id)
         .bind(hauler_user_id)
         .execute(&mut **tx)
         .await?;
@@ -492,37 +563,7 @@ pub async fn settle_manual(
     .await?;
 
     if is_corp_funded {
-        // Corp-funded: flip all hauler-fulfilled items on the list, but only
-        // when no other hauler still has a pending reimbursement on the same
-        // item (mirrors the guard in flip_items_to_settled / settle_via_contract).
-        sqlx::query(
-            r#"
-            UPDATE list_items li
-            SET status = 'settled'
-            WHERE li.list_id = $1
-              AND li.status = 'delivered'
-              AND EXISTS (
-                  SELECT 1 FROM fulfillments f
-                  WHERE f.list_item_id = li.id
-                    AND f.hauler_user_id = $2
-                    AND f.reversed_at IS NULL
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM reimbursements r2
-                  JOIN fulfillments f2
-                    ON f2.list_item_id = li.id
-                   AND f2.hauler_user_id = r2.hauler_user_id
-                   AND f2.reversed_at IS NULL
-                  WHERE r2.list_id = $1
-                    AND r2.hauler_user_id <> $2
-                    AND r2.status = 'pending'
-              )
-            "#,
-        )
-        .bind(list_id)
-        .bind(hauler_user_id)
-        .execute(&mut **tx)
-        .await?;
+        flip_items_to_settled_corp(tx, list_id, hauler_user_id, false).await?;
     } else {
         let req_uid = requester_user_id.ok_or(SettlementError::NotFound)?;
         flip_items_to_settled(tx, list_id, req_uid, hauler_user_id, false).await?;
@@ -549,14 +590,17 @@ pub async fn verify_contract_against_journal(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     contract_id: Uuid,
 ) -> Result<(), SettlementError> {
-    // Fetch esi_contract_id and price_isk for this contract; lock the row.
-    let row: Option<(i64, Decimal)> =
-        sqlx::query_as("SELECT esi_contract_id, price_isk FROM contracts WHERE id = $1 FOR UPDATE")
-            .bind(contract_id)
-            .fetch_optional(&mut **tx)
-            .await?;
+    // Fetch esi_contract_id + source_corp_id for this contract; lock the row.
+    // source_corp_id is threaded into the payout-sum query below so we don't
+    // need a second JOIN back to `contracts` just to scope the wallet journal.
+    let row: Option<(i64, Option<Uuid>)> = sqlx::query_as(
+        "SELECT esi_contract_id, source_corp_id FROM contracts WHERE id = $1 FOR UPDATE",
+    )
+    .bind(contract_id)
+    .fetch_optional(&mut **tx)
+    .await?;
 
-    let (esi_contract_id, _price_isk) = match row {
+    let (esi_contract_id, source_corp_id) = match row {
         Some(r) => r,
         None => return Ok(()), // Unknown contract.
     };
@@ -598,18 +642,22 @@ pub async fn verify_contract_against_journal(
             .await?
         }
         None => {
+            // No payer corp linked: fall back to the discovering corp threaded
+            // through from the contracts row above. When source_corp_id is
+            // NULL (character-discovered contract), we have no way to scope
+            // by corp; accept whatever the journal carries.
             sqlx::query_scalar(
                 r#"
-                SELECT SUM(ABS(j.amount))
-                FROM corp_wallet_journal j
-                JOIN contracts c ON c.esi_contract_id = j.context_id
-                WHERE j.context_id = $1
-                  AND j.context_id_type = 'contract_id'
-                  AND j.ref_type = 'contract_price'
-                  AND j.corp_id = COALESCE(c.source_corp_id, j.corp_id)
+                SELECT SUM(ABS(amount))
+                FROM corp_wallet_journal
+                WHERE context_id = $1
+                  AND context_id_type = 'contract_id'
+                  AND ref_type = 'contract_price'
+                  AND ($2::uuid IS NULL OR corp_id = $2)
                 "#,
             )
             .bind(esi_contract_id)
+            .bind(source_corp_id)
             .fetch_one(&mut **tx)
             .await?
         }
@@ -648,27 +696,35 @@ pub async fn verify_contract_against_journal(
 
     let total_reimb_sum: Decimal = reimbs.iter().map(|(_, t)| *t).sum();
 
-    for (reimb_id, total_isk) in reimbs {
+    // Batch all per-reimbursement deltas into one UPDATE using parallel arrays
+    // unnested into (id, delta) rows.
+    let mut ids: Vec<Uuid> = Vec::with_capacity(reimbs.len());
+    let mut deltas: Vec<Decimal> = Vec::with_capacity(reimbs.len());
+    for (reimb_id, total_isk) in &reimbs {
         let share = if total_reimb_sum > Decimal::ZERO {
-            payout_aggregate * total_isk / total_reimb_sum
+            payout_aggregate * *total_isk / total_reimb_sum
         } else {
             Decimal::ZERO
         };
-        let share = share.round_dp(2);
-        let delta = share - total_isk;
-
-        sqlx::query(
-            "UPDATE reimbursements \
-             SET verified_by_wallet = true, \
-                 wallet_settlement_delta_isk = $2, \
-                 updated_at = now() \
-             WHERE id = $1",
-        )
-        .bind(reimb_id)
-        .bind(delta)
-        .execute(&mut **tx)
-        .await?;
+        let delta = share.round_dp(2) - *total_isk;
+        ids.push(*reimb_id);
+        deltas.push(delta);
     }
+
+    sqlx::query(
+        r#"
+        UPDATE reimbursements r
+        SET verified_by_wallet = true,
+            wallet_settlement_delta_isk = v.delta,
+            updated_at = now()
+        FROM UNNEST($1::uuid[], $2::numeric[]) AS v(id, delta)
+        WHERE r.id = v.id
+        "#,
+    )
+    .bind(&ids)
+    .bind(&deltas)
+    .execute(&mut **tx)
+    .await?;
 
     Ok(())
 }

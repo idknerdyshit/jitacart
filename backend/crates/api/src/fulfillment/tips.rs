@@ -1,14 +1,13 @@
 use axum::{extract::State, Json};
-use chrono::{DateTime, Utc};
 use domain::GroupRole;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use uuid::Uuid;
 
 use crate::{
     db::Tx,
     errors::ApiError,
     extract::{CurrentGroup, CurrentList},
+    groups::GroupRow,
     lists::load_list_detail,
     state::AppState,
 };
@@ -16,29 +15,6 @@ use crate::{
 #[derive(Deserialize)]
 pub(super) struct SetTipBody {
     pub(super) tip_pct: Decimal,
-}
-
-#[derive(sqlx::FromRow)]
-struct GroupRow {
-    id: Uuid,
-    name: String,
-    invite_code: String,
-    created_by_user_id: Uuid,
-    created_at: DateTime<Utc>,
-    default_tip_pct: Decimal,
-}
-
-impl GroupRow {
-    fn into_group(self) -> domain::Group {
-        domain::Group {
-            id: self.id,
-            name: self.name,
-            invite_code: self.invite_code,
-            created_by_user_id: self.created_by_user_id,
-            created_at: self.created_at,
-            default_tip_pct: self.default_tip_pct,
-        }
-    }
 }
 
 pub(super) async fn set_list_tip(

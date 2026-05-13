@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use auth_tokens::{CharacterTokenStore, EsiBudgetGuard, TokenEncConfig};
+use jitacart_config::{EsiCommonCfg, EveSsoCommonCfg};
 use nea_esi::EsiClient;
-use secrecy::SecretString;
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -20,6 +20,8 @@ use tokio::time::{interval, MissedTickBehavior};
 use jobs::JobSlot;
 
 mod jobs;
+
+pub type EveSsoCfg = EveSsoCommonCfg;
 
 #[derive(Debug, Deserialize)]
 pub struct WorkerConfig {
@@ -40,15 +42,10 @@ pub struct WorkerConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct EsiCfg {
-    pub user_agent: String,
+    #[serde(flatten)]
+    pub common: EsiCommonCfg,
     #[serde(default)]
     pub poll_intervals_secs: PollIntervals,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct EveSsoCfg {
-    pub client_id: String,
-    pub client_secret: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,12 +213,12 @@ async fn main() -> anyhow::Result<()> {
     let token_store = CharacterTokenStore::new(
         pool.clone(),
         cipher,
-        config.esi.user_agent.clone(),
+        config.esi.common.user_agent.clone(),
         config.eve_sso.client_id.clone(),
-        SecretString::from(config.eve_sso.client_secret.clone()),
+        config.eve_sso.client_secret.clone(),
     );
 
-    let esi_anon = EsiClient::with_user_agent(&config.esi.user_agent)
+    let esi_anon = EsiClient::with_user_agent(&config.esi.common.user_agent)
         .map_err(|e| anyhow!("EsiClient::with_user_agent: {e}"))?
         .with_cache();
 
@@ -234,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
         webhook_http: reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .expect("building webhook http client"),
+            .context("building webhook http client")?,
     });
 
     spawn_healthz(&ctx).await?;
@@ -268,9 +265,21 @@ async fn drive_slot(slot: Box<dyn JobSlot>, ctx: Arc<Ctx>) {
     let mut t = mk_interval(secs);
     loop {
         t.tick().await;
-        if let Err(e) = slot.run(&ctx).await {
-            tracing::error!(error = ?e, slot = slot.name(), "tick failed");
-        }
+        let outcome = match slot.run(&ctx).await {
+            Ok(()) => "ok",
+            Err(e) => {
+                tracing::error!(error = ?e, slot = slot.name(), "tick failed");
+                "err"
+            }
+        };
+        // Per-slot tick counter, labelled with outcome so an alerting
+        // rule can compare error rate against total runs.
+        metrics::counter!(
+            "jitacart_worker_job_runs_total",
+            "slot" => slot.name(),
+            "outcome" => outcome,
+        )
+        .increment(1);
     }
 }
 
@@ -280,10 +289,11 @@ fn mk_interval(secs: u64) -> tokio::time::Interval {
     t
 }
 
-/// Tiny healthz server bound to a (typically loopback) port. Exposes
-/// `/healthz/esi` (budget snapshot) and `/healthz` (always-200). Empty
-/// `worker.healthz_bind` skips the server, so tests / one-shot tools
-/// don't pay the port-binding cost.
+/// Tiny healthz + metrics server bound to a (typically loopback) port.
+/// Exposes `/healthz/esi` (budget snapshot), `/healthz` (always-200),
+/// and `/metrics` (Prometheus exposition). Empty `worker.healthz_bind`
+/// skips the server, so tests / one-shot tools don't pay the
+/// port-binding cost.
 async fn spawn_healthz(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
     let bind = ctx.config.worker.healthz_bind.trim();
     if bind.is_empty() {
@@ -291,6 +301,20 @@ async fn spawn_healthz(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
         return Ok(());
     }
     let addr: std::net::SocketAddr = bind.parse().context("parsing worker.healthz_bind")?;
+
+    let prom_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .context("installing prometheus recorder")?;
+    // Pre-describe metrics so /metrics is non-empty before the first job tick.
+    metrics::describe_counter!(
+        "jitacart_worker_job_runs_total",
+        "Job ticks per slot (success or failure)."
+    );
+    metrics::describe_gauge!(
+        "jitacart_worker_esi_budget_remaining",
+        "Current ESI error budget remaining (lower is worse)."
+    );
+
     let budget = ctx.budget.clone();
     let app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
@@ -301,12 +325,23 @@ async fn spawn_healthz(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
                 move || {
                     let budget = budget.clone();
                     async move {
+                        // Cheap to expose alongside the dedicated gauge —
+                        // /healthz/esi remains the human-readable view.
+                        metrics::gauge!("jitacart_worker_esi_budget_remaining")
+                            .set(budget.remaining() as f64);
                         axum::Json(serde_json::json!({
                             "remaining": budget.remaining(),
                             "has_budget": budget.has_budget(),
                         }))
                     }
                 }
+            }),
+        )
+        .route(
+            "/metrics",
+            axum::routing::get(move || {
+                let h = prom_handle.clone();
+                async move { h.render() }
             }),
         );
     let listener = tokio::net::TcpListener::bind(addr)

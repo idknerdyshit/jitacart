@@ -1,4 +1,5 @@
 use auth_tokens::TokenEncConfig;
+use jitacart_config::{EsiCommonCfg, EveSsoCommonCfg};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +28,32 @@ pub struct Config {
     pub limits: AbuseLimits,
     #[serde(default)]
     pub turnstile: TurnstileConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// Prometheus `/metrics` exposition. Bound on its own listener so the
+/// public router never accidentally serves it; default is loopback
+/// only and there is no auth — operators scrape via
+/// `docker compose exec api curl 127.0.0.1:9090/metrics` or a sidecar
+/// in the same network namespace.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    /// Empty string disables the listener entirely (tests / no-metrics builds).
+    #[serde(default = "default_metrics_bind")]
+    pub bind: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_metrics_bind(),
+        }
+    }
+}
+
+fn default_metrics_bind() -> String {
+    "127.0.0.1:9090".to_string()
 }
 
 /// Per-IP rate-limit knobs. `tower_governor` uses a token-bucket: bucket
@@ -139,8 +166,8 @@ fn default_cookie_secure() -> bool {
 
 #[derive(Debug, Deserialize)]
 pub struct EveSsoConfig {
-    pub client_id: String,
-    pub client_secret: String,
+    #[serde(flatten)]
+    pub common: EveSsoCommonCfg,
     pub callback_url: String,
     /// Scopes requested on the *first* login. Upgrades request additional
     /// scopes via `/auth/eve/upgrade`.
@@ -154,7 +181,8 @@ pub struct EveSsoConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct EsiConfig {
-    pub user_agent: String,
+    #[serde(flatten)]
+    pub common: EsiCommonCfg,
     #[serde(default)]
     pub poll_intervals_secs: PollIntervals,
 }

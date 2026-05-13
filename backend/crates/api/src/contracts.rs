@@ -177,17 +177,25 @@ async fn confirm_suggestion(
 ) -> Result<Json<SuggestionDecision>, ApiError> {
     let mut conn = tx.acquire().await;
     let (decision, webhook_info) = do_confirm(&mut **conn, user_id, suggestion_id).await?;
-    for info in webhook_info {
-        let event = WebhookEvent::ReimbursementSettled {
-            list_destination: info.list_destination,
-            requester_name: info.requester_name,
-            hauler_name: info.hauler_name,
-            total_isk: info.total_isk.to_string(),
-        };
-        fire_webhook(&mut **conn, info.group_id, &event).await?;
-    }
+    fire_settlement_webhooks(&mut **conn, &webhook_info).await?;
     let _ = state;
     Ok(Json(decision))
+}
+
+async fn fire_settlement_webhooks(
+    conn: &mut sqlx::PgConnection,
+    infos: &[settlement::ContractSettledReimbursement],
+) -> Result<(), ApiError> {
+    for info in infos {
+        let event = WebhookEvent::ReimbursementSettled {
+            list_destination: info.list_destination.clone(),
+            requester_name: info.requester_name.clone(),
+            hauler_name: info.hauler_name.clone(),
+            total_isk: info.total_isk.to_string(),
+        };
+        fire_webhook(&mut *conn, info.group_id, &event).await?;
+    }
+    Ok(())
 }
 
 /// Acquire a transaction (or savepoint, when the caller already holds one)
@@ -238,17 +246,16 @@ where
     .bind(suggestion_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let row = row.ok_or_else(ApiError::not_found)?;
+    let ctx = row.ok_or_else(ApiError::not_found)?;
 
-    if row.suggestion_state != Some(ContractMatchState::Pending) {
+    if ctx.suggestion_state != Some(ContractMatchState::Pending) {
         return Err(ApiError::Conflict(format!(
             "suggestion is already {}",
-            row.suggestion_state
+            ctx.suggestion_state
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "(unknown)".into())
         )));
     }
-    let ctx = row;
     validate_link(&mut tx, &ctx, user_id).await?;
 
     sqlx::query(
@@ -492,15 +499,7 @@ async fn manual_link(
     let mut conn = tx.acquire().await;
     let (decision, webhook_info) =
         do_manual_link(&mut **conn, user_id, contract_id, body.reimbursement_id).await?;
-    for info in webhook_info {
-        let event = WebhookEvent::ReimbursementSettled {
-            list_destination: info.list_destination,
-            requester_name: info.requester_name,
-            hauler_name: info.hauler_name,
-            total_isk: info.total_isk.to_string(),
-        };
-        fire_webhook(&mut **conn, info.group_id, &event).await?;
-    }
+    fire_settlement_webhooks(&mut **conn, &webhook_info).await?;
     let _ = state;
     Ok(Json(decision))
 }

@@ -35,6 +35,37 @@ pub struct PriceAggregate {
     pub computed_at: DateTime<Utc>,
 }
 
+async fn upsert_price_row<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    market_id: Uuid,
+    type_id: i64,
+    agg: &PriceAggregate,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO market_prices
+            (market_id, type_id, best_sell, best_buy, sell_volume, buy_volume, computed_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (market_id, type_id) DO UPDATE SET
+            best_sell   = EXCLUDED.best_sell,
+            best_buy    = EXCLUDED.best_buy,
+            sell_volume = EXCLUDED.sell_volume,
+            buy_volume  = EXCLUDED.buy_volume,
+            computed_at = EXCLUDED.computed_at
+        "#,
+    )
+    .bind(market_id)
+    .bind(type_id)
+    .bind(agg.best_sell)
+    .bind(agg.best_buy)
+    .bind(agg.sell_volume)
+    .bind(agg.buy_volume)
+    .bind(agg.computed_at)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Process-wide cap on concurrent ESI fetches issued by this module.
 fn esi_semaphore() -> &'static Semaphore {
     static SEM: OnceLock<Semaphore> = OnceLock::new();
@@ -121,25 +152,6 @@ pub async fn get_or_refresh_prices(
     Ok(out)
 }
 
-/// f64 -> Decimal with a `warn!` on NaN/inf (which would otherwise silently
-/// drop the price to NULL). Returns None on conversion failure, so the row is
-/// still upserted with NULL rather than failing the whole refresh.
-fn f64_to_dec(label: &str, region_id: i32, type_id: i32, v: Option<f64>) -> Option<Decimal> {
-    let f = v?;
-    match Decimal::from_f64(f) {
-        Some(d) => Some(d),
-        None => {
-            tracing::warn!(
-                region_id,
-                type_id,
-                value = f,
-                "{label} f64 to Decimal conversion failed; storing NULL"
-            );
-            None
-        }
-    }
-}
-
 /// Fetch market orders for `(region, type_id)`, filter to the market's
 /// `esi_location_id`, compute aggregates, and upsert.
 pub async fn refresh_one(
@@ -157,6 +169,7 @@ pub async fn refresh_one(
         .region_id
         .ok_or_else(|| anyhow::anyhow!("refresh_one called on market without region_id"))?;
     let region_id_i32: i32 = region_id
+        .get()
         .try_into()
         .map_err(|_| anyhow::anyhow!("region_id {} does not fit in i32", region_id))?;
     let type_id_i32: i32 = type_id
@@ -175,7 +188,7 @@ pub async fn refresh_one(
 
     for o in orders
         .iter()
-        .filter(|o| o.location_id == market.esi_location_id)
+        .filter(|o| o.location_id == market.esi_location_id.get())
     {
         if o.is_buy_order {
             buy_volume = buy_volume.saturating_add(o.volume_remain);
@@ -192,43 +205,20 @@ pub async fn refresh_one(
         }
     }
 
-    let best_sell = f64_to_dec("best_sell", region_id_i32, type_id_i32, best_sell_f);
-    let best_buy = f64_to_dec("best_buy", region_id_i32, type_id_i32, best_buy_f);
-    let computed_at = Utc::now();
+    let agg = PriceAggregate {
+        best_sell: best_sell_f.and_then(Decimal::from_f64),
+        best_buy: best_buy_f.and_then(Decimal::from_f64),
+        sell_volume,
+        buy_volume,
+        computed_at: Utc::now(),
+    };
 
     // `computed_at` is a freshness timestamp, not a changed-at timestamp. Bump
     // it on every successful fetch so unchanged prices do not become
     // permanently stale and refetch on every worker tick.
-    sqlx::query(
-        r#"
-        INSERT INTO market_prices
-            (market_id, type_id, best_sell, best_buy, sell_volume, buy_volume, computed_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (market_id, type_id) DO UPDATE SET
-            best_sell   = EXCLUDED.best_sell,
-            best_buy    = EXCLUDED.best_buy,
-            sell_volume = EXCLUDED.sell_volume,
-            buy_volume  = EXCLUDED.buy_volume,
-            computed_at = EXCLUDED.computed_at
-        "#,
-    )
-    .bind(market.id)
-    .bind(type_id)
-    .bind(best_sell)
-    .bind(best_buy)
-    .bind(sell_volume)
-    .bind(buy_volume)
-    .bind(computed_at)
-    .execute(pool)
-    .await?;
+    upsert_price_row(pool, market.id, type_id, &agg).await?;
 
-    Ok(PriceAggregate {
-        best_sell,
-        best_buy,
-        sell_volume,
-        buy_volume,
-        computed_at,
-    })
+    Ok(agg)
 }
 
 #[derive(sqlx::FromRow)]
@@ -318,48 +308,24 @@ pub async fn refresh_many_for_citadel(
 
     let mut tx = pool.begin().await?;
     for &type_id in type_ids {
-        let (best_sell, best_buy, sell_volume, buy_volume) = match by_type.get(&type_id) {
-            Some(acc) => (
-                acc.best_sell_f.and_then(Decimal::from_f64),
-                acc.best_buy_f.and_then(Decimal::from_f64),
-                acc.sell_volume,
-                acc.buy_volume,
-            ),
-            None => (None, None, 0, 0),
-        };
-        sqlx::query(
-            r#"
-            INSERT INTO market_prices
-                (market_id, type_id, best_sell, best_buy, sell_volume, buy_volume, computed_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (market_id, type_id) DO UPDATE SET
-                best_sell   = EXCLUDED.best_sell,
-                best_buy    = EXCLUDED.best_buy,
-                sell_volume = EXCLUDED.sell_volume,
-                buy_volume  = EXCLUDED.buy_volume,
-                computed_at = EXCLUDED.computed_at
-            "#,
-        )
-        .bind(market_id)
-        .bind(type_id)
-        .bind(best_sell)
-        .bind(best_buy)
-        .bind(sell_volume)
-        .bind(buy_volume)
-        .bind(computed_at)
-        .execute(&mut *tx)
-        .await?;
-
-        aggregates.insert(
-            type_id,
-            PriceAggregate {
-                best_sell,
-                best_buy,
-                sell_volume,
-                buy_volume,
+        let agg = match by_type.get(&type_id) {
+            Some(acc) => PriceAggregate {
+                best_sell: acc.best_sell_f.and_then(Decimal::from_f64),
+                best_buy: acc.best_buy_f.and_then(Decimal::from_f64),
+                sell_volume: acc.sell_volume,
+                buy_volume: acc.buy_volume,
                 computed_at,
             },
-        );
+            None => PriceAggregate {
+                best_sell: None,
+                best_buy: None,
+                sell_volume: 0,
+                buy_volume: 0,
+                computed_at,
+            },
+        };
+        upsert_price_row(&mut *tx, market_id, type_id, &agg).await?;
+        aggregates.insert(type_id, agg);
     }
     sqlx::query("UPDATE markets SET last_orders_synced_at = $1 WHERE id = $2")
         .bind(computed_at)

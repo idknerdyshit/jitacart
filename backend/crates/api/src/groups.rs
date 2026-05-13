@@ -343,17 +343,17 @@ fn invite_exhausted() -> ApiError {
 }
 
 #[derive(sqlx::FromRow)]
-struct GroupRow {
-    id: Uuid,
-    name: String,
-    invite_code: String,
-    created_by_user_id: Uuid,
-    created_at: DateTime<Utc>,
-    default_tip_pct: Decimal,
+pub(crate) struct GroupRow {
+    pub(crate) id: Uuid,
+    pub(crate) name: String,
+    pub(crate) invite_code: String,
+    pub(crate) created_by_user_id: Uuid,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) default_tip_pct: Decimal,
 }
 
 impl GroupRow {
-    fn into_group(self) -> Group {
+    pub(crate) fn into_group(self) -> Group {
         Group {
             id: self.id,
             name: self.name,

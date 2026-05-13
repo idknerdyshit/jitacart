@@ -132,7 +132,7 @@ pub(super) async fn add_items(
         let r = resolved
             .get(&key)
             .ok_or_else(|| ApiError::internal(anyhow::anyhow!("resolved missing for {}", name)))?;
-        type_ids.push(r.type_id);
+        type_ids.push(r.type_id.get() as i64);
         type_names.push(r.type_name.clone());
         qtys.push(*qty);
         line_nos.push(*line_no);

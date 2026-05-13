@@ -279,63 +279,9 @@ or just a docker-compose `curl` check) at it.
 ## Backups (Phase 9 / M6)
 
 Nightly Postgres dump → age-encrypted → S3-compatible bucket via the
-profile-gated `backup` service in `docker-compose.yml`. The container
-runs on its own cron loop (default 03:00 UTC) and exits each run after
-either uploading + pruning, or warning that required env vars are
-missing.
-
-### Setup (first time)
-
-1. **Generate an age key** on a trusted machine (NOT the production
-   host — the *private* key only needs to exist where you'd restore):
-   ```sh
-   age-keygen -o jitacart-backup.age
-   ```
-   The `# public key:` line goes into `BACKUP_AGE_RECIPIENT` in `.env`.
-   Stash the file (containing the secret line) somewhere durable
-   (1Password, paper printout, etc.).
-2. **Pick a bucket**. B2, R2, Wasabi, AWS, MinIO — anything `rclone`
-   speaks. Copy `backup/rclone.conf.example` to `backup/rclone.conf`
-   and fill in. Set `BACKUP_RCLONE_REMOTE` in `.env` to e.g.
-   `b2:my-bucket/jitacart`.
-3. **Bring up the service**:
-   ```sh
-   docker compose --profile backup up -d --build backup
-   ```
-   On startup it logs the next scheduled fire time. To smoke-test now:
-   `BACKUP_RUN_ON_START=true docker compose --profile backup up backup`.
-
-### Restore
-
-Backups are streamed `pg_dump` custom-format → age-encrypted. Restore
-one as:
-
-```sh
-# Pull the encrypted backup from S3.
-rclone --config backup/rclone.conf copy "$BACKUP_RCLONE_REMOTE/jitacart-2026-05-08.dump.age" .
-
-# Decrypt with the private key. Stays in /dev/shm or memory if at all
-# possible; never write the plaintext dump to a shared disk.
-age -d -i jitacart-backup.age jitacart-2026-05-08.dump.age > restored.dump
-
-# Restore into a fresh database.
-createdb -U jitacart jitacart_restore
-pg_restore -U jitacart -d jitacart_restore --no-owner --no-acl restored.dump
-
-# Verify, then point the api at it (DATABASE_URL) and bounce the stack.
-```
-
-### Threats
-
-- **Bucket compromise alone**: ciphertext only; useless without the
-  age key.
-- **Age key compromise alone**: useless without the ciphertext.
-- **Both lost**: restoration impossible. Print the age key.
-- **Bucket lifecycle misconfiguration**: rclone-side prune is bounded
-  by `BACKUP_RETAIN_DAILY` (default 30). If your bucket *also* has a
-  shorter object-lifetime policy, that wins. Configure the bucket
-  with at least 35 days retention and let the backup script's prune
-  be the floor.
+`backup` service in `docker-compose.yml` (runs by default). Setup,
+restore procedure, and the quarterly restore drill live in
+[`backup/RESTORE.md`](../backup/RESTORE.md). One source of truth.
 
 ## Observability (Phase 9 / M6)
 

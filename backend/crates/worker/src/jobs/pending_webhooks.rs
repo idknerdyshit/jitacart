@@ -69,7 +69,7 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let sender = ReqwestSender(ctx.webhook_http.clone());
+    let sender = ReqwestSender::new(ctx.webhook_http.clone());
     for row in rows {
         let event: WebhookEvent = match serde_json::from_value(row.payload.clone()) {
             Ok(e) => e,

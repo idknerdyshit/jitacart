@@ -11,6 +11,7 @@
         type PreviewResponse,
         type ListDetail
     } from '$lib/api';
+    import MarketPicker from '$lib/lists/MarketPicker.svelte';
     import { SvelteSet } from 'svelte/reactivity';
 
     const groupId = $derived(page.params.id);
@@ -53,11 +54,6 @@
         }
         selectedIds = next;
         schedulePreview();
-    }
-
-    function setPrimary(id: string) {
-        if (!selectedIds.has(id)) return;
-        primaryId = id;
     }
 
     function schedulePreview() {
@@ -161,43 +157,14 @@
 <section>
     <h2>Markets</h2>
     {#if markets}
-        <div class="chips">
-            {#each markets as m (m.id)}
-                <button
-                    class="chip"
-                    class:selected={selectedIds.has(m.id)}
-                    class:stale={isMarketStale(m)}
-                    onclick={() => toggleMarket(m.id)}
-                    type="button"
-                    title={m.kind === 'public_structure'
-                        ? `${m.name ?? '(unnamed)'}${m.accessing_character_name ? ` · via ${m.accessing_character_name}` : ''}${isMarketStale(m) ? ' · stale' : ''}`
-                        : (m.name ?? '')}
-                >
-                    {m.short_label ?? '(unnamed)'}
-                    {#if m.kind === 'public_structure'}
-                        <span class="badge">citadel</span>
-                    {/if}
-                </button>
-            {/each}
-        </div>
-        {#if selectedIds.size > 0}
-            <p class="muted">Primary (used for snapshot fallback display):</p>
-            <div class="chips">
-                {#each markets.filter((m) => selectedIds.has(m.id)) as m (m.id)}
-                    <button
-                        class="chip"
-                        class:selected={primaryId === m.id}
-                        onclick={() => setPrimary(m.id)}
-                        type="button"
-                    >
-                        ★ {m.short_label ?? '(unnamed)'}
-                        {#if m.kind === 'public_structure'}
-                            <span class="badge">citadel</span>
-                        {/if}
-                    </button>
-                {/each}
-            </div>
-        {/if}
+        <MarketPicker
+            {markets}
+            selected={selectedIds}
+            primary={primaryId}
+            onToggle={toggleMarket}
+            onSetPrimary={(id) => (primaryId = id)}
+            primaryLabel="Primary (used for snapshot fallback display):"
+        />
     {:else}
         <p class="muted">Loading markets…</p>
     {/if}
@@ -313,37 +280,6 @@
     h2,
     h3 {
         margin-bottom: 0.5rem;
-    }
-    .chips {
-        display: flex;
-        gap: 0.4rem;
-        flex-wrap: wrap;
-        margin-bottom: 0.5rem;
-    }
-    .chip {
-        background: #21262d;
-        color: #e6edf3;
-        border: 1px solid #30363d;
-        padding: 0.3rem 0.7rem;
-        border-radius: 999px;
-        cursor: pointer;
-    }
-    .chip.selected {
-        border-color: #2f6feb;
-        background: #1f2937;
-    }
-    .chip.stale {
-        opacity: 0.5;
-    }
-    .badge {
-        font-size: 0.7em;
-        padding: 0.05em 0.4em;
-        border-radius: 4px;
-        background: #30363d;
-        color: #8b949e;
-        margin-left: 0.35em;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
     }
     td.stale {
         opacity: 0.55;

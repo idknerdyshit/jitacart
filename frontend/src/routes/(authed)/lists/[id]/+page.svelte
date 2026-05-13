@@ -17,6 +17,7 @@
     } from '$lib/api';
     import ClaimChips from '$lib/lists/ClaimChips.svelte';
     import BuyModal from '$lib/lists/BuyModal.svelte';
+    import MarketPicker from '$lib/lists/MarketPicker.svelte';
     import ReimbursementPanel from '$lib/lists/ReimbursementPanel.svelte';
     import Skeleton from '$lib/components/Skeleton.svelte';
     import EmptyState from '$lib/components/EmptyState.svelte';
@@ -165,14 +166,12 @@
     }
 
     const qtyTimers = new Map<string, ReturnType<typeof setTimeout>>();
-    let qtyInflightIds = $state<string[]>([]);
+    let qtyInflightIds = $state<Set<string>>(new SvelteSet());
     function setInflight(id: string, on: boolean) {
-        const cur = new Set(qtyInflightIds);
-        if (on) cur.add(id);
-        else cur.delete(id);
-        qtyInflightIds = Array.from(cur);
+        if (on) qtyInflightIds.add(id);
+        else qtyInflightIds.delete(id);
     }
-    const isQtyInflight = (id: string) => qtyInflightIds.includes(id);
+    const isQtyInflight = (id: string) => qtyInflightIds.has(id);
     function updateQty(itemId: string, qty: number) {
         if (qty <= 0) return;
         const existing = qtyTimers.get(itemId);
@@ -236,13 +235,18 @@
         editingTip = true;
     }
 
+    const marketsById = $derived.by(() => {
+        const m = new Map<string, GroupMarket>();
+        for (const x of allMarkets ?? []) m.set(x.id, x);
+        return m;
+    });
     function isStaleMarket(mid: string): boolean {
-        const m = allMarkets?.find((x) => x.id === mid);
+        const m = marketsById.get(mid);
         return m ? isMarketStale(m) : false;
     }
 
     function isCitadel(mid: string): boolean {
-        return allMarkets?.find((x) => x.id === mid)?.kind === 'public_structure';
+        return marketsById.get(mid)?.kind === 'public_structure';
     }
 
     const priceIndex = $derived.by(() => {
@@ -403,43 +407,13 @@
             </button>
         </div>
         {#if editingMarkets && allMarkets}
-            <div class="chips">
-                {#each allMarkets as m (m.id)}
-                    <button
-                        class="chip"
-                        class:selected={editSelected.has(m.id)}
-                        class:stale={isStaleMarket(m.id)}
-                        onclick={() => toggleEditMarket(m.id)}
-                        type="button"
-                        title={m.kind === 'public_structure'
-                            ? `${m.name ?? ''}${m.accessing_character_name ? ` · via ${m.accessing_character_name}` : ''}`
-                            : (m.name ?? '')}
-                    >
-                        {m.short_label ?? '(unnamed)'}
-                        {#if m.kind === 'public_structure'}
-                            <span class="badge">citadel</span>
-                        {/if}
-                    </button>
-                {/each}
-            </div>
-            {#if editSelected.size > 0}
-                <p class="muted">Primary:</p>
-                <div class="chips">
-                    {#each allMarkets.filter((m) => editSelected.has(m.id)) as m (m.id)}
-                        <button
-                            class="chip"
-                            class:selected={editPrimary === m.id}
-                            onclick={() => (editPrimary = m.id)}
-                            type="button"
-                        >
-                            ★ {m.short_label ?? '(unnamed)'}
-                            {#if m.kind === 'public_structure'}
-                                <span class="badge">citadel</span>
-                            {/if}
-                        </button>
-                    {/each}
-                </div>
-            {/if}
+            <MarketPicker
+                markets={allMarkets}
+                selected={editSelected}
+                primary={editPrimary}
+                onToggle={toggleEditMarket}
+                onSetPrimary={(id) => (editPrimary = id)}
+            />
             <button class="primary" onclick={saveMarkets}>Save markets</button>
         {:else}
             <p>
@@ -654,27 +628,6 @@
         display: flex;
         gap: 0.4rem;
         align-items: center;
-    }
-    .chips {
-        display: flex;
-        gap: 0.4rem;
-        flex-wrap: wrap;
-        margin-bottom: 0.5rem;
-    }
-    .chip {
-        background: #21262d;
-        color: #e6edf3;
-        border: 1px solid #30363d;
-        padding: 0.3rem 0.7rem;
-        border-radius: 999px;
-        cursor: pointer;
-    }
-    .chip.selected {
-        border-color: #2f6feb;
-        background: #1f2937;
-    }
-    .chip.stale {
-        opacity: 0.5;
     }
     .badge {
         font-size: 0.7em;

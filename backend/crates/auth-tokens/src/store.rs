@@ -19,10 +19,12 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use domain::EsiCharacterId;
 use nea_esi::{auth::EsiTokens, EsiClient};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::PgPool;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::cipher::MultiKeyCipher;
 
@@ -50,10 +52,10 @@ struct CachedClient {
     /// token. Used to detect rotation without copying the secret out for
     /// comparison. Never escapes this process.
     last_refresh_hash: std::sync::atomic::AtomicU64,
-    /// EVE character_id (i64) for this row. Used as AAD when re-encrypting
+    /// EVE character_id for this row. Used as AAD when re-encrypting
     /// rotated tokens so a row-level write can't transplant ciphertexts
     /// across characters.
-    eve_character_id: i64,
+    eve_character_id: EsiCharacterId,
 }
 
 impl CharacterTokenStore {
@@ -111,6 +113,10 @@ impl CharacterTokenStore {
 
         client
             .set_tokens(EsiTokens {
+                // Empty access token + already-expired `expires_at` is the
+                // intentional sentinel for "no cached access token in DB":
+                // nea-esi will hit the refresh endpoint on first call before
+                // ever sending the empty access token over the wire.
                 access_token: row.access_token.unwrap_or_else(|| SecretString::from("")),
                 refresh_token: row.refresh_token.clone(),
                 expires_at: row.access_token_expires_at.unwrap_or_else(|| {
@@ -151,7 +157,7 @@ impl CharacterTokenStore {
         if prior == new_hash {
             return Ok(());
         }
-        let aad = entry.eve_character_id.to_be_bytes();
+        let aad = entry.eve_character_id.get().to_be_bytes();
         let (rt_ct, rt_nonce, kid) = self
             .inner
             .cipher
@@ -184,7 +190,7 @@ impl CharacterTokenStore {
     async fn load_tokens(&self, character_id: Uuid) -> anyhow::Result<LoadedTokens> {
         #[derive(sqlx::FromRow)]
         struct Row {
-            character_id: i64,
+            character_id: EsiCharacterId,
             refresh_token_ciphertext: Vec<u8>,
             refresh_token_nonce: Vec<u8>,
             access_token_ciphertext: Option<Vec<u8>>,
@@ -204,25 +210,33 @@ impl CharacterTokenStore {
         .context("loading character tokens")?
         .ok_or_else(|| anyhow!("character {character_id} not found"))?;
 
-        let aad = row.character_id.to_be_bytes();
-        let refresh_pt = self.inner.cipher.decrypt(
+        let aad = row.character_id.get().to_be_bytes();
+        // Hold decrypted plaintext in a Zeroizing buffer so a panic in
+        // String::from_utf8 (or any early return below) still wipes the secret.
+        let refresh_pt: Zeroizing<Vec<u8>> = Zeroizing::new(self.inner.cipher.decrypt(
             &row.refresh_token_ciphertext,
             &row.refresh_token_nonce,
             &row.token_key_id,
             &aad,
-        )?;
+        )?);
         let refresh_token = SecretString::from(
-            String::from_utf8(refresh_pt).context("refresh token plaintext is not UTF-8")?,
+            std::str::from_utf8(&refresh_pt)
+                .context("refresh token plaintext is not UTF-8")?
+                .to_owned(),
         );
 
         let access_token = match (row.access_token_ciphertext, row.access_token_nonce) {
             (Some(ct), Some(nonce)) => {
-                let pt = self
-                    .inner
-                    .cipher
-                    .decrypt(&ct, &nonce, &row.token_key_id, &aad)?;
+                let pt: Zeroizing<Vec<u8>> = Zeroizing::new(self.inner.cipher.decrypt(
+                    &ct,
+                    &nonce,
+                    &row.token_key_id,
+                    &aad,
+                )?);
                 Some(SecretString::from(
-                    String::from_utf8(pt).context("access token plaintext is not UTF-8")?,
+                    std::str::from_utf8(&pt)
+                        .context("access token plaintext is not UTF-8")?
+                        .to_owned(),
                 ))
             }
             _ => None,
@@ -241,7 +255,7 @@ struct LoadedTokens {
     refresh_token: SecretString,
     access_token: Option<SecretString>,
     access_token_expires_at: Option<DateTime<Utc>>,
-    eve_character_id: i64,
+    eve_character_id: EsiCharacterId,
 }
 
 /// blake3 hash truncated to u64. Used only for in-process comparison of
@@ -273,7 +287,7 @@ pub async fn reencrypt_stale(
     #[derive(sqlx::FromRow)]
     struct Row {
         id: Uuid,
-        character_id: i64,
+        character_id: EsiCharacterId,
         refresh_token_ciphertext: Vec<u8>,
         refresh_token_nonce: Vec<u8>,
         access_token_ciphertext: Option<Vec<u8>>,
@@ -303,25 +317,29 @@ pub async fn reencrypt_stale(
         .await
         .context("opening reencrypt transaction")?;
     for row in stale {
-        let aad = row.character_id.to_be_bytes();
-        let rt_pt = cipher
-            .decrypt(
-                &row.refresh_token_ciphertext,
-                &row.refresh_token_nonce,
-                &row.token_key_id,
-                &aad,
-            )
-            .with_context(|| format!("decrypting refresh token for character {}", row.id))?;
+        let aad = row.character_id.get().to_be_bytes();
+        let rt_pt: Zeroizing<Vec<u8>> = Zeroizing::new(
+            cipher
+                .decrypt(
+                    &row.refresh_token_ciphertext,
+                    &row.refresh_token_nonce,
+                    &row.token_key_id,
+                    &aad,
+                )
+                .with_context(|| format!("decrypting refresh token for character {}", row.id))?,
+        );
         let (rt_ct, rt_nonce, _) = cipher.encrypt(&rt_pt, &aad)?;
 
         let (at_ct, at_nonce): (Option<Vec<u8>>, Option<Vec<u8>>) =
             match (row.access_token_ciphertext, row.access_token_nonce) {
                 (Some(ct), Some(nonce)) => {
-                    let pt = cipher
-                        .decrypt(&ct, &nonce, &row.token_key_id, &aad)
-                        .with_context(|| {
-                            format!("decrypting access token for character {}", row.id)
-                        })?;
+                    let pt: Zeroizing<Vec<u8>> = Zeroizing::new(
+                        cipher
+                            .decrypt(&ct, &nonce, &row.token_key_id, &aad)
+                            .with_context(|| {
+                                format!("decrypting access token for character {}", row.id)
+                            })?,
+                    );
                     let (ct, nonce, _) = cipher.encrypt(&pt, &aad)?;
                     (Some(ct), Some(nonce))
                 }

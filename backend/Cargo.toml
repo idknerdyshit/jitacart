@@ -7,6 +7,7 @@ members = [
     "crates/market",
     "crates/auth-tokens",
     "crates/bootstrap",
+    "crates/config",
     "crates/settlement",
     "crates/webhook-dispatch",
 ]
@@ -58,6 +59,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
 thiserror = "2"
 
+# enums
+strum = { version = "0.26", features = ["derive"] }
+
 # misc
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -81,6 +85,7 @@ domain = { path = "crates/domain" }
 market = { path = "crates/market" }
 auth-tokens = { path = "crates/auth-tokens" }
 bootstrap = { path = "crates/bootstrap" }
+jitacart-config = { path = "crates/config" }
 settlement = { path = "crates/settlement" }
 webhook-dispatch = { path = "crates/webhook-dispatch" }
 

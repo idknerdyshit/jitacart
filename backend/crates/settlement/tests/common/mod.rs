@@ -231,10 +231,10 @@ pub async fn insert_contract(
     let assignee_pid = get_user_principal_id(pool, assignee_user_id).await;
 
     let upsert = settlement::ContractUpsert {
-        esi_contract_id: esi_id,
-        issuer_character_id: 1,
+        esi_contract_id: domain::EsiContractId(esi_id),
+        issuer_character_id: domain::EsiCharacterId(1),
         issuer_user_id: Some(issuer_user_id),
-        assignee_character_id: Some(2),
+        assignee_character_id: Some(domain::EsiCharacterId(2)),
         assignee_user_id: Some(assignee_user_id),
         issuer_principal_id: Some(issuer_pid),
         assignee_principal_id: Some(assignee_pid),

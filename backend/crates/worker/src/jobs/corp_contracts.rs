@@ -337,8 +337,8 @@ async fn poll_one_corp(
 
         let parties = resolve_contract_parties(
             &EsiContractParties {
-                issuer_id: c.issuer_id,
-                issuer_corporation_id: c.issuer_corporation_id,
+                issuer_id: domain::EsiCharacterId(c.issuer_id),
+                issuer_corporation_id: domain::EsiCorporationId(c.issuer_corporation_id),
                 for_corporation: c.for_corporation,
                 assignee_id: c.assignee_id,
             },
@@ -359,10 +359,10 @@ async fn poll_one_corp(
             .and_then(|pid| find_user_for_principal(&idx, pid));
 
         let upsert = ContractUpsert {
-            esi_contract_id: c.contract_id,
-            issuer_character_id: c.issuer_id,
+            esi_contract_id: domain::EsiContractId(c.contract_id),
+            issuer_character_id: domain::EsiCharacterId(c.issuer_id),
             issuer_user_id,
-            assignee_character_id: c.assignee_id,
+            assignee_character_id: c.assignee_id.map(domain::EsiCharacterId),
             assignee_user_id,
             issuer_principal_id: parties.issuer_principal_id,
             assignee_principal_id: parties.assignee_principal_id,
@@ -375,8 +375,8 @@ async fn poll_one_corp(
             date_expired: Some(c.date_expired),
             date_accepted: c.date_accepted,
             date_completed: c.date_completed,
-            start_location_id: c.start_location_id,
-            end_location_id: c.end_location_id,
+            start_location_id: c.start_location_id.map(domain::EsiLocationId),
+            end_location_id: c.end_location_id.map(domain::EsiLocationId),
             raw_json: serde_json::to_value(c).unwrap_or(Value::Null),
             source_corp_id: Some(corp_id),
         };

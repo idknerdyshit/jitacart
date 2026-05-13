@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 pub use domain::multibuy::name_key as normalize_key;
-use domain::ResolvedType;
+use domain::{EsiTypeId, ResolvedType};
 use nea_esi::EsiClient;
 use sqlx::PgPool;
 
@@ -49,7 +49,13 @@ pub async fn resolve_type_ids(
     let mut have_keys: HashSet<String> = HashSet::new();
     for (k, _name, type_id, type_name) in cached {
         have_keys.insert(k.clone());
-        resolved.insert(k, ResolvedType { type_id, type_name });
+        resolved.insert(
+            k,
+            ResolvedType {
+                type_id: EsiTypeId(type_id as i32),
+                type_name,
+            },
+        );
     }
 
     // Anything not in cache: ask ESI. Send the *original casing* so ESI can
@@ -87,7 +93,7 @@ pub async fn resolve_type_ids(
                     resolved.insert(
                         k.clone(),
                         ResolvedType {
-                            type_id: *id,
+                            type_id: EsiTypeId(*id as i32),
                             type_name: canonical_name.clone(),
                         },
                     );

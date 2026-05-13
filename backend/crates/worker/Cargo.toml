@@ -14,12 +14,20 @@ domain = { workspace = true }
 market = { workspace = true }
 auth-tokens = { workspace = true }
 bootstrap = { workspace = true }
+jitacart-config = { workspace = true }
 settlement = { workspace = true }
 webhook-dispatch = { workspace = true }
 
 tokio = { workspace = true }
 axum = { workspace = true }
 sqlx = { workspace = true }
+
+# Worker has no axum middleware chain (no per-request metrics), so we
+# use the lower-level `metrics` crate directly for custom counters
+# (job ticks, ESI budget, etc.) and expose them via the Prometheus
+# exporter on the existing healthz listener.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 futures-util = "0.3"
 rand = { workspace = true }
 rust_decimal = { workspace = true }

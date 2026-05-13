@@ -1,11 +1,22 @@
-# Production stack: postgres + api + worker + frontend + caddy.
+# Production stack: postgres + api + worker + frontend + caddy + backup.
 #
 # Image-only by design. CI publishes built images to GHCR; prod just
 # pulls and restarts:
-#     docker compose pull && docker compose up -d
+#     scripts/deploy.sh
+# (or `docker compose pull && docker compose up -d` if you don't want
+# the healthcheck-driven rollback).
+#
+# Every image line is digest-pinned so `git revert` is the rollback
+# button and the audit trail is in the tree, not in whatever Docker
+# Hub serves today. To take a new release:
+#     scripts/bump-image-digests.sh vX.Y.Z   # rewrites the digests
+#     git commit                              # captures the new state
+#     scripts/deploy.sh                       # pull + up + verify
 #
 # To build images locally (hotfix from a non-CI box, dev iteration):
 #     docker compose -f docker-compose.yml -f docker-compose.build.yml build
+# The build override replaces digest-pinned `image:` fields with
+# retaggable mutable refs — digest-pinned forms cannot be retagged.
 #
 # For local Postgres-only development, use the dev override:
 #     docker compose -f docker-compose.dev.yml up
@@ -43,7 +54,9 @@ services:
     logging: *default-logging
 
   api:
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    # Digest-pin via scripts/bump-image-digests.sh vX.Y.Z. Until then,
+    # this tracks :latest mutably — first deploy MUST run the script.
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest
     restart: unless-stopped
     depends_on:
       postgres:
@@ -57,6 +70,10 @@ services:
       ADMIN_DATABASE_URL: postgres://jitacart_admin:${POSTGRES_PASSWORD}@postgres:5432/jitacart
       DATABASE_URL: postgres://jitacart_app:${APP_DB_PASSWORD}@postgres:5432/jitacart
       SERVER__BIND: 0.0.0.0:8080
+      # Loopback only; scrape via `docker compose exec api curl
+      # 127.0.0.1:9090/metrics` or a sidecar in the same netns.
+      # Caddy does not proxy this port.
+      METRICS__BIND: 127.0.0.1:9090
     expose:
       - "8080"
     healthcheck:
@@ -68,7 +85,8 @@ services:
     logging: *default-logging
 
   worker:
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    # Same backend image as api; keep them at the same digest.
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest
     command: ["jitacart-worker"]
     restart: unless-stopped
     depends_on:
@@ -95,7 +113,7 @@ services:
     logging: *default-logging
 
   frontend:
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:latest@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:latest
     restart: unless-stopped
     depends_on:
       api:
@@ -130,12 +148,12 @@ services:
       - caddy-config:/config
     logging: *default-logging
 
-  # Nightly Postgres → age → S3 backup runner. Profile-gated so dev
-  # stacks don't pay the cost of pulling alpine + postgresql-client.
-  # Bring it up alongside the rest with `docker compose --profile backup up -d`.
+  # Nightly Postgres → age → S3 backup runner. Runs by default; if
+  # BACKUP_AGE_RECIPIENT / BACKUP_RCLONE_REMOTE are unset, the container
+  # stays Up with a single WARN line so the missing config is visible
+  # in `docker compose ps` rather than silently absent.
   backup:
-    profiles: [backup]
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backup:latest@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backup:latest
     restart: unless-stopped
     depends_on:
       postgres:

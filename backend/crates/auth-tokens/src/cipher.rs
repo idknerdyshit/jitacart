@@ -23,6 +23,7 @@ use aes_gcm::{
 use anyhow::{anyhow, Context};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::Deserialize;
+use zeroize::Zeroize;
 
 /// Multi-key encryption config: a map of kid → base64 key plus a `primary`
 /// kid. Loaded from the api/worker config files; deserialized via serde.
@@ -84,17 +85,20 @@ impl MultiKeyCipher {
             if kid.is_empty() {
                 return Err(anyhow!("token_enc key id must not be empty"));
             }
-            let raw = B64
+            let mut raw = B64
                 .decode(b64.trim())
                 .with_context(|| format!("token_enc key {kid:?} is not valid base64"))?;
             if raw.len() != 32 {
+                raw.zeroize();
                 return Err(anyhow!(
                     "token_enc key {kid:?} must decode to 32 bytes, got {}",
                     raw.len()
                 ));
             }
             let key = Key::<Aes256Gcm>::from_slice(&raw);
-            keys.insert(kid, Aes256Gcm::new(key));
+            let aes = Aes256Gcm::new(key);
+            raw.zeroize();
+            keys.insert(kid, aes);
         }
         Ok(Self { keys, primary })
     }

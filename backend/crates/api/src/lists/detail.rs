@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use domain::{
-    Claim, ClaimStatus, Fulfillment, FulfillmentSource, GroupRole, List, ListDetail, ListItem,
-    ListItemStatus, ListStatus, LiveItemPrice, Market, MarketKind, Reimbursement,
-    ReimbursementStatus,
+    Claim, ClaimStatus, EsiContractId, EsiLocationId, EsiRegionId, EsiTypeId, Fulfillment,
+    FulfillmentSource, GroupRole, List, ListDetail, ListItem, ListItemStatus, ListStatus,
+    LiveItemPrice, Market, MarketKind, Reimbursement, ReimbursementStatus,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -265,7 +265,7 @@ impl ListItemRow {
         ListItem {
             id: self.id,
             list_id: self.list_id,
-            type_id: self.type_id,
+            type_id: EsiTypeId(self.type_id as i32),
             type_name: self.type_name,
             qty_requested: self.qty_requested,
             qty_fulfilled: self.qty_fulfilled,
@@ -296,8 +296,8 @@ impl MarketWithPrimaryRow {
         Market {
             id: self.id,
             kind: self.kind,
-            esi_location_id: self.esi_location_id,
-            region_id: self.region_id,
+            esi_location_id: EsiLocationId(self.esi_location_id),
+            region_id: self.region_id.map(EsiRegionId),
             name: self.name,
             short_label: self.short_label,
             is_hub: self.is_hub,
@@ -437,7 +437,7 @@ impl ReimbursementRow {
             self.contract_price_isk,
         ) {
             (Some(esi_id), Some(cstatus), Some(price)) => Some(domain::ContractSummary {
-                esi_contract_id: esi_id,
+                esi_contract_id: EsiContractId(esi_id),
                 status: cstatus,
                 price_isk: price,
                 expected_total_isk: self.contract_expected_total_isk,

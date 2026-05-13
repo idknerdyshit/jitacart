@@ -3,12 +3,78 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
 pub mod multibuy;
 pub mod principals;
+
+// ── ESI id newtypes ───────────────────────────────────────────────────────────
+//
+// EVE Online ESI gives us a small zoo of bare integer ids — character_id,
+// type_id, region_id, esi_location_id, esi_contract_id, esi_corporation_id, …
+// — that are freely interchangeable at every call site if you let them stay
+// `i64`. Wrapping them as transparent newtypes makes argument transposition
+// a compile error while preserving:
+//
+//   - `#[serde(transparent)]`  → JSON wire format is byte-identical.
+//   - `#[sqlx(transparent)]`   → sqlx encodes/decodes as the inner integer,
+//                                so DB column types don't have to change.
+//
+// Callers go through `.get()` / `From<i64>` to cross the boundary.
+macro_rules! esi_id_newtype {
+    ($(#[$meta:meta])* $name:ident, $inner:ty) => {
+        $(#[$meta])*
+        #[derive(
+            Copy,
+            Clone,
+            Eq,
+            PartialEq,
+            Hash,
+            Debug,
+            Serialize,
+            Deserialize,
+            sqlx::Type,
+        )]
+        #[serde(transparent)]
+        #[sqlx(transparent)]
+        pub struct $name(pub $inner);
+
+        impl $name {
+            #[inline]
+            pub fn get(self) -> $inner {
+                self.0
+            }
+        }
+
+        impl From<$inner> for $name {
+            #[inline]
+            fn from(v: $inner) -> Self {
+                Self(v)
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+    };
+}
+
+esi_id_newtype!(EsiCharacterId, i64);
+esi_id_newtype!(EsiCorporationId, i64);
+esi_id_newtype!(EsiContractId, i64);
+esi_id_newtype!(EsiLocationId, i64);
+esi_id_newtype!(EsiRegionId, i64);
+esi_id_newtype!(EsiStructureId, i64);
+esi_id_newtype!(EsiJournalRefId, i64);
+esi_id_newtype!(EsiRecordId, i64);
+// type_id is i32 because that's what ESI gives us (and what
+// `contract_items.type_id` already is). DB columns that hold it as bigint
+// will need an explicit `.get() as i64` / `i64::from(.get())` at the
+// boundary; do that cast at the SQL bind site, not in the wrapper.
+esi_id_newtype!(EsiTypeId, i32);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -24,7 +90,7 @@ pub struct User {
 pub struct Character {
     pub id: Uuid,
     pub user_id: Uuid,
-    pub character_id: i64,
+    pub character_id: EsiCharacterId,
     pub character_name: String,
     pub owner_hash: String,
     pub scopes: Vec<String>,
@@ -33,27 +99,13 @@ pub struct Character {
     pub last_refreshed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, strum::Display)]
 #[sqlx(type_name = "group_role", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum GroupRole {
     Owner,
     Member,
-}
-
-impl GroupRole {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            GroupRole::Owner => "owner",
-            GroupRole::Member => "member",
-        }
-    }
-}
-
-impl fmt::Display for GroupRole {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,57 +126,29 @@ pub struct GroupMember {
     pub joined_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, strum::Display)]
 #[sqlx(type_name = "market_kind", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum MarketKind {
     NpcHub,
     PublicStructure,
 }
 
-impl MarketKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            MarketKind::NpcHub => "npc_hub",
-            MarketKind::PublicStructure => "public_structure",
-        }
-    }
-}
-
-impl fmt::Display for MarketKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, strum::Display)]
 #[sqlx(type_name = "list_status", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum ListStatus {
     Open,
     Closed,
     Archived,
 }
 
-impl ListStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ListStatus::Open => "open",
-            ListStatus::Closed => "closed",
-            ListStatus::Archived => "archived",
-        }
-    }
-}
-
-impl fmt::Display for ListStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, strum::Display)]
 #[sqlx(type_name = "list_item_status", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum ListItemStatus {
     Open,
     Claimed,
@@ -133,105 +157,43 @@ pub enum ListItemStatus {
     Settled,
 }
 
-impl ListItemStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ListItemStatus::Open => "open",
-            ListItemStatus::Claimed => "claimed",
-            ListItemStatus::Bought => "bought",
-            ListItemStatus::Delivered => "delivered",
-            ListItemStatus::Settled => "settled",
-        }
-    }
-}
-
-impl fmt::Display for ListItemStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, strum::Display)]
 #[sqlx(type_name = "claim_status", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum ClaimStatus {
     Active,
     Released,
     Completed,
 }
 
-impl ClaimStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ClaimStatus::Active => "active",
-            ClaimStatus::Released => "released",
-            ClaimStatus::Completed => "completed",
-        }
-    }
-}
-
-impl fmt::Display for ClaimStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, strum::Display)]
 #[sqlx(type_name = "fulfillment_source", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum FulfillmentSource {
     Manual,
     Contract,
 }
 
-impl FulfillmentSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FulfillmentSource::Manual => "manual",
-            FulfillmentSource::Contract => "contract",
-        }
-    }
-}
-
-impl fmt::Display for FulfillmentSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, strum::Display)]
 #[sqlx(type_name = "reimbursement_status", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum ReimbursementStatus {
     Pending,
     Settled,
     Cancelled,
 }
 
-impl ReimbursementStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ReimbursementStatus::Pending => "pending",
-            ReimbursementStatus::Settled => "settled",
-            ReimbursementStatus::Cancelled => "cancelled",
-        }
-    }
-}
-
-impl fmt::Display for ReimbursementStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Market {
     pub id: Uuid,
     pub kind: MarketKind,
-    pub esi_location_id: i64,
+    pub esi_location_id: EsiLocationId,
     /// `None` only for citadels still pending detail-fetch resolution.
     /// NPC hubs always carry `Some(_)`; the DB CHECK constraint enforces this.
-    pub region_id: Option<i64>,
+    pub region_id: Option<EsiRegionId>,
     pub name: Option<String>,
     pub short_label: Option<String>,
     pub is_hub: bool,
@@ -241,7 +203,7 @@ pub struct Market {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketPrice {
     pub market_id: Uuid,
-    pub type_id: i64,
+    pub type_id: EsiTypeId,
     pub best_sell: Option<Decimal>,
     pub best_buy: Option<Decimal>,
     pub sell_volume: i64,
@@ -271,7 +233,7 @@ pub struct List {
 pub struct ListItem {
     pub id: Uuid,
     pub list_id: Uuid,
-    pub type_id: i64,
+    pub type_id: EsiTypeId,
     pub type_name: String,
     pub qty_requested: i64,
     pub qty_fulfilled: i64,
@@ -363,31 +325,15 @@ pub struct Reimbursement {
     pub wallet_settlement_delta_isk: Option<Decimal>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, strum::Display)]
 #[sqlx(type_name = "contract_type", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ContractType {
     ItemExchange,
     Auction,
     Courier,
     Unknown,
-}
-
-impl ContractType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ContractType::ItemExchange => "item_exchange",
-            ContractType::Auction => "auction",
-            ContractType::Courier => "courier",
-            ContractType::Unknown => "unknown",
-        }
-    }
-}
-
-impl fmt::Display for ContractType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 impl FromStr for ContractType {
@@ -403,9 +349,10 @@ impl FromStr for ContractType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, strum::Display)]
 #[sqlx(type_name = "contract_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ContractStatus {
     Outstanding,
     InProgress,
@@ -420,21 +367,6 @@ pub enum ContractStatus {
 }
 
 impl ContractStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ContractStatus::Outstanding => "outstanding",
-            ContractStatus::InProgress => "in_progress",
-            ContractStatus::FinishedIssuer => "finished_issuer",
-            ContractStatus::FinishedContractor => "finished_contractor",
-            ContractStatus::Finished => "finished",
-            ContractStatus::Cancelled => "cancelled",
-            ContractStatus::Rejected => "rejected",
-            ContractStatus::Failed => "failed",
-            ContractStatus::Deleted => "deleted",
-            ContractStatus::Reversed => "reversed",
-        }
-    }
-
     pub fn is_terminal_success(self) -> bool {
         matches!(
             self,
@@ -453,12 +385,6 @@ impl ContractStatus {
                 | ContractStatus::Deleted
                 | ContractStatus::Reversed
         )
-    }
-}
-
-impl fmt::Display for ContractStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -481,9 +407,10 @@ impl FromStr for ContractStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, strum::Display)]
 #[sqlx(type_name = "contract_match_state", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ContractMatchState {
     Pending,
     Confirmed,
@@ -491,31 +418,14 @@ pub enum ContractMatchState {
     Superseded,
 }
 
-impl ContractMatchState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ContractMatchState::Pending => "pending",
-            ContractMatchState::Confirmed => "confirmed",
-            ContractMatchState::Rejected => "rejected",
-            ContractMatchState::Superseded => "superseded",
-        }
-    }
-}
-
-impl fmt::Display for ContractMatchState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contract {
     pub id: Uuid,
-    pub esi_contract_id: i64,
-    pub issuer_character_id: i64,
+    pub esi_contract_id: EsiContractId,
+    pub issuer_character_id: EsiCharacterId,
     /// Deprecated: use `issuer_principal_id`.
     pub issuer_user_id: Option<Uuid>,
-    pub assignee_character_id: Option<i64>,
+    pub assignee_character_id: Option<EsiCharacterId>,
     /// Deprecated: use `assignee_principal_id`.
     pub assignee_user_id: Option<Uuid>,
     pub contract_type: ContractType,
@@ -529,8 +439,8 @@ pub struct Contract {
     pub date_expired: Option<DateTime<Utc>>,
     pub date_accepted: Option<DateTime<Utc>>,
     pub date_completed: Option<DateTime<Utc>>,
-    pub start_location_id: Option<i64>,
-    pub end_location_id: Option<i64>,
+    pub start_location_id: Option<EsiLocationId>,
+    pub end_location_id: Option<EsiLocationId>,
     pub items_synced_at: Option<DateTime<Utc>>,
     pub issuer_principal_id: Option<Uuid>,
     pub assignee_principal_id: Option<Uuid>,
@@ -541,15 +451,15 @@ pub struct Contract {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractItem {
     pub contract_id: Uuid,
-    pub record_id: i64,
-    pub type_id: i32,
+    pub record_id: EsiRecordId,
+    pub type_id: EsiTypeId,
     pub quantity: i64,
     pub is_included: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractSummary {
-    pub esi_contract_id: i64,
+    pub esi_contract_id: EsiContractId,
     pub status: ContractStatus,
     pub price_isk: Decimal,
     pub expected_total_isk: Option<Decimal>,
@@ -611,33 +521,19 @@ pub struct ListDetail {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedType {
-    pub type_id: i64,
+    pub type_id: EsiTypeId,
     pub type_name: String,
 }
 
 // ── Corp principals ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, strum::Display)]
 #[sqlx(type_name = "principal_kind", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum PrincipalKind {
     User,
     Corp,
-}
-
-impl PrincipalKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PrincipalKind::User => "user",
-            PrincipalKind::Corp => "corp",
-        }
-    }
-}
-
-impl fmt::Display for PrincipalKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// Polymorphic principal — either a user or a corporation.
@@ -653,9 +549,9 @@ pub struct Principal {
 #[derive(Debug, Default)]
 pub struct PrincipalIndex {
     /// EVE corporation id → corp UUID in our `corps` table.
-    pub corp_by_esi_id: std::collections::HashMap<i64, Uuid>,
+    pub corp_by_esi_id: std::collections::HashMap<EsiCorporationId, Uuid>,
     /// EVE character id → user UUID in our `users` table.
-    pub user_by_character_id: std::collections::HashMap<i64, Uuid>,
+    pub user_by_character_id: std::collections::HashMap<EsiCharacterId, Uuid>,
     /// principal row keyed by user_id.
     pub principal_by_user_id: std::collections::HashMap<Uuid, Principal>,
     /// principal row keyed by corp_id.
@@ -665,7 +561,7 @@ pub struct PrincipalIndex {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Corp {
     pub id: Uuid,
-    pub esi_corporation_id: i64,
+    pub esi_corporation_id: EsiCorporationId,
     pub name: String,
     pub ticker: String,
     pub last_synced_at: Option<DateTime<Utc>>,
@@ -712,7 +608,7 @@ pub struct CorpWalletJournalEntry {
     pub id: Uuid,
     pub corp_id: Uuid,
     pub division: i16,
-    pub esi_journal_ref_id: i64,
+    pub esi_journal_ref_id: EsiJournalRefId,
     pub date: DateTime<Utc>,
     pub ref_type: String,
     pub amount: Decimal,

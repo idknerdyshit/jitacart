@@ -37,15 +37,33 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
         attempts: i32,
     }
 
+    // Lease window: bump next_attempt_at far enough into the future that no
+    // other worker drain (or a self-overlapping tick) picks the same row up
+    // while we're dispatching. On success we DELETE; on failure the
+    // exponential-backoff branch overwrites this lease with the real retry
+    // time. FOR UPDATE SKIP LOCKED makes the lease-claim contention-safe.
+    const LEASE_SECS: i64 = 600;
+
+    let mut tx = ctx.pool.begin().await?;
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id, group_id, payload, attempts FROM pending_webhooks \
-         WHERE next_attempt_at <= now() \
-         ORDER BY next_attempt_at \
-         LIMIT $1",
+        "WITH due AS (\
+             SELECT id FROM pending_webhooks \
+             WHERE next_attempt_at <= now() \
+             ORDER BY next_attempt_at \
+             LIMIT $1 \
+             FOR UPDATE SKIP LOCKED\
+         ) \
+         UPDATE pending_webhooks p \
+         SET next_attempt_at = now() + make_interval(secs => $2::double precision) \
+         FROM due \
+         WHERE p.id = due.id \
+         RETURNING p.id, p.group_id, p.payload, p.attempts",
     )
     .bind(BATCH)
-    .fetch_all(&ctx.pool)
+    .bind(LEASE_SECS as f64)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     if rows.is_empty() {
         return Ok(());

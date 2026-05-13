@@ -289,13 +289,13 @@ pub async fn refresh_many_for_citadel(
             buy_volume: 0,
         });
         if o.is_buy_order {
-            acc.buy_volume += o.volume_remain;
+            acc.buy_volume = acc.buy_volume.saturating_add(o.volume_remain);
             acc.best_buy_f = Some(match acc.best_buy_f {
                 Some(c) => c.max(o.price),
                 None => o.price,
             });
         } else {
-            acc.sell_volume += o.volume_remain;
+            acc.sell_volume = acc.sell_volume.saturating_add(o.volume_remain);
             acc.best_sell_f = Some(match acc.best_sell_f {
                 Some(c) => c.min(o.price),
                 None => o.price,

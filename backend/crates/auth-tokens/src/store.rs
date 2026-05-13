@@ -296,26 +296,31 @@ pub async fn reencrypt_stale(
     }
 
     let primary = cipher.primary_kid().to_string();
+    let mut tx = pool
+        .begin()
+        .await
+        .context("opening reencrypt transaction")?;
+    // FOR UPDATE SKIP LOCKED self-partitions work across concurrent worker
+    // instances: each call claims its own batch of rows and holds the locks
+    // for the duration of the transaction, so two workers never re-encrypt
+    // the same plaintext at the same time.
     let stale: Vec<Row> = sqlx::query_as(
         "SELECT id, character_id, refresh_token_ciphertext, refresh_token_nonce, \
                 access_token_ciphertext, access_token_nonce, token_key_id \
          FROM characters \
          WHERE token_key_id != $1 \
          ORDER BY last_refreshed_at NULLS FIRST \
-         LIMIT $2",
+         LIMIT $2 \
+         FOR UPDATE SKIP LOCKED",
     )
     .bind(&primary)
     .bind(batch_size)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .context("scanning for stale-kid rows")?;
 
     let scanned = stale.len();
     let mut rewritten = 0;
-    let mut tx = pool
-        .begin()
-        .await
-        .context("opening reencrypt transaction")?;
     for row in stale {
         let aad = row.character_id.get().to_be_bytes();
         let rt_pt: Zeroizing<Vec<u8>> = Zeroizing::new(

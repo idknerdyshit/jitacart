@@ -111,10 +111,11 @@ $EDITOR .env
 #             TURNSTILE__SITE_KEY, TURNSTILE__SECRET_KEY,
 #             TURNSTILE__DISABLED=false
 
-# 6. Pin images to a release and start.
-scripts/bump-image-digests.sh v0.2.0   # rewrites docker-compose.yml
-git add docker-compose.yml && git commit -m "Deploy: pin to v0.2.0"
-scripts/deploy.sh                       # pull + up + healthcheck poll
+# 6. Bring it up. CI's pin-digests job has already pinned the four
+#    jitacart-* images on main to the latest release's multi-arch
+#    digests; `scripts/deploy.sh` pulls + ups + polls /readyz and
+#    rolls back if it doesn't go green.
+scripts/deploy.sh
 
 # 7. Watch Caddy obtain a cert.
 docker compose logs -f caddy   # look for "certificate obtained successfully"
@@ -156,11 +157,14 @@ bash scripts/install-git-hooks.sh
 ## Updating
 
 ```sh
-git pull --ff-only
-scripts/bump-image-digests.sh v0.3.0    # resolve new digests
-git commit -am "Deploy: pin to v0.3.0"
-scripts/deploy.sh                        # pull, up, verify, rollback on failure
+git pull --ff-only    # fetches CI's "Release: pin images to vX.Y.Z" commit
+scripts/deploy.sh     # pull, up, verify, rollback on failure
 ```
+
+CI's `pin-digests` job rewrites `docker-compose.yml` on `main` after
+each `vX.Y.Z` tag, so `git pull` is the only thing the operator does
+between releases. See `DEPLOY.md` § Manual digest pinning for the
+escape-hatch flow (forks, hotfixes, recovery).
 
 ## Health and monitoring
 

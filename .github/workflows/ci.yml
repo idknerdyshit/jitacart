@@ -232,9 +232,14 @@ jobs:
             echo
             for img in backend frontend backup; do
               ref="ghcr.io/${OWNER}/jitacart-${img}:${VERSION}"
-              digest=$(docker buildx imagetools inspect "$ref" \
-                  | awk '/^Name:/ { print $2; exit }' \
-                  | sed -nE 's/.*@(sha256:[0-9a-f]+).*/\1/p')
+              # Read docker's output into a variable first so the pipe to
+              # awk can't SIGPIPE docker mid-stream — under `set -e +
+              # pipefail`, that surfaces as a 141 from the pipeline and
+              # kills the whole script. The `Digest:` line is what we
+              # actually want (multi-arch index digest); the `Name:` line
+              # only repeats the input ref with no @sha256.
+              inspect_out=$(docker buildx imagetools inspect "$ref" || true)
+              digest=$(printf '%s\n' "$inspect_out" | awk '/^Digest:/ { print $2; exit }')
               if [[ -z "$digest" ]]; then
                 echo "- \`${ref}\`  *(digest lookup failed)*"
               else

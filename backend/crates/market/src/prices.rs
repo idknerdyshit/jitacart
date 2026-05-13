@@ -121,6 +121,25 @@ pub async fn get_or_refresh_prices(
     Ok(out)
 }
 
+/// f64 -> Decimal with a `warn!` on NaN/inf (which would otherwise silently
+/// drop the price to NULL). Returns None on conversion failure, so the row is
+/// still upserted with NULL rather than failing the whole refresh.
+fn f64_to_dec(label: &str, region_id: i32, type_id: i32, v: Option<f64>) -> Option<Decimal> {
+    let f = v?;
+    match Decimal::from_f64(f) {
+        Some(d) => Some(d),
+        None => {
+            tracing::warn!(
+                region_id,
+                type_id,
+                value = f,
+                "{label} f64 to Decimal conversion failed; storing NULL"
+            );
+            None
+        }
+    }
+}
+
 /// Fetch market orders for `(region, type_id)`, filter to the market's
 /// `esi_location_id`, compute aggregates, and upsert.
 pub async fn refresh_one(
@@ -173,8 +192,8 @@ pub async fn refresh_one(
         }
     }
 
-    let best_sell = best_sell_f.and_then(Decimal::from_f64);
-    let best_buy = best_buy_f.and_then(Decimal::from_f64);
+    let best_sell = f64_to_dec("best_sell", region_id_i32, type_id_i32, best_sell_f);
+    let best_buy = f64_to_dec("best_buy", region_id_i32, type_id_i32, best_buy_f);
     let computed_at = Utc::now();
 
     // `computed_at` is a freshness timestamp, not a changed-at timestamp. Bump

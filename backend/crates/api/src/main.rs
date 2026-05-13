@@ -2,8 +2,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{anyhow, Context};
 use axum::{extract::DefaultBodyLimit, extract::State, routing::get, Json, Router};
+use axum_prometheus::PrometheusMetricLayer;
 use nea_esi::EsiClient;
-use secrecy::SecretString;
 use sqlx::postgres::PgPoolOptions;
 use time::Duration as TimeDuration;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
@@ -60,16 +60,16 @@ async fn main() -> anyhow::Result<()> {
             .context("building token-at-rest cipher")?;
 
     let http = reqwest::Client::builder()
-        .user_agent(&config.esi.user_agent)
+        .user_agent(&config.esi.common.user_agent)
         .build()
         .context("building reqwest client")?;
 
-    let jwks = JwksCache::new(http, config.eve_sso.client_id.clone());
+    let jwks = JwksCache::new(http, config.eve_sso.common.client_id.clone());
 
     let esi = EsiClient::with_web_app(
-        &config.esi.user_agent,
-        &config.eve_sso.client_id,
-        SecretString::from(config.eve_sso.client_secret.clone()),
+        &config.esi.common.user_agent,
+        &config.eve_sso.common.client_id,
+        config.eve_sso.common.client_secret.clone(),
     )
     .map_err(|e| anyhow!("EsiClient::with_web_app: {e}"))?
     .with_cache();
@@ -88,9 +88,9 @@ async fn main() -> anyhow::Result<()> {
     let token_store = CharacterTokenStore::new(
         pool.clone(),
         cipher.clone(),
-        config.esi.user_agent.clone(),
-        config.eve_sso.client_id.clone(),
-        SecretString::from(config.eve_sso.client_secret.clone()),
+        config.esi.common.user_agent.clone(),
+        config.eve_sso.common.client_id.clone(),
+        config.eve_sso.common.client_secret.clone(),
     );
 
     let budget_guard = EsiBudgetGuard::default();
@@ -175,11 +175,16 @@ async fn main() -> anyhow::Result<()> {
         tx_middleware,
     ));
 
+    // `prom_handle` is mounted on a *separate* listener so /metrics is never
+    // reachable through Caddy.
+    let (prom_layer, prom_handle) = PrometheusMetricLayer::pair();
+
     // Layer order (executes outer-first, propagates inner-first on the way back):
     //   SetRequestId   — generates X-Request-Id if absent
     //   TraceLayer     — opens a span with method, uri, request_id
     //   session        — tower-sessions cookie session
     //   PropagateRequestId — copies the id into the response header
+    //   PrometheusMetricLayer — counts / times every matched route
     let app = health_routes
         .merge(auth_routes)
         .merge(other_routes)
@@ -187,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
         // pastes); anything larger is almost certainly a misconfigured
         // client or an abuse attempt. Json/extractors inherit this.
         .layer(DefaultBodyLimit::max(256 * 1024))
+        .layer(prom_layer)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(session_layer)
         .layer(
@@ -195,10 +201,44 @@ async fn main() -> anyhow::Result<()> {
         )
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
 
+    // Loopback-only /metrics server. Empty bind skips it entirely
+    // (tests). No auth — a loopback bind is unforgeable; a bearer
+    // token would be one more secret to rotate.
+    spawn_metrics_server(state.config.metrics.bind.clone(), prom_handle).await?;
+
     tracing::info!("listening on {bind}");
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
 
+    Ok(())
+}
+
+async fn spawn_metrics_server(
+    bind: String,
+    handle: metrics_exporter_prometheus::PrometheusHandle,
+) -> anyhow::Result<()> {
+    let bind = bind.trim();
+    if bind.is_empty() {
+        tracing::info!("metrics disabled (metrics.bind empty)");
+        return Ok(());
+    }
+    let addr: SocketAddr = bind.parse().context("parsing metrics.bind")?;
+    let app = Router::new().route(
+        "/metrics",
+        get(move || {
+            let h = handle.clone();
+            async move { h.render() }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding metrics on {addr}"))?;
+    tracing::info!(%addr, "metrics listening");
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!(error = ?e, "metrics server stopped");
+        }
+    });
     Ok(())
 }
 

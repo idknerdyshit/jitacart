@@ -29,6 +29,15 @@ if [[ $# -gt 0 ]]; then
     esac
 fi
 
+# Misconfiguration guard. The service is on by default in the prod
+# compose file, so an operator who hasn't filled out backup vars yet
+# would otherwise get a crash-loop. Park the container instead — `Up`
+# in `docker compose ps`, one WARN line in logs, no spam.
+if [[ -z "${BACKUP_AGE_RECIPIENT:-}" || -z "${BACKUP_RCLONE_REMOTE:-}" ]]; then
+    log "WARN backup disabled: BACKUP_AGE_RECIPIENT and/or BACKUP_RCLONE_REMOTE unset; sleeping. See backup/RESTORE.md."
+    exec sleep infinity
+fi
+
 # `BACKUP_HOUR_UTC=3` by default — overridable for tests / staggering.
 HOUR="${BACKUP_HOUR_UTC:-3}"
 

@@ -9,6 +9,7 @@
 //!    per-reimbursement `verified_by_wallet`).
 //! 4. Page atomicity: a 403 mid-page does not advance the wallet cursor.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -384,11 +385,8 @@ async fn poll_one_corp_wallet(
         .await
         .with_context(|| format!("backfill unverified contracts corp={corp_id}"))?;
 
-        for id in backfill {
-            if !contract_uuids.contains(&id) {
-                contract_uuids.push(id);
-            }
-        }
+        let seen: HashSet<Uuid> = contract_uuids.iter().copied().collect();
+        contract_uuids.extend(backfill.into_iter().filter(|id| !seen.contains(id)));
 
         // Mark ambassador last_used_at.
         sqlx::query(

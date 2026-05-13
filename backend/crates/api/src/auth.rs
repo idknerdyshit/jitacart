@@ -347,7 +347,7 @@ impl From<CharacterRow> for domain::Character {
         domain::Character {
             id: r.id,
             user_id: r.user_id,
-            character_id: r.character_id,
+            character_id: domain::EsiCharacterId(r.character_id),
             character_name: r.character_name,
             owner_hash: r.owner_hash,
             scopes: r.scopes,

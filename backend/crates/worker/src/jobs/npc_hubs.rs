@@ -74,8 +74,8 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
                     Market {
                         id: r.market_id,
                         kind: r.kind,
-                        esi_location_id: r.esi_location_id,
-                        region_id: r.region_id,
+                        esi_location_id: domain::EsiLocationId(r.esi_location_id),
+                        region_id: r.region_id.map(domain::EsiRegionId),
                         name: r.name.clone(),
                         short_label: r.short_label.clone(),
                         is_hub: r.is_hub,

@@ -25,6 +25,7 @@ blake3 = "1"
 rand = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
+zeroize = "1"
 
 nea-esi = { workspace = true }
 

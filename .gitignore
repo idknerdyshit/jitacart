@@ -24,5 +24,8 @@ backup/rclone.conf
 # Logs
 *.log
 
+# deploy.sh snapshot files (used to roll back on healthcheck failure)
+.deploy-prev-*
+
 # sqlx offline cache (commit if you want offline builds in CI)
 # /backend/.sqlx/

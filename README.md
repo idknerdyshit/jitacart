@@ -110,11 +110,11 @@ $EDITOR .env
 #             ESI__USER_AGENT, TOKEN_ENC_KEY, POSTGRES_PASSWORD,
 #             TURNSTILE__SITE_KEY, TURNSTILE__SECRET_KEY,
 #             TURNSTILE__DISABLED=false
-#   Pin: JC_IMAGE_TAG=0.2.0  (semver tag, or 'latest')
 
-# 6. Pull and start.
-docker compose pull
-docker compose up -d
+# 6. Pin images to a release and start.
+scripts/bump-image-digests.sh v0.2.0   # rewrites docker-compose.yml
+git add docker-compose.yml && git commit -m "Deploy: pin to v0.2.0"
+scripts/deploy.sh                       # pull + up + healthcheck poll
 
 # 7. Watch Caddy obtain a cert.
 docker compose logs -f caddy   # look for "certificate obtained successfully"
@@ -156,9 +156,10 @@ bash scripts/install-git-hooks.sh
 ## Updating
 
 ```sh
-$EDITOR .env                    # bump JC_IMAGE_TAG
-docker compose pull
-docker compose up -d            # rolling restart of changed services
+git pull --ff-only
+scripts/bump-image-digests.sh v0.3.0    # resolve new digests
+git commit -am "Deploy: pin to v0.3.0"
+scripts/deploy.sh                        # pull, up, verify, rollback on failure
 ```
 
 ## Health and monitoring

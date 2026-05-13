@@ -152,7 +152,7 @@ pub(super) async fn preview(
     let (resolved, unresolved) =
         market::resolve_type_ids(&state.pool, &state.esi, &distinct_names).await?;
 
-    let type_ids = dedup_type_ids(resolved.values().map(|r| r.type_id));
+    let type_ids = dedup_type_ids(resolved.values().map(|r| r.type_id.get() as i64));
     let prices_by_market =
         fetch_prices_for_markets(&state, &tx, group_id, &markets, &type_ids).await?;
 
@@ -167,7 +167,7 @@ pub(super) async fn preview(
                 for m in &markets {
                     let agg = prices_by_market
                         .get(&m.id)
-                        .and_then(|map| map.get(&r.type_id));
+                        .and_then(|map| map.get(&(r.type_id.get() as i64)));
                     prices_out.insert(
                         m.id.to_string(),
                         PreviewPrice {
@@ -188,7 +188,7 @@ pub(super) async fn preview(
             PreviewLine {
                 line_nos: p.line_nos,
                 name: p.name.clone(),
-                type_id: resolved_for_line.map(|r| r.type_id),
+                type_id: resolved_for_line.map(|r| r.type_id.get() as i64),
                 type_name: resolved_for_line.map(|r| r.type_name.clone()),
                 qty: p.qty,
                 prices: prices_out,
@@ -275,7 +275,7 @@ pub(super) async fn create(
         )));
     }
 
-    let type_ids = dedup_type_ids(resolved.values().map(|r| r.type_id));
+    let type_ids = dedup_type_ids(resolved.values().map(|r| r.type_id.get() as i64));
     let prices_by_market =
         fetch_prices_for_markets(&state, &tx, group_id, &markets, &type_ids).await?;
 
@@ -294,12 +294,13 @@ pub(super) async fn create(
         let r = resolved.get(&key).ok_or_else(|| {
             ApiError::internal(anyhow::anyhow!("resolved missing for {}", p.name))
         })?;
-        let (est_unit, est_market) = pick_cheapest(&markets, &prices_by_market, r.type_id);
+        let (est_unit, est_market) =
+            pick_cheapest(&markets, &prices_by_market, r.type_id.get() as i64);
         if let Some(u) = est_unit {
             total += u * Decimal::from(p.qty);
         }
         items_to_insert.push(ItemRow {
-            type_id: r.type_id,
+            type_id: r.type_id.get() as i64,
             type_name: r.type_name.clone(),
             qty: p.qty,
             line_no: *p.line_nos.first().unwrap_or(&0) as i32,

@@ -8,7 +8,7 @@
 
 use domain::GroupRole;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgExecutor, PgPool};
+use sqlx::PgExecutor;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +41,20 @@ struct WebhookRow {
     notify_reimbursement_settled: bool,
 }
 
+async fn fetch_row(
+    executor: impl PgExecutor<'_>,
+    group_id: Uuid,
+) -> Result<Option<WebhookRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT webhook_url, notify_list_created, notify_list_claimed, \
+                notify_list_delivered, notify_reimbursement_settled \
+         FROM group_discord_webhooks WHERE group_id = $1",
+    )
+    .bind(group_id)
+    .fetch_optional(executor)
+    .await
+}
+
 pub async fn do_get_webhook(
     executor: impl PgExecutor<'_>,
     group_id: Uuid,
@@ -49,16 +63,7 @@ pub async fn do_get_webhook(
     if role != GroupRole::Owner {
         return Err(Error::Forbidden);
     }
-    let row: Option<WebhookRow> = sqlx::query_as(
-        "SELECT webhook_url, notify_list_created, notify_list_claimed, \
-                notify_list_delivered, notify_reimbursement_settled \
-         FROM group_discord_webhooks WHERE group_id = $1",
-    )
-    .bind(group_id)
-    .fetch_optional(executor)
-    .await?;
-
-    Ok(row.map(|r| WebhookConfig {
+    Ok(fetch_row(executor, group_id).await?.map(|r| WebhookConfig {
         webhook_url: r.webhook_url,
         notify_list_created: r.notify_list_created,
         notify_list_claimed: r.notify_list_claimed,
@@ -234,7 +239,13 @@ pub trait WebhookSender: Send + Sync {
     async fn send(&self, url: &str, payload: serde_json::Value) -> anyhow::Result<()>;
 }
 
-pub struct ReqwestSender(pub reqwest::Client);
+pub struct ReqwestSender(reqwest::Client);
+
+impl ReqwestSender {
+    pub fn new(client: reqwest::Client) -> Self {
+        Self(client)
+    }
+}
 
 #[async_trait::async_trait]
 impl WebhookSender for ReqwestSender {
@@ -260,21 +271,12 @@ pub fn build_payload(event: &WebhookEvent) -> serde_json::Value {
 }
 
 pub async fn dispatch_webhook(
-    pool: &PgPool,
+    executor: impl PgExecutor<'_>,
     sender: &dyn WebhookSender,
     group_id: Uuid,
     event: &WebhookEvent,
 ) -> Result<(), Error> {
-    let row: Option<WebhookRow> = sqlx::query_as(
-        "SELECT webhook_url, notify_list_created, notify_list_claimed, \
-                notify_list_delivered, notify_reimbursement_settled \
-         FROM group_discord_webhooks WHERE group_id = $1",
-    )
-    .bind(group_id)
-    .fetch_optional(pool)
-    .await?;
-
-    let row = match row {
+    let row = match fetch_row(executor, group_id).await? {
         Some(r) => r,
         None => return Ok(()),
     };

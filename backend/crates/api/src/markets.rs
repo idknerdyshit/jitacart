@@ -5,7 +5,7 @@
 
 use axum::{extract::State, routing::get, Json, Router};
 use chrono::{DateTime, Utc};
-use domain::{Market, MarketKind};
+use domain::{EsiLocationId, EsiRegionId, Market, MarketKind};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -111,8 +111,8 @@ impl MarketRow {
         Market {
             id: self.id,
             kind: self.kind,
-            esi_location_id: self.esi_location_id,
-            region_id: self.region_id,
+            esi_location_id: EsiLocationId(self.esi_location_id),
+            region_id: self.region_id.map(EsiRegionId),
             name: self.name,
             short_label: self.short_label,
             is_hub: self.is_hub,
@@ -143,8 +143,8 @@ impl GroupMarketRow {
             market: Market {
                 id: self.id,
                 kind: self.kind,
-                esi_location_id: self.esi_location_id,
-                region_id: self.region_id,
+                esi_location_id: EsiLocationId(self.esi_location_id),
+                region_id: self.region_id.map(EsiRegionId),
                 name: self.name,
                 short_label: self.short_label,
                 is_hub: self.is_hub,

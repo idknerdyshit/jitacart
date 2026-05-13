@@ -96,7 +96,7 @@ pub(crate) async fn build_principal_index(
     for (char_id, user_id) in char_rows {
         if let Some(pid) = user_principal_by_user.get(&user_id) {
             idx.add_user(
-                char_id,
+                domain::EsiCharacterId(char_id),
                 user_id,
                 Principal {
                     id: *pid,
@@ -137,7 +137,7 @@ pub(crate) async fn build_principal_index(
     for (esi_corp_id, corp_id) in corp_rows {
         if let Some(pid) = corp_principal_by_corp.get(&corp_id) {
             idx.add_corp(
-                esi_corp_id,
+                domain::EsiCorporationId(esi_corp_id),
                 corp_id,
                 Principal {
                     id: *pid,

@@ -17,8 +17,8 @@ use tower_sessions_sqlx_store::PostgresStore;
 use auth_tokens::{CharacterTokenStore, EsiBudgetGuard};
 
 use jitacart_api::{
-    auth, citadels, config::Config, contracts, corps, fulfillment, groups, jwt::JwksCache, lists,
-    markets, state::AppState, webhooks,
+    auth, citadels, config::Config, contracts, corps, db::tx_middleware, fulfillment, groups,
+    jwt::JwksCache, lists, markets, state::AppState, webhooks,
 };
 
 #[tokio::main]
@@ -26,16 +26,34 @@ async fn main() -> anyhow::Result<()> {
     bootstrap::init_tracing();
     let config: Config = bootstrap::load_config("loading config")?;
 
+    // Migrations run as `jitacart_admin` (table owner; CREATE/ALTER allowed).
+    // Open a tiny pool, run schema migrations + the tower-sessions store
+    // migration, close it, then connect the runtime pool as `jitacart_app`
+    // (NOBYPASSRLS).
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&config.admin_database_url)
+        .await
+        .context("connecting admin pool")?;
+
+    sqlx::migrate!("../../migrations")
+        .run(&admin_pool)
+        .await
+        .context("running migrations")?;
+
+    let session_store_admin = PostgresStore::new(admin_pool.clone());
+    session_store_admin
+        .migrate()
+        .await
+        .context("running tower-sessions migrations")?;
+
+    admin_pool.close().await;
+
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&config.database_url)
         .await
         .context("connecting to postgres")?;
-
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .context("running migrations")?;
 
     let cipher =
         auth_tokens::build_cipher(config.token_enc.as_ref(), config.token_enc_key.as_deref())
@@ -56,11 +74,11 @@ async fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow!("EsiClient::with_web_app: {e}"))?
     .with_cache();
 
+    // Sessions at runtime use the app pool. The store's table was created
+    // above via the admin pool; tower-sessions only needs SELECT/INSERT
+    // /UPDATE/DELETE here, which the public-schema GRANT to jitacart_app
+    // covers.
     let session_store = PostgresStore::new(pool.clone());
-    session_store
-        .migrate()
-        .await
-        .context("running tower-sessions migrations")?;
     let session_layer = SessionManagerLayer::new(session_store)
         .with_secure(config.server.cookie_secure)
         .with_http_only(true)
@@ -113,6 +131,14 @@ async fn main() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow!("invalid {label} rate-limit config"))
     };
 
+    // /healthz and /readyz live on their own sub-router with no
+    // tx_middleware: they only do `SELECT 1` against the app pool and have
+    // no use for a tx (and would needlessly open one for every probe).
+    let health_routes = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .with_state(state.clone());
+
     let auth_routes = Router::new()
         .merge(auth::router())
         .with_state(state.clone());
@@ -121,10 +147,15 @@ async fn main() -> anyhow::Result<()> {
     } else {
         auth_routes.layer(mk_layer(rl.auth_period_secs, rl.auth_burst, "auth")?)
     };
+    // tx_middleware sits *outside* the rate limiter so a rate-limit reject
+    // doesn't open a tx, and *inside* SessionManagerLayer (added below at
+    // the outer chain) so it can read the session.
+    let auth_routes = auth_routes.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        tx_middleware,
+    ));
 
     let other_routes = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
         .merge(groups::router())
         .merge(markets::router())
         .merge(lists::router())
@@ -139,13 +170,18 @@ async fn main() -> anyhow::Result<()> {
     } else {
         other_routes.layer(mk_layer(rl.per_ip_period_secs, rl.per_ip_burst, "per-ip")?)
     };
+    let other_routes = other_routes.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        tx_middleware,
+    ));
 
     // Layer order (executes outer-first, propagates inner-first on the way back):
     //   SetRequestId   — generates X-Request-Id if absent
     //   TraceLayer     — opens a span with method, uri, request_id
     //   session        — tower-sessions cookie session
     //   PropagateRequestId — copies the id into the response header
-    let app = auth_routes
+    let app = health_routes
+        .merge(auth_routes)
         .merge(other_routes)
         // 256 KiB is generous for our largest expected payload (multibuy
         // pastes); anything larger is almost certainly a misconfigured

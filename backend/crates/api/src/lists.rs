@@ -85,13 +85,16 @@ fn validate_market_ids_size(ids: &[Uuid]) -> Result<(), ApiError> {
     Ok(())
 }
 
-pub(crate) async fn load_markets(state: &AppState, ids: &[Uuid]) -> Result<Vec<Market>, ApiError> {
+pub(crate) async fn load_markets(
+    executor: impl sqlx::PgExecutor<'_>,
+    ids: &[Uuid],
+) -> Result<Vec<Market>, ApiError> {
     let rows: Vec<MarketRow> = sqlx::query_as(
         "SELECT id, kind, esi_location_id, region_id, name, short_label, is_hub, is_public \
          FROM markets WHERE id = ANY($1::uuid[])",
     )
     .bind(ids)
-    .fetch_all(&state.pool)
+    .fetch_all(executor)
     .await?;
 
     if rows.len() != ids.len() {
@@ -105,7 +108,7 @@ pub(crate) async fn load_markets(state: &AppState, ids: &[Uuid]) -> Result<Vec<M
 /// Allow if every market is either an NPC hub or present in
 /// `group_tracked_markets` for the given group.
 pub(crate) async fn validate_markets_for_group(
-    pool: &sqlx::PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     group_id: Uuid,
     markets: &[Market],
 ) -> Result<(), ApiError> {
@@ -127,7 +130,7 @@ pub(crate) async fn validate_markets_for_group(
         )
         .bind(group_id)
         .bind(&citadel_ids)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?
         .into_iter()
         .collect()
@@ -164,11 +167,13 @@ pub(crate) async fn validate_markets_for_group(
 /// list's creator or a group owner. Extracted so tests can drive the archive
 /// transition without going through the extractor stack.
 pub async fn do_patch_list_status(
-    pool: &sqlx::PgPool,
+    executor: impl sqlx::Acquire<'_, Database = sqlx::Postgres>,
     list_id: Uuid,
     user_id: Uuid,
     new_status: ListStatus,
 ) -> Result<(), ApiError> {
+    let mut conn = executor.acquire().await?;
+
     let row: Option<(Uuid, Option<GroupRole>)> = sqlx::query_as(
         "SELECT l.created_by_user_id, gm.role \
          FROM lists l \
@@ -178,7 +183,7 @@ pub async fn do_patch_list_status(
     )
     .bind(user_id)
     .bind(list_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     let (created_by, role) = row.ok_or_else(ApiError::not_found)?;
@@ -190,7 +195,7 @@ pub async fn do_patch_list_status(
     sqlx::query("UPDATE lists SET status = $1, updated_at = now() WHERE id = $2")
         .bind(new_status)
         .bind(list_id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
@@ -198,7 +203,7 @@ pub async fn do_patch_list_status(
 /// Enforce `limits.lists_per_group`. Counts non-archived lists; archive
 /// is the existing escape hatch for groups that hit the ceiling.
 pub async fn check_lists_quota(
-    pool: &sqlx::PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     group_id: Uuid,
     cap: i64,
 ) -> Result<(), ApiError> {
@@ -206,7 +211,7 @@ pub async fn check_lists_quota(
         "SELECT count(*) FROM lists WHERE group_id = $1 AND status != 'archived'",
     )
     .bind(group_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     if count >= cap {
         return Err(ApiError::QuotaExceeded(format!(
@@ -216,6 +221,10 @@ pub async fn check_lists_quota(
     Ok(())
 }
 
-async fn require_lists_quota(state: &AppState, group_id: Uuid) -> Result<(), ApiError> {
-    check_lists_quota(&state.pool, group_id, state.config.limits.lists_per_group).await
+async fn require_lists_quota(
+    executor: impl sqlx::PgExecutor<'_>,
+    state: &AppState,
+    group_id: Uuid,
+) -> Result<(), ApiError> {
+    check_lists_quota(executor, group_id, state.config.limits.lists_per_group).await
 }

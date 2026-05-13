@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    db::Tx,
     errors::ApiError,
     extract::{CurrentGroup, CurrentUser},
     state::AppState,
@@ -65,11 +66,13 @@ struct SuggestionDto {
 }
 
 async fn list_suggestions(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup {
         user_id, group_id, ..
     }: CurrentGroup,
+    tx: Tx,
 ) -> Result<Json<Vec<SuggestionDto>>, ApiError> {
+    let mut conn = tx.acquire().await;
     let rows: Vec<SuggestionDto> = sqlx::query_as(
         r#"
         SELECT
@@ -107,8 +110,10 @@ async fn list_suggestions(
     )
     .bind(group_id)
     .bind(user_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
+
+    // Suppress unused warning — state is required by the extractor pattern
 
     Ok(Json(rows))
 }
@@ -126,11 +131,13 @@ struct BoundContractDto {
 }
 
 async fn list_contracts(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup {
         user_id, group_id, ..
     }: CurrentGroup,
+    tx: Tx,
 ) -> Result<Json<Vec<BoundContractDto>>, ApiError> {
+    let mut conn = tx.acquire().await;
     let rows: Vec<BoundContractDto> = sqlx::query_as(
         r#"
         SELECT
@@ -154,8 +161,10 @@ async fn list_contracts(
     )
     .bind(group_id)
     .bind(user_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
+
+    // Suppress unused warning — state is required by the extractor pattern
 
     Ok(Json(rows))
 }
@@ -164,25 +173,30 @@ async fn confirm_suggestion(
     State(state): State<AppState>,
     Path(suggestion_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
 ) -> Result<Json<SuggestionDecision>, ApiError> {
-    let (decision, webhook_info) = do_confirm(&state.pool, user_id, suggestion_id).await?;
+    let mut conn = tx.acquire().await;
+    let (decision, webhook_info) = do_confirm(&mut **conn, user_id, suggestion_id).await?;
     for info in webhook_info {
-        fire_webhook(
-            &state,
-            info.group_id,
-            WebhookEvent::ReimbursementSettled {
-                list_destination: info.list_destination,
-                requester_name: info.requester_name,
-                hauler_name: info.hauler_name,
-                total_isk: info.total_isk.to_string(),
-            },
-        );
+        let event = WebhookEvent::ReimbursementSettled {
+            list_destination: info.list_destination,
+            requester_name: info.requester_name,
+            hauler_name: info.hauler_name,
+            total_isk: info.total_isk.to_string(),
+        };
+        fire_webhook(&mut **conn, info.group_id, &event).await?;
     }
+    let _ = state;
     Ok(Json(decision))
 }
 
-pub async fn do_confirm(
-    pool: &sqlx::PgPool,
+/// Acquire a transaction (or savepoint, when the caller already holds one)
+/// and run the confirm flow inside it. Calling with `&PgPool` opens a fresh
+/// top-level tx; calling with `&mut Transaction` (the request tx) opens a
+/// savepoint that releases on inner commit, leaving the outer tx alive for
+/// the middleware to commit/rollback.
+pub async fn do_confirm<'c, A>(
+    acquirer: A,
     user_id: Uuid,
     suggestion_id: Uuid,
 ) -> Result<
@@ -191,9 +205,11 @@ pub async fn do_confirm(
         Vec<settlement::ContractSettledReimbursement>,
     ),
     ApiError,
-> {
-    let mut tx = pool.begin().await?;
-
+>
+where
+    A: sqlx::Acquire<'c, Database = sqlx::Postgres>,
+{
+    let mut tx = acquirer.begin().await?;
     let row: Option<LinkLockRow> = sqlx::query_as(
         r#"
         SELECT s.state               AS suggestion_state,
@@ -385,19 +401,24 @@ pub struct SuggestionDecision {
 }
 
 async fn reject_suggestion(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(suggestion_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
 ) -> Result<Json<SuggestionDecision>, ApiError> {
-    Ok(Json(do_reject(&state.pool, user_id, suggestion_id).await?))
+    let mut conn = tx.acquire().await;
+    Ok(Json(do_reject(&mut **conn, user_id, suggestion_id).await?))
 }
 
-pub async fn do_reject(
-    pool: &sqlx::PgPool,
+pub async fn do_reject<'c, A>(
+    acquirer: A,
     user_id: Uuid,
     suggestion_id: Uuid,
-) -> Result<SuggestionDecision, ApiError> {
-    let mut tx = pool.begin().await?;
+) -> Result<SuggestionDecision, ApiError>
+where
+    A: sqlx::Acquire<'c, Database = sqlx::Postgres>,
+{
+    let mut tx = acquirer.begin().await?;
     let row: Option<(ContractMatchState, Option<Uuid>, Uuid, Uuid)> = sqlx::query_as(
         "SELECT s.state, c.issuer_user_id, r.hauler_user_id, l.group_id \
          FROM contract_match_suggestions s \
@@ -465,27 +486,27 @@ async fn manual_link(
     State(state): State<AppState>,
     Path(contract_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
     Json(body): Json<ManualLinkBody>,
 ) -> Result<Json<SuggestionDecision>, ApiError> {
+    let mut conn = tx.acquire().await;
     let (decision, webhook_info) =
-        do_manual_link(&state.pool, user_id, contract_id, body.reimbursement_id).await?;
+        do_manual_link(&mut **conn, user_id, contract_id, body.reimbursement_id).await?;
     for info in webhook_info {
-        fire_webhook(
-            &state,
-            info.group_id,
-            WebhookEvent::ReimbursementSettled {
-                list_destination: info.list_destination,
-                requester_name: info.requester_name,
-                hauler_name: info.hauler_name,
-                total_isk: info.total_isk.to_string(),
-            },
-        );
+        let event = WebhookEvent::ReimbursementSettled {
+            list_destination: info.list_destination,
+            requester_name: info.requester_name,
+            hauler_name: info.hauler_name,
+            total_isk: info.total_isk.to_string(),
+        };
+        fire_webhook(&mut **conn, info.group_id, &event).await?;
     }
+    let _ = state;
     Ok(Json(decision))
 }
 
-pub async fn do_manual_link(
-    pool: &sqlx::PgPool,
+pub async fn do_manual_link<'c, A>(
+    acquirer: A,
     user_id: Uuid,
     contract_id: Uuid,
     reimbursement_id: Uuid,
@@ -495,9 +516,11 @@ pub async fn do_manual_link(
         Vec<settlement::ContractSettledReimbursement>,
     ),
     ApiError,
-> {
-    let mut tx = pool.begin().await?;
-
+>
+where
+    A: sqlx::Acquire<'c, Database = sqlx::Postgres>,
+{
+    let mut tx = acquirer.begin().await?;
     let row: Option<LinkLockRow> = sqlx::query_as(
         r#"
         SELECT
@@ -561,20 +584,24 @@ pub async fn do_manual_link(
 }
 
 async fn unlink_contract(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(contract_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
 ) -> Result<Json<SuggestionDecision>, ApiError> {
-    Ok(Json(do_unlink(&state.pool, user_id, contract_id).await?))
+    let mut conn = tx.acquire().await;
+    Ok(Json(do_unlink(&mut **conn, user_id, contract_id).await?))
 }
 
-pub async fn do_unlink(
-    pool: &sqlx::PgPool,
+pub async fn do_unlink<'c, A>(
+    acquirer: A,
     user_id: Uuid,
     contract_id: Uuid,
-) -> Result<SuggestionDecision, ApiError> {
-    let mut tx = pool.begin().await?;
-
+) -> Result<SuggestionDecision, ApiError>
+where
+    A: sqlx::Acquire<'c, Database = sqlx::Postgres>,
+{
+    let mut tx = acquirer.begin().await?;
     let row: Option<(Option<Uuid>, ContractStatus)> =
         sqlx::query_as("SELECT issuer_user_id, status FROM contracts WHERE id = $1 FOR UPDATE")
             .bind(contract_id)

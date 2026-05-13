@@ -10,11 +10,10 @@ use axum::{
 };
 use uuid::Uuid;
 
-use crate::{extract::CurrentGroup, state::AppState};
+use crate::{db::Tx, extract::CurrentGroup, state::AppState};
 
 pub use webhook_dispatch::{
-    build_payload, dispatch_webhook, do_delete_webhook, do_get_webhook, do_upsert_webhook,
-    ReqwestSender, WebhookConfig, WebhookEvent, WebhookSender,
+    do_delete_webhook, do_get_webhook, do_upsert_webhook, WebhookConfig, WebhookEvent,
 };
 
 pub fn router() -> Router<AppState> {
@@ -25,38 +24,65 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn get_webhook(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup { group_id, role, .. }: CurrentGroup,
+    tx: Tx,
 ) -> Result<Json<Option<WebhookConfig>>, WebhookError> {
-    Ok(Json(do_get_webhook(&state.pool, group_id, role).await?))
+    let mut conn = tx.acquire().await;
+    Ok(Json(do_get_webhook(&mut **conn, group_id, role).await?))
 }
 
 async fn upsert_webhook(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup { group_id, role, .. }: CurrentGroup,
+    tx: Tx,
     Json(body): Json<WebhookConfig>,
 ) -> Result<Json<WebhookConfig>, WebhookError> {
+    let mut conn = tx.acquire().await;
     Ok(Json(
-        do_upsert_webhook(&state.pool, group_id, role, body).await?,
+        do_upsert_webhook(&mut **conn, group_id, role, body).await?,
     ))
 }
 
 async fn delete_webhook(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup { group_id, role, .. }: CurrentGroup,
+    tx: Tx,
 ) -> Result<StatusCode, WebhookError> {
-    do_delete_webhook(&state.pool, group_id, role).await?;
+    let mut conn = tx.acquire().await;
+    do_delete_webhook(&mut **conn, group_id, role).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub fn fire_webhook(state: &AppState, group_id: Uuid, event: WebhookEvent) {
-    let pool = state.pool.clone();
-    let sender = ReqwestSender(state.webhook_http.clone());
-    tokio::spawn(async move {
-        if let Err(e) = dispatch_webhook(&pool, &sender, group_id, &event).await {
-            tracing::warn!(group_id = %group_id, error = ?e, "webhook delivery failed");
+/// Enqueue a webhook event into `pending_webhooks` for the worker to drain.
+///
+/// Must run on the *request transaction*: writing through `state.pool`
+/// directly grabs a fresh connection without `app.current_user_id` set, and
+/// RLS on `pending_webhooks` would silently reject the insert. The worker
+/// (BYPASSRLS) reads the row and fires the HTTP request — the api never
+/// touches `group_discord_webhooks` directly here, so RLS on that table is
+/// not a concern. The same atomicity property that contract settlement uses
+/// applies: a 4xx/5xx handler response rolls back the enqueue along with
+/// every other change, so callers can fire webhooks early without worrying
+/// about partial commits.
+pub async fn fire_webhook(
+    executor: impl sqlx::PgExecutor<'_>,
+    group_id: Uuid,
+    event: &WebhookEvent,
+) -> Result<(), sqlx::Error> {
+    let payload = match serde_json::to_value(event) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to serialize webhook event");
+            return Ok(());
         }
-    });
+    };
+    sqlx::query("INSERT INTO pending_webhooks (group_id, payload) VALUES ($1, $2)")
+        .bind(group_id)
+        .bind(payload)
+        .execute(executor)
+        .await?;
+    Ok(())
 }
 
 #[derive(Debug)]

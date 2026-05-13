@@ -10,6 +10,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
+    db::Tx,
     errors::ApiError,
     extract::{CurrentGroup, CurrentUser},
     state::AppState,
@@ -22,15 +23,17 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_global(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     _user: CurrentUser,
+    tx: Tx,
 ) -> Result<Json<Vec<Market>>, ApiError> {
+    let mut conn = tx.acquire().await;
     let rows: Vec<MarketRow> = sqlx::query_as(
         "SELECT id, kind, esi_location_id, region_id, name, short_label, is_hub, is_public \
          FROM markets WHERE is_public AND kind = 'npc_hub' \
          ORDER BY is_hub DESC, short_label",
     )
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
 
     Ok(Json(rows.into_iter().map(MarketRow::into_market).collect()))
@@ -47,9 +50,11 @@ pub struct GroupMarket {
 }
 
 async fn list_for_group(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup { group_id, .. }: CurrentGroup,
+    tx: Tx,
 ) -> Result<Json<Vec<GroupMarket>>, ApiError> {
+    let mut conn = tx.acquire().await;
     let rows: Vec<GroupMarketRow> = sqlx::query_as(
         r#"
         SELECT m.id, m.kind, m.esi_location_id, m.region_id, m.name, m.short_label,
@@ -79,7 +84,7 @@ async fn list_for_group(
         "#,
     )
     .bind(group_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
 
     Ok(Json(

@@ -7,6 +7,7 @@ use axum::{
 };
 use domain::{ClaimStatus, GroupRole, ListStatus};
 
+use crate::db::Tx;
 use crate::errors::ApiError;
 use serde::Deserialize;
 use tower_sessions::Session;
@@ -73,12 +74,18 @@ impl FromRequestParts<AppState> for CurrentGroup {
             (StatusCode::BAD_REQUEST, "missing group id in route").into_response()
         })?;
 
+        let tx = Tx::from_request_parts(parts, state).await?;
+        let mut conn = tx.acquire().await;
+        // RLS will already gate this lookup, but we keep the explicit
+        // user_id predicate so the application returns 403 (vs a silent
+        // empty result) and so the extractor doesn't depend on RLS being
+        // configured to behave correctly.
         let role: Option<GroupRole> = sqlx::query_scalar(
             "SELECT role FROM group_memberships WHERE user_id = $1 AND group_id = $2",
         )
         .bind(user_id)
         .bind(group_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&mut **conn)
         .await
         .map_err(|e| db_error("group membership lookup failed", e))?;
 
@@ -142,6 +149,8 @@ impl FromRequestParts<AppState> for CurrentClaim {
             (StatusCode::BAD_REQUEST, "missing claim id in route").into_response()
         })?;
 
+        let tx = Tx::from_request_parts(parts, state).await?;
+        let mut conn = tx.acquire().await;
         let row: Option<(Uuid, Uuid, Uuid, ClaimStatus, Option<GroupRole>, ListStatus)> =
             sqlx::query_as(
                 "SELECT c.list_id, l.group_id, c.hauler_user_id, c.status, gm.role, l.status \
@@ -153,7 +162,7 @@ impl FromRequestParts<AppState> for CurrentClaim {
             )
             .bind(user_id)
             .bind(claim_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&mut **conn)
             .await
             .map_err(|e| db_error("claim lookup failed", e))?;
 
@@ -246,8 +255,14 @@ impl FromRequestParts<AppState> for CurrentList {
             .or(path.id)
             .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing list id in route").into_response())?;
 
+        let tx = Tx::from_request_parts(parts, state).await?;
+        let mut conn = tx.acquire().await;
         // Outer-join membership so a missing list returns 404 while a non-member
-        // on an existing list returns 403 (role IS NULL).
+        // on an existing list returns 403 (role IS NULL). Note: under RLS the
+        // policy on `lists` would already hide non-member rows, turning this
+        // into a 404 — keeping the LEFT JOIN preserves the historical 403 so
+        // callers can distinguish "doesn't exist" from "you can't see it"
+        // without depending on RLS policy details for behavior.
         let row: Option<(Uuid, Uuid, ListStatus, Option<GroupRole>)> = sqlx::query_as(
             "SELECT l.group_id, l.created_by_user_id, l.status, gm.role \
              FROM lists l \
@@ -257,7 +272,7 @@ impl FromRequestParts<AppState> for CurrentList {
         )
         .bind(user_id)
         .bind(list_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&mut **conn)
         .await
         .map_err(|e| db_error("list lookup failed", e))?;
 

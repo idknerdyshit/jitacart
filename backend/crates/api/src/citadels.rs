@@ -11,7 +11,7 @@ use domain::{GroupRole, MarketKind};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{errors::ApiError, extract::CurrentGroup, state::AppState};
+use crate::{db::Tx, errors::ApiError, extract::CurrentGroup, state::AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -38,8 +38,9 @@ struct CitadelSearchHit {
 }
 
 async fn search(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup { group_id, .. }: CurrentGroup,
+    tx: Tx,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<Vec<CitadelSearchHit>>, ApiError> {
     let trimmed = q.q.trim();
@@ -51,6 +52,7 @@ async fn search(
     }
     let pattern = format!("%{}%", trimmed.replace(['%', '_'], ""));
 
+    let mut conn = tx.acquire().await;
     let rows: Vec<HitRow> = sqlx::query_as(
         r#"
         SELECT m.id, m.name, m.short_label, m.region_id, m.solar_system_id,
@@ -69,8 +71,10 @@ async fn search(
     )
     .bind(group_id)
     .bind(&pattern)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
+
+    // Suppress unused warning — state is required by the extractor pattern
 
     Ok(Json(
         rows.into_iter()
@@ -106,18 +110,21 @@ struct TrackBody {
 }
 
 async fn track(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     cur: CurrentGroup,
+    tx: Tx,
     Json(body): Json<TrackBody>,
 ) -> Result<StatusCode, ApiError> {
     require_owner(&cur)?;
+
+    let mut conn = tx.acquire().await;
 
     // Confirm the target is a public, detail-resolved citadel.
     let row: Option<(MarketKind, bool, bool)> = sqlx::query_as(
         "SELECT kind, is_public, (details_synced_at IS NOT NULL) FROM markets WHERE id = $1",
     )
     .bind(body.market_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut **conn)
     .await?;
 
     let (kind, is_public, detailed) = row.ok_or_else(ApiError::not_found)?;
@@ -134,26 +141,33 @@ async fn track(
     .bind(cur.group_id)
     .bind(body.market_id)
     .bind(cur.user_id)
-    .execute(&state.pool)
+    .execute(&mut **conn)
     .await?;
+
+    // Suppress unused warning — state is required by the extractor pattern
 
     Ok(StatusCode::CREATED)
 }
 
 async fn untrack(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     cur: CurrentGroup,
+    tx: Tx,
     Path((_group_id, market_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     require_owner(&cur)?;
+    let mut conn = tx.acquire().await;
     let r = sqlx::query("DELETE FROM group_tracked_markets WHERE group_id = $1 AND market_id = $2")
         .bind(cur.group_id)
         .bind(market_id)
-        .execute(&state.pool)
+        .execute(&mut **conn)
         .await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+
+    // Suppress unused warning — state is required by the extractor pattern
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -173,9 +187,11 @@ struct TrackedMarket {
 }
 
 async fn list(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup { group_id, .. }: CurrentGroup,
+    tx: Tx,
 ) -> Result<Json<Vec<TrackedMarket>>, ApiError> {
+    let mut conn = tx.acquire().await;
     let rows: Vec<TrackedRow> = sqlx::query_as(
         r#"
         SELECT m.id, m.name, m.short_label, m.region_id, m.solar_system_id,
@@ -199,8 +215,10 @@ async fn list(
         "#,
     )
     .bind(group_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
+
+    // Suppress unused warning — state is required by the extractor pattern
 
     Ok(Json(
         rows.into_iter()

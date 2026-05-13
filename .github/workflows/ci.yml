@@ -136,7 +136,7 @@ jobs:
   build-images:
     name: build & push images
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [backend, frontend]
     permissions:
       contents: read
@@ -168,11 +168,9 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/jitacart-${{ matrix.name }}
           tags: |
-            type=sha,prefix=sha-,format=short
-            type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest
       - uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
@@ -183,3 +181,35 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  release:
+    name: github release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-images]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          NOTES_FILE="$(mktemp)"
+          {
+            echo "## Container images"
+            echo
+            for img in backend frontend backup; do
+              echo "- \`ghcr.io/${OWNER}/jitacart-${img}:${VERSION}\`"
+            done
+          } > "$NOTES_FILE"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            --notes-file "$NOTES_FILE"

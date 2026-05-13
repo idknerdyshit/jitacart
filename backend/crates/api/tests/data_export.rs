@@ -3,6 +3,8 @@
 //! The endpoint returns a JSON document keyed to the caller's user_id.
 //! These tests exercise `do_export_me` directly.
 
+#![allow(clippy::explicit_auto_deref)]
+
 #[path = "../../settlement/tests/common/mod.rs"]
 mod common;
 
@@ -13,7 +15,8 @@ use sqlx::PgPool;
 #[sqlx::test(migrations = "../../migrations")]
 async fn export_for_empty_user_has_all_keys(pool: PgPool) {
     let user = insert_user(&pool, "alice").await;
-    let v = do_export_me(&pool, user).await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let v = do_export_me(&mut *conn, user).await.unwrap();
     assert!(v["user"].is_object(), "user");
     assert_eq!(v["user"]["display_name"], "alice");
     assert!(v["characters"].is_array());
@@ -45,7 +48,8 @@ async fn export_includes_membership_and_list(pool: PgPool) {
     .await
     .unwrap();
 
-    let v = do_export_me(&pool, alice).await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let v = do_export_me(&mut *conn, alice).await.unwrap();
     let memberships = v["group_memberships"].as_array().unwrap();
     assert_eq!(memberships.len(), 1, "alice in one group");
     assert_eq!(memberships[0]["group_name"], "team");
@@ -77,12 +81,15 @@ async fn export_excludes_other_users_data(pool: PgPool) {
         .await
         .unwrap();
 
-    let alice_export = do_export_me(&pool, alice).await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let alice_export = do_export_me(&mut *conn, alice).await.unwrap();
     let lists = alice_export["lists_created"].as_array().unwrap();
     assert_eq!(lists.len(), 1, "alice should only see her own list");
     assert_eq!(lists[0]["destination_label"], "AlicesList");
 
-    let bob_export = do_export_me(&pool, bob).await.unwrap();
+    drop(conn);
+    let mut conn = pool.acquire().await.unwrap();
+    let bob_export = do_export_me(&mut *conn, bob).await.unwrap();
     let bob_lists = bob_export["lists_created"].as_array().unwrap();
     assert_eq!(bob_lists.len(), 1);
     assert_eq!(bob_lists[0]["destination_label"], "BobsList");
@@ -105,7 +112,8 @@ async fn export_never_includes_token_plaintext(pool: PgPool) {
     .await
     .unwrap();
 
-    let v = do_export_me(&pool, user).await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let v = do_export_me(&mut *conn, user).await.unwrap();
     let chars = v["characters"].as_array().unwrap();
     assert_eq!(chars.len(), 1);
     let serialized = serde_json::to_string(&chars[0]).unwrap();

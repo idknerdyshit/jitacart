@@ -56,12 +56,12 @@ pub(crate) enum DeliveredDemotion {
 }
 
 pub(crate) async fn lock_list(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    conn: &mut sqlx::PgConnection,
     list_id: Uuid,
 ) -> Result<(), ApiError> {
     let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM lists WHERE id = $1 FOR UPDATE")
         .bind(list_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(conn)
         .await?;
     exists.ok_or_else(ApiError::not_found).map(|_| ())
 }
@@ -94,14 +94,14 @@ pub(crate) fn ensure_claim_writable(
 /// Never demotes settled. Only demotes delivered when `demotion == Allow` and the item is
 /// no longer fully fulfilled (e.g. after a fulfillment reversal).
 pub(crate) async fn recompute_item_status(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    conn: &mut sqlx::PgConnection,
     item_id: Uuid,
     demotion: DeliveredDemotion,
 ) -> Result<ListItemStatus, ApiError> {
     let current_status: ListItemStatus =
         sqlx::query_scalar("SELECT status FROM list_items WHERE id = $1")
             .bind(item_id)
-            .fetch_one(&mut **tx)
+            .fetch_one(&mut *conn)
             .await?;
 
     if current_status == ListItemStatus::Settled {
@@ -120,7 +120,7 @@ pub(crate) async fn recompute_item_status(
          FROM list_items li WHERE li.id = $1",
     )
     .bind(item_id)
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *conn)
     .await?;
 
     let base_status = if qty_fulfilled >= qty_requested {
@@ -143,7 +143,7 @@ pub(crate) async fn recompute_item_status(
         .bind(new_status)
         .bind(qty_fulfilled)
         .bind(item_id)
-        .execute(&mut **tx)
+        .execute(&mut *conn)
         .await?;
 
     Ok(new_status)
@@ -152,7 +152,7 @@ pub(crate) async fn recompute_item_status(
 /// Set-based recompute for many items in one round-trip. Uses Forbid semantics
 /// (delivered/settled are never demoted) — used by claim mutations where reversal isn't possible.
 pub(crate) async fn recompute_item_statuses_bulk(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    conn: &mut sqlx::PgConnection,
     item_ids: &[Uuid],
 ) -> Result<(), ApiError> {
     if item_ids.is_empty() {
@@ -187,7 +187,7 @@ pub(crate) async fn recompute_item_statuses_bulk(
         "#,
     )
     .bind(item_ids)
-    .execute(&mut **tx)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }

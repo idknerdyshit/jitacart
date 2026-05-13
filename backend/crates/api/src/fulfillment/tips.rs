@@ -6,6 +6,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
+    db::Tx,
     errors::ApiError,
     extract::{CurrentGroup, CurrentList},
     lists::load_list_detail,
@@ -43,6 +44,7 @@ impl GroupRow {
 pub(super) async fn set_list_tip(
     State(state): State<AppState>,
     cur: CurrentList,
+    tx: Tx,
     Json(body): Json<SetTipBody>,
 ) -> Result<Json<domain::ListDetail>, ApiError> {
     cur.require_mutable()?;
@@ -60,8 +62,8 @@ pub(super) async fn set_list_tip(
         return Err(ApiError::forbidden());
     }
 
-    let mut tx = state.pool.begin().await?;
-    super::lock_list(&mut tx, list_id).await?;
+    let mut conn = tx.acquire().await;
+    super::lock_list(&mut **conn, list_id).await?;
 
     // Creator is locked out once any fulfillment exists; owner can always edit.
     // Read inside the tx so a concurrent fulfillment cannot slip past the check.
@@ -74,7 +76,7 @@ pub(super) async fn set_list_tip(
             )",
         )
         .bind(list_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **conn)
         .await?;
         if has_fulfillments {
             return Err(ApiError::forbidden());
@@ -84,7 +86,7 @@ pub(super) async fn set_list_tip(
     sqlx::query("UPDATE lists SET tip_pct = $1 WHERE id = $2")
         .bind(body.tip_pct)
         .bind(list_id)
-        .execute(&mut *tx)
+        .execute(&mut **conn)
         .await?;
 
     // Recompute all pending reimbursements for this list
@@ -97,17 +99,18 @@ pub(super) async fn set_list_tip(
     )
     .bind(body.tip_pct)
     .bind(list_id)
-    .execute(&mut *tx)
+    .execute(&mut **conn)
     .await?;
 
-    tx.commit().await?;
-    let detail = load_list_detail(&state, list_id, user_id, role).await?;
+    drop(conn);
+    let detail = load_list_detail(&state, &tx, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
 
 pub(super) async fn set_group_default_tip(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup { group_id, role, .. }: CurrentGroup,
+    tx: Tx,
     Json(body): Json<SetTipBody>,
 ) -> Result<Json<domain::Group>, ApiError> {
     if role != GroupRole::Owner {
@@ -115,13 +118,14 @@ pub(super) async fn set_group_default_tip(
     }
     super::validate_tip_pct(body.tip_pct)?;
 
+    let mut conn = tx.acquire().await;
     let row: Option<GroupRow> = sqlx::query_as(
         "UPDATE groups SET default_tip_pct = $1 WHERE id = $2 \
          RETURNING id, name, invite_code, created_by_user_id, created_at, default_tip_pct",
     )
     .bind(body.tip_pct)
     .bind(group_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut **conn)
     .await?;
 
     let group = row.ok_or_else(ApiError::not_found)?.into_group();

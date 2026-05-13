@@ -5,7 +5,7 @@ use domain::{Market, MarketKind};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use crate::{markets::MarketRow, state::AppState};
+use crate::{db::Tx, markets::MarketRow, state::AppState};
 
 pub(super) const RECOMPUTE_RETRY_LIMIT: usize = 3;
 
@@ -24,6 +24,7 @@ pub(super) fn dedup_type_ids(iter: impl IntoIterator<Item = i64>) -> Vec<i64> {
 /// which group member succeeded before these handlers expose cached rows.
 pub(super) async fn fetch_prices_for_markets(
     state: &AppState,
+    tx: &Tx,
     group_id: Uuid,
     markets: &[Market],
     type_ids: &[i64],
@@ -40,10 +41,13 @@ pub(super) async fn fetch_prices_for_markets(
         .filter(|m| matches!(m.kind, MarketKind::PublicStructure))
         .map(|m| m.id)
         .collect();
+    // accessible_market_ids joins through group_memberships (RLS-enabled), so
+    // it MUST run on the request tx where `app.current_user_id` is set.
     let accessible = if citadel_ids.is_empty() {
         HashSet::new()
     } else {
-        accessible_market_ids(&state.pool, group_id, &citadel_ids).await?
+        let mut conn = tx.acquire().await;
+        accessible_market_ids(&mut **conn, group_id, &citadel_ids).await?
     };
     let futs = markets.iter().map(|m| {
         let accessible = &accessible;
@@ -81,7 +85,7 @@ pub(super) async fn read_group_citadel_prices(
 /// always accessible; citadels are accessible iff some group member has an
 /// `ok` `character_structure_access` row plus the structure-markets scope.
 pub(crate) async fn accessible_market_ids(
-    pool: &sqlx::PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     group_id: Uuid,
     market_ids: &[Uuid],
 ) -> anyhow::Result<HashSet<Uuid>> {
@@ -110,7 +114,7 @@ pub(crate) async fn accessible_market_ids(
     )
     .bind(group_id)
     .bind(market_ids)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows.into_iter().collect())
 }
@@ -188,13 +192,15 @@ pub(super) fn pick_cheapest(
 /// on concurrent mutation up to [`RECOMPUTE_RETRY_LIMIT`] times.
 pub(super) async fn recompute_estimates(
     state: &AppState,
+    tx: &Tx,
     list_id: Uuid,
     mut updated_after: DateTime<Utc>,
 ) -> Result<(), crate::errors::ApiError> {
     for _ in 0..RECOMPUTE_RETRY_LIMIT {
+        let mut conn = tx.acquire().await;
         let group_id: Uuid = sqlx::query_scalar("SELECT group_id FROM lists WHERE id = $1")
             .bind(list_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&mut **conn)
             .await?
             .ok_or_else(crate::errors::ApiError::not_found)?;
 
@@ -205,7 +211,7 @@ pub(super) async fn recompute_estimates(
              WHERE lm.list_id = $1",
         )
         .bind(list_id)
-        .fetch_all(&state.pool)
+        .fetch_all(&mut **conn)
         .await?;
         let markets: Vec<domain::Market> = market_rows
             .into_iter()
@@ -215,24 +221,27 @@ pub(super) async fn recompute_estimates(
         let items: Vec<(Uuid, i64)> =
             sqlx::query_as("SELECT id, type_id FROM list_items WHERE list_id = $1")
                 .bind(list_id)
-                .fetch_all(&state.pool)
+                .fetch_all(&mut **conn)
                 .await?;
+
+        drop(conn);
 
         let type_ids = dedup_type_ids(items.iter().map(|(_, t)| *t));
         let prices_by_market =
-            fetch_prices_for_markets(state, group_id, &markets, &type_ids).await?;
+            fetch_prices_for_markets(state, tx, group_id, &markets, &type_ids).await?;
 
-        let mut tx = state.pool.begin().await?;
+        let mut conn = tx.acquire().await;
         let current_updated: DateTime<Utc> =
             sqlx::query_scalar("SELECT updated_at FROM lists WHERE id = $1 FOR UPDATE")
                 .bind(list_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **conn)
                 .await?
                 .ok_or_else(crate::errors::ApiError::not_found)?;
 
         if current_updated != updated_after {
             updated_after = current_updated;
-            tx.rollback().await?;
+            // drop conn and retry (no rollback needed — we're in the request tx)
+            drop(conn);
             continue;
         }
 
@@ -269,7 +278,7 @@ pub(super) async fn recompute_estimates(
             .bind(&item_ids)
             .bind(&est_units)
             .bind(&est_markets)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut **conn)
             .await?
         };
 
@@ -296,9 +305,8 @@ pub(super) async fn recompute_estimates(
         )
         .bind(total)
         .bind(list_id)
-        .execute(&mut *tx)
+        .execute(&mut **conn)
         .await?;
-        tx.commit().await?;
         return Ok(());
     }
     Err(crate::errors::ApiError::Conflict(

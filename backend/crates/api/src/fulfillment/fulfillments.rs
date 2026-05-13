@@ -9,6 +9,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
+    db::Tx,
     errors::ApiError,
     extract::{CurrentList, CurrentUser},
     lists::load_list_detail,
@@ -30,6 +31,7 @@ pub(super) async fn record_fulfillment(
     State(state): State<AppState>,
     Path((_list_id, item_id)): Path<(Uuid, Uuid)>,
     cur: CurrentList,
+    tx: Tx,
     Json(body): Json<RecordFulfillmentBody>,
 ) -> Result<Json<ListDetail>, ApiError> {
     cur.require_mutable()?;
@@ -66,8 +68,8 @@ pub(super) async fn record_fulfillment(
         }
     }
 
-    let mut tx = state.pool.begin().await?;
-    super::lock_list(&mut tx, list_id).await?;
+    let mut conn = tx.acquire().await;
+    super::lock_list(&mut **conn, list_id).await?;
 
     let item_row: Option<(i64, i64, Uuid)> = sqlx::query_as(
         "SELECT qty_requested, qty_fulfilled, requested_by_user_id \
@@ -75,7 +77,7 @@ pub(super) async fn record_fulfillment(
     )
     .bind(item_id)
     .bind(list_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **conn)
     .await?;
 
     let (qty_requested, qty_fulfilled, requested_by_user_id) =
@@ -114,7 +116,7 @@ pub(super) async fn record_fulfillment(
     .bind(list_id)
     .bind(requested_by_user_id)
     .bind(user_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **conn)
     .await?;
 
     if let Some(rs) = existing_reimb_status {
@@ -140,7 +142,7 @@ pub(super) async fn record_fulfillment(
         .bind(body.bought_at_market_id)
         .bind(body.hauler_character_id)
         .bind(user_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **conn)
         .await?;
 
         if !market_exists {
@@ -163,7 +165,7 @@ pub(super) async fn record_fulfillment(
          WHERE ci.list_item_id = $1 AND ci.active",
     )
     .bind(item_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **conn)
     .await?;
 
     if let Some((active_claim_id, active_hauler_user_id)) = active_claim {
@@ -198,11 +200,12 @@ pub(super) async fn record_fulfillment(
     .bind(body.unit_price_isk)
     .bind(body.bought_at_market_id)
     .bind(body.bought_at_note.as_deref())
-    .execute(&mut *tx)
+    .execute(&mut **conn)
     .await?;
 
     let new_status =
-        super::recompute_item_status(&mut tx, item_id, super::DeliveredDemotion::Forbid).await?;
+        super::recompute_item_status(&mut **conn, item_id, super::DeliveredDemotion::Forbid)
+            .await?;
 
     if new_status == ListItemStatus::Bought || new_status == ListItemStatus::Settled {
         if let Some((claim_id, _)) = active_claim {
@@ -217,7 +220,7 @@ pub(super) async fn record_fulfillment(
                 "#,
             )
             .bind(claim_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **conn)
             .await?;
 
             if all_done {
@@ -225,17 +228,22 @@ pub(super) async fn record_fulfillment(
                     .bind(ClaimStatus::Completed)
                     .bind(claim_id)
                     .bind(ClaimStatus::Active)
-                    .execute(&mut *tx)
+                    .execute(&mut **conn)
                     .await?;
             }
         }
     }
 
-    super::reimbursements::upsert_reimbursement(&mut tx, list_id, requested_by_user_id, user_id)
-        .await?;
+    super::reimbursements::upsert_reimbursement(
+        &mut **conn,
+        list_id,
+        requested_by_user_id,
+        user_id,
+    )
+    .await?;
 
-    tx.commit().await?;
-    let detail = load_list_detail(&state, list_id, user_id, role).await?;
+    drop(conn);
+    let detail = load_list_detail(&state, &tx, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
 
@@ -243,8 +251,12 @@ pub(super) async fn reverse_fulfillment(
     State(state): State<AppState>,
     Path(fulfillment_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
 ) -> Result<Json<ListDetail>, ApiError> {
-    // Load fulfillment + its list context to get the group membership
+    let mut conn = tx.acquire().await;
+
+    // Load fulfillment + its list context to get the group membership.
+    // Read inside the request tx so the authz check and mutations are atomic.
     type ReverseRow = (Uuid, Uuid, Uuid, Option<DateTime<Utc>>, ListStatus);
     let row: Option<ReverseRow> = sqlx::query_as(
         "SELECT f.hauler_user_id, li.list_id, li.requested_by_user_id, f.reversed_at, l.status \
@@ -254,7 +266,7 @@ pub(super) async fn reverse_fulfillment(
          WHERE f.id = $1",
     )
     .bind(fulfillment_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut **conn)
     .await?;
 
     let (hauler_user_id, list_id, requested_by_user_id, reversed_at, list_status) =
@@ -272,8 +284,7 @@ pub(super) async fn reverse_fulfillment(
         ));
     }
 
-    let mut tx = state.pool.begin().await?;
-    super::lock_list(&mut tx, list_id).await?;
+    super::lock_list(&mut **conn, list_id).await?;
 
     // Read group membership inside the tx so authz reflects the same state
     // we'll mutate. A non-member returns 403; non-hauler-non-owner also 403.
@@ -284,7 +295,7 @@ pub(super) async fn reverse_fulfillment(
     )
     .bind(user_id)
     .bind(list_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **conn)
     .await?
     .ok_or_else(ApiError::forbidden)?;
 
@@ -315,7 +326,7 @@ pub(super) async fn reverse_fulfillment(
     .bind(list_id)
     .bind(requested_by_user_id)
     .bind(hauler_user_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **conn)
     .await?;
 
     if matches!(reimb_status, Some(rs) if rs != ReimbursementStatus::Pending) {
@@ -328,20 +339,20 @@ pub(super) async fn reverse_fulfillment(
         "UPDATE fulfillments SET reversed_at = now() WHERE id = $1 RETURNING list_item_id",
     )
     .bind(fulfillment_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **conn)
     .await?;
 
-    super::recompute_item_status(&mut tx, item_id, super::DeliveredDemotion::Allow).await?;
+    super::recompute_item_status(&mut **conn, item_id, super::DeliveredDemotion::Allow).await?;
     super::reimbursements::upsert_reimbursement(
-        &mut tx,
+        &mut **conn,
         list_id,
         requested_by_user_id,
         hauler_user_id,
     )
     .await?;
 
-    tx.commit().await?;
-    let detail = load_list_detail(&state, list_id, user_id, role).await?;
+    drop(conn);
+    let detail = load_list_detail(&state, &tx, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
 
@@ -349,6 +360,7 @@ pub(super) async fn mark_delivered(
     State(state): State<AppState>,
     Path((_list_id, item_id)): Path<(Uuid, Uuid)>,
     cur: CurrentList,
+    tx: Tx,
 ) -> Result<Json<ListDetail>, ApiError> {
     cur.require_mutable()?;
     let CurrentList {
@@ -357,8 +369,8 @@ pub(super) async fn mark_delivered(
         role,
         ..
     } = cur;
-    let mut tx = state.pool.begin().await?;
-    super::lock_list(&mut tx, list_id).await?;
+    let mut conn = tx.acquire().await;
+    super::lock_list(&mut **conn, list_id).await?;
 
     // Check current status and last hauler
     let row: Option<(ListItemStatus, Option<Uuid>)> = sqlx::query_as(
@@ -370,7 +382,7 @@ pub(super) async fn mark_delivered(
     )
     .bind(item_id)
     .bind(list_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **conn)
     .await?;
 
     let (item_status, last_hauler) = row.ok_or_else(ApiError::not_found)?;
@@ -388,7 +400,7 @@ pub(super) async fn mark_delivered(
     sqlx::query("UPDATE list_items SET status = $1 WHERE id = $2")
         .bind(ListItemStatus::Delivered)
         .bind(item_id)
-        .execute(&mut *tx)
+        .execute(&mut **conn)
         .await?;
 
     let all_done: bool = sqlx::query_scalar(
@@ -398,32 +410,28 @@ pub(super) async fn mark_delivered(
          )",
     )
     .bind(list_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **conn)
     .await?;
 
     let hauler_name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
         .bind(user_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **conn)
         .await?;
     let (list_dest, group_id_for_wh): (Option<String>, Uuid) =
         sqlx::query_as("SELECT destination_label, group_id FROM lists WHERE id = $1")
             .bind(list_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **conn)
             .await?;
 
-    tx.commit().await?;
-
     if all_done {
-        fire_webhook(
-            &state,
-            group_id_for_wh,
-            WebhookEvent::ListDelivered {
-                list_destination: list_dest.unwrap_or_else(|| "(unnamed)".into()),
-                hauler_name,
-            },
-        );
+        let event = WebhookEvent::ListDelivered {
+            list_destination: list_dest.unwrap_or_else(|| "(unnamed)".into()),
+            hauler_name,
+        };
+        fire_webhook(&mut **conn, group_id_for_wh, &event).await?;
     }
+    drop(conn);
 
-    let detail = load_list_detail(&state, list_id, user_id, role).await?;
+    let detail = load_list_detail(&state, &tx, list_id, user_id, role).await?;
     Ok(Json(detail))
 }

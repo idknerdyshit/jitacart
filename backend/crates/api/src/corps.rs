@@ -17,6 +17,7 @@ use uuid::Uuid;
 use domain::{GroupRole, ListDetail};
 
 use crate::{
+    db::Tx,
     errors::ApiError,
     extract::{CurrentGroup, CurrentUser},
     lists::load_list_detail,
@@ -106,14 +107,19 @@ pub struct JournalEntryDto {
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn list_corps(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup {
         group_id,
         user_id,
         role,
     }: CurrentGroup,
+    tx: Tx,
 ) -> Result<Json<CorpsResponse>, ApiError> {
-    let corps = list_corps_inner(&state.pool, group_id, user_id, role).await?;
+    let mut conn = tx.acquire().await;
+    let corps = list_corps_inner(&mut **conn, group_id, user_id, role).await?;
+
+    // Suppress unused warning — state is required by the extractor pattern
+
     Ok(Json(CorpsResponse { corps, role }))
 }
 
@@ -130,11 +136,14 @@ async fn link_corp(
         group_id,
         role,
     }: CurrentGroup,
+    tx: Tx,
     Json(body): Json<LinkCorpBody>,
 ) -> Result<Json<CorpDto>, ApiError> {
     if role != domain::GroupRole::Owner {
         return Err(ApiError::forbidden());
     }
+
+    let mut conn = tx.acquire().await;
 
     // Verify the character belongs to this user and has corp scopes.
     let char_row: Option<(Uuid, Vec<String>)> = sqlx::query_as(
@@ -143,12 +152,18 @@ async fn link_corp(
     )
     .bind(body.character_id)
     .bind(user_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut **conn)
     .await?;
 
     let (char_uuid, granted_scopes) = char_row.ok_or(ApiError::BadRequest(
         "character not found or not yours".into(),
     ))?;
+
+    // Drop the conn guard while doing ESI calls so we don't hold the tx
+    // connection during network I/O.
+    // TODO(rls): ESI call inside the request tx — split into multiple txs if
+    //            probing shows lock-hold latency is a problem
+    drop(conn);
 
     // Fetch corp info from ESI (via the character's affiliation).
     let client = state
@@ -173,7 +188,7 @@ async fn link_corp(
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
 
-    let mut tx = state.pool.begin().await?;
+    let mut conn = tx.acquire().await;
 
     // Upsert corp row.
     let corp_id: Uuid = sqlx::query_scalar(
@@ -191,7 +206,7 @@ async fn link_corp(
     .bind(esi_corp_id)
     .bind(&corp_info.name)
     .bind(&corp_info.ticker)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **conn)
     .await?;
 
     // Upsert corp principal.
@@ -203,7 +218,7 @@ async fn link_corp(
         "#,
     )
     .bind(corp_id)
-    .execute(&mut *tx)
+    .execute(&mut **conn)
     .await?;
 
     // Link corp to group. One row per pair: activate (clear unlinked_at) on relink.
@@ -223,7 +238,7 @@ async fn link_corp(
     .bind(group_id)
     .bind(corp_id)
     .bind(user_id)
-    .execute(&mut *tx)
+    .execute(&mut **conn)
     .await?;
 
     // Upsert ambassador.
@@ -240,13 +255,11 @@ async fn link_corp(
     .bind(corp_id)
     .bind(char_uuid)
     .bind(&granted_scopes)
-    .execute(&mut *tx)
+    .execute(&mut **conn)
     .await?;
 
-    tx.commit().await?;
-
-    // Return updated corp dto.
-    let corps = list_corps_inner(&state.pool, group_id, user_id, role).await?;
+    // Return updated corp dto (within the same tx so caller sees their own write).
+    let corps = list_corps_inner(&mut **conn, group_id, user_id, role).await?;
     let dto = corps
         .into_iter()
         .find(|c| c.id == corp_id)
@@ -261,15 +274,18 @@ struct AddAmbassadorBody {
 }
 
 async fn add_ambassador(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path((group_id, corp_id)): Path<(Uuid, Uuid)>,
     CurrentGroup { user_id, role, .. }: CurrentGroup,
+    tx: Tx,
     Json(body): Json<AddAmbassadorBody>,
 ) -> Result<StatusCode, ApiError> {
     if role != domain::GroupRole::Owner {
         return Err(ApiError::forbidden());
     }
-    require_corp_in_group(&state.pool, group_id, corp_id).await?;
+
+    let mut conn = tx.acquire().await;
+    require_corp_in_group(&mut **conn, group_id, corp_id).await?;
 
     let char_row: Option<(Uuid, Vec<String>)> = sqlx::query_as(
         "SELECT id, scopes FROM characters \
@@ -277,7 +293,7 @@ async fn add_ambassador(
     )
     .bind(body.character_id)
     .bind(user_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut **conn)
     .await?;
 
     let (char_uuid, granted_scopes) = char_row.ok_or(ApiError::BadRequest(
@@ -299,22 +315,26 @@ async fn add_ambassador(
     .bind(char_uuid)
     .bind(&granted_scopes)
     .bind(group_id)
-    .execute(&state.pool)
-    .await
-    ?;
+    .execute(&mut **conn)
+    .await?;
+
+    // Suppress unused warning — state is required by the extractor pattern
 
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn remove_ambassador(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path((group_id, corp_id, character_id)): Path<(Uuid, Uuid, Uuid)>,
     CurrentGroup { role, .. }: CurrentGroup,
+    tx: Tx,
 ) -> Result<StatusCode, ApiError> {
     if role != domain::GroupRole::Owner {
         return Err(ApiError::forbidden());
     }
-    require_corp_in_group(&state.pool, group_id, corp_id).await?;
+
+    let mut conn = tx.acquire().await;
+    require_corp_in_group(&mut **conn, group_id, corp_id).await?;
 
     sqlx::query(
         "UPDATE corp_ambassadors SET disabled_at = now() \
@@ -322,23 +342,29 @@ async fn remove_ambassador(
     )
     .bind(corp_id)
     .bind(character_id)
-    .execute(&state.pool)
+    .execute(&mut **conn)
     .await?;
+
+    // Suppress unused warning — state is required by the extractor pattern
 
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn unlink_corp(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path((group_id, corp_id)): Path<(Uuid, Uuid)>,
     CurrentGroup { role, .. }: CurrentGroup,
+    tx: Tx,
 ) -> Result<StatusCode, ApiError> {
     if role != domain::GroupRole::Owner {
         return Err(ApiError::forbidden());
     }
-    require_corp_in_group(&state.pool, group_id, corp_id).await?;
 
-    let mut tx = state.pool.begin().await?;
+    let mut conn = tx.acquire().await;
+    require_corp_in_group(&mut **conn, group_id, corp_id).await?;
+
+    // TODO(rls): ESI call inside the request tx — split into multiple txs if
+    //            probing shows lock-hold latency is a problem
 
     sqlx::query(
         "UPDATE group_corps SET unlinked_at = now() \
@@ -346,7 +372,7 @@ async fn unlink_corp(
     )
     .bind(group_id)
     .bind(corp_id)
-    .execute(&mut *tx)
+    .execute(&mut **conn)
     .await?;
 
     // Disable ambassadors contributed through this group.
@@ -356,7 +382,7 @@ async fn unlink_corp(
     )
     .bind(corp_id)
     .bind(group_id)
-    .execute(&mut *tx)
+    .execute(&mut **conn)
     .await?;
 
     // If no other group links this corp, disable it (stop polling).
@@ -365,17 +391,18 @@ async fn unlink_corp(
          WHERE corp_id = $1 AND unlinked_at IS NULL",
     )
     .bind(corp_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **conn)
     .await?;
 
     if other_links == 0 {
         sqlx::query("UPDATE corps SET disabled_at = now() WHERE id = $1")
             .bind(corp_id)
-            .execute(&mut *tx)
+            .execute(&mut **conn)
             .await?;
     }
 
-    tx.commit().await?;
+    // Suppress unused warning — state is required by the extractor pattern
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -392,16 +419,18 @@ fn default_journal_limit() -> i64 {
 }
 
 async fn list_journal(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path((group_id, corp_id)): Path<(Uuid, Uuid)>,
     CurrentGroup {
         user_id,
         group_id: _gid,
         ..
     }: CurrentGroup,
+    tx: Tx,
     Query(q): Query<JournalQuery>,
 ) -> Result<Json<Vec<JournalEntryDto>>, ApiError> {
-    require_corp_in_group(&state.pool, group_id, corp_id).await?;
+    let mut conn = tx.acquire().await;
+    require_corp_in_group(&mut **conn, group_id, corp_id).await?;
 
     // Determine visibility: ambassador or group owner sees raw_json.
     let is_ambassador: bool = sqlx::query_scalar(
@@ -413,7 +442,7 @@ async fn list_journal(
     )
     .bind(corp_id)
     .bind(user_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut **conn)
     .await?;
 
     let is_owner: bool = sqlx::query_scalar(
@@ -425,7 +454,7 @@ async fn list_journal(
     .bind(group_id)
     .bind(user_id)
     .bind(GroupRole::Owner)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut **conn)
     .await?;
 
     let full_visibility = is_ambassador || is_owner;
@@ -467,8 +496,10 @@ async fn list_journal(
     .bind(q.before)
     .bind(q.limit.clamp(1, 500))
     .bind(q.division)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
+
+    // Suppress unused warning — state is required by the extractor pattern
 
     let entries = rows
         .into_iter()
@@ -506,6 +537,7 @@ async fn patch_list_payer(
     State(state): State<AppState>,
     Path(list_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
     Json(body): Json<PatchListPayerBody>,
 ) -> Result<Json<ListDetail>, ApiError> {
     // Verify both or neither.
@@ -518,6 +550,8 @@ async fn patch_list_payer(
         _ => {}
     }
 
+    let mut conn = tx.acquire().await;
+
     // Load list group; require group owner (same guard as link/unlink/add-ambassador).
     let row: Option<(Uuid,)> = sqlx::query_as(
         "SELECT l.group_id FROM lists l \
@@ -528,7 +562,7 @@ async fn patch_list_payer(
     .bind(list_id)
     .bind(user_id)
     .bind(GroupRole::Owner)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut **conn)
     .await?;
 
     let group_id = row.ok_or_else(ApiError::forbidden)?.0;
@@ -540,7 +574,7 @@ async fn patch_list_payer(
     let has_reimbs: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM reimbursements WHERE list_id = $1)")
             .bind(list_id)
-            .fetch_one(&state.pool)
+            .fetch_one(&mut **conn)
             .await?;
 
     if has_reimbs {
@@ -551,24 +585,25 @@ async fn patch_list_payer(
 
     // If setting a corp, verify it's linked to this group.
     if let Some(corp_id) = body.payer_corp_id {
-        require_corp_in_group(&state.pool, group_id, corp_id).await?;
+        require_corp_in_group(&mut **conn, group_id, corp_id).await?;
     }
 
     sqlx::query("UPDATE lists SET payer_corp_id = $2, payer_division = $3 WHERE id = $1")
         .bind(list_id)
         .bind(body.payer_corp_id)
         .bind(body.payer_division)
-        .execute(&state.pool)
+        .execute(&mut **conn)
         .await?;
 
-    let detail = load_list_detail(&state, list_id, user_id, actual_role).await?;
+    drop(conn);
+    let detail = load_list_detail(&state, &tx, list_id, user_id, actual_role).await?;
     Ok(Json(detail))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async fn require_corp_in_group(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     group_id: Uuid,
     corp_id: Uuid,
 ) -> Result<(), ApiError> {
@@ -578,7 +613,7 @@ async fn require_corp_in_group(
     )
     .bind(group_id)
     .bind(corp_id)
-    .fetch_one(pool)
+    .fetch_one(conn)
     .await?;
 
     if !exists {
@@ -588,7 +623,7 @@ async fn require_corp_in_group(
 }
 
 async fn list_corps_inner(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     group_id: Uuid,
     caller_user_id: Uuid,
     caller_role: GroupRole,
@@ -620,7 +655,7 @@ async fn list_corps_inner(
         "#,
     )
     .bind(group_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     if corps.is_empty() {
@@ -654,7 +689,7 @@ async fn list_corps_inner(
         "#,
     )
     .bind(&corp_ids)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     let mut ambassadors_by_corp: HashMap<Uuid, Vec<AmbassadorDto>> = HashMap::new();
@@ -690,7 +725,7 @@ async fn list_corps_inner(
          ORDER BY corp_id, division",
     )
     .bind(&corp_ids)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     let mut divisions_by_corp: HashMap<Uuid, Vec<DivRow>> = HashMap::new();

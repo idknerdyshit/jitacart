@@ -10,6 +10,25 @@ log() {
         "$(date -u +%FT%TZ)" "$*"
 }
 
+# Subcommand dispatch. `docker compose run --rm backup restore <date>`
+# routes here; the default (no args) is the long-running cron loop.
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        restore)
+            shift
+            exec /usr/local/bin/restore.sh "$@"
+            ;;
+        backup-now)
+            exec /usr/local/bin/backup.sh
+            ;;
+        *)
+            # Anything else: run it. Lets operators drop into a shell with
+            # `docker compose run --rm backup bash` without fighting tini.
+            exec "$@"
+            ;;
+    esac
+fi
+
 # `BACKUP_HOUR_UTC=3` by default — overridable for tests / staggering.
 HOUR="${BACKUP_HOUR_UTC:-3}"
 

@@ -27,8 +27,14 @@ services:
       POSTGRES_USER: jitacart
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: jitacart
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
+      WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:?set WORKER_DB_PASSWORD in .env}
     volumes:
       - jitacart-pgdata:/var/lib/postgresql/data
+      # Runs once on a fresh data dir to create the RLS roles. Idempotent
+      # on subsequent restarts: the entrypoint only invokes
+      # /docker-entrypoint-initdb.d/ when the cluster is being initialized.
+      - ./scripts/init-roles.sh:/docker-entrypoint-initdb.d/00-init-roles.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U jitacart -d jitacart"]
       interval: 10s
@@ -46,7 +52,10 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgres://jitacart:${POSTGRES_PASSWORD}@postgres:5432/jitacart
+      # Migration runner uses the admin role (table owner; runs CREATE/ALTER);
+      # all runtime queries go through jitacart_app, which is gated by RLS.
+      ADMIN_DATABASE_URL: postgres://jitacart_admin:${POSTGRES_PASSWORD}@postgres:5432/jitacart
+      DATABASE_URL: postgres://jitacart_app:${APP_DB_PASSWORD}@postgres:5432/jitacart
       SERVER__BIND: 0.0.0.0:8080
     expose:
       - "8080"
@@ -71,7 +80,9 @@ services:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: postgres://jitacart:${POSTGRES_PASSWORD}@postgres:5432/jitacart
+      # Worker connects as jitacart_worker (BYPASSRLS) — it operates across
+      # tenants by design (price refresh, contract sync, webhook drain, …).
+      DATABASE_URL: postgres://jitacart_worker:${WORKER_DB_PASSWORD}@postgres:5432/jitacart
       WORKER__HEALTHZ_BIND: 127.0.0.1:9091
     expose:
       - "9091"

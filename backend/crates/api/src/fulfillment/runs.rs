@@ -4,7 +4,7 @@ use domain::{ListStatus, RunMarketRef, RunSummary};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use crate::{errors::ApiError, extract::CurrentGroup, state::AppState};
+use crate::{db::Tx, errors::ApiError, extract::CurrentGroup, state::AppState};
 
 #[derive(sqlx::FromRow)]
 struct RunRow {
@@ -31,11 +31,13 @@ struct RunMarketRow {
 }
 
 pub(super) async fn runs(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup {
         user_id, group_id, ..
     }: CurrentGroup,
+    tx: Tx,
 ) -> Result<Json<Vec<RunSummary>>, ApiError> {
+    let mut conn = tx.acquire().await;
     let rows: Vec<RunRow> = sqlx::query_as(
         r#"
         WITH item_agg AS (
@@ -84,7 +86,7 @@ pub(super) async fn runs(
     )
     .bind(group_id)
     .bind(user_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
 
     if rows.is_empty() {
@@ -102,7 +104,7 @@ pub(super) async fn runs(
         "#,
     )
     .bind(&list_ids)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
 
     let mut markets_by_list: std::collections::HashMap<Uuid, Vec<RunMarketRef>> =

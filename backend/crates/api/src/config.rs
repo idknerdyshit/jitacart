@@ -5,6 +5,11 @@ use serde::Deserialize;
 pub struct Config {
     pub server: ServerConfig,
     pub database_url: String,
+    /// DSN for the migration-running role (`jitacart_admin`). Opened in a
+    /// short-lived pool at startup, used to apply sqlx + tower_sessions
+    /// migrations, then closed. Runtime queries go through `database_url`
+    /// (`jitacart_app`), which is gated by RLS.
+    pub admin_database_url: String,
     pub eve_sso: EveSsoConfig,
     pub esi: EsiConfig,
     /// Legacy single-key shim: base64-encoded 32-byte AES-GCM key. Loaded as

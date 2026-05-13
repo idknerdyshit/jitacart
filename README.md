@@ -110,7 +110,7 @@ $EDITOR .env
 #             ESI__USER_AGENT, TOKEN_ENC_KEY, POSTGRES_PASSWORD,
 #             TURNSTILE__SITE_KEY, TURNSTILE__SECRET_KEY,
 #             TURNSTILE__DISABLED=false
-#   Pin: JC_IMAGE_TAG=sha-<short>  (or a semver tag, or 'latest')
+#   Pin: JC_IMAGE_TAG=0.2.0  (semver tag, or 'latest')
 
 # 6. Pull and start.
 docker compose pull

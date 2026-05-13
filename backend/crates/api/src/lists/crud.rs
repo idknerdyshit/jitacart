@@ -16,6 +16,7 @@ use super::pricing::{
     dedup_type_ids, fetch_prices_for_markets, pick_cheapest, recompute_estimates,
 };
 use crate::{
+    db::Tx,
     errors::ApiError,
     extract::{CurrentGroup, CurrentList},
     state::AppState,
@@ -112,6 +113,7 @@ impl ListSummaryRow {
 pub(super) async fn preview(
     State(state): State<AppState>,
     CurrentGroup { group_id, .. }: CurrentGroup,
+    tx: Tx,
     Json(body): Json<PreviewBody>,
 ) -> Result<Json<PreviewResponse>, ApiError> {
     use super::{MAX_DISTINCT_NAMES, MAX_PARSED_LINES};
@@ -138,14 +140,21 @@ pub(super) async fn preview(
         )));
     }
 
-    let markets = super::load_markets(&state, &body.market_ids).await?;
-    super::validate_markets_for_group(&state.pool, group_id, &markets).await?;
+    let markets = {
+        let mut conn = tx.acquire().await;
+        let m = super::load_markets(&mut **conn, &body.market_ids).await?;
+        super::validate_markets_for_group(&mut **conn, group_id, &m).await?;
+        m
+    };
 
+    // market::resolve_type_ids hits `type_cache` (not RLS-enabled), so a
+    // pool connection without app.current_user_id is fine here.
     let (resolved, unresolved) =
         market::resolve_type_ids(&state.pool, &state.esi, &distinct_names).await?;
 
     let type_ids = dedup_type_ids(resolved.values().map(|r| r.type_id));
-    let prices_by_market = fetch_prices_for_markets(&state, group_id, &markets, &type_ids).await?;
+    let prices_by_market =
+        fetch_prices_for_markets(&state, &tx, group_id, &markets, &type_ids).await?;
 
     let lines: Vec<PreviewLine> = parsed
         .lines
@@ -202,6 +211,7 @@ pub(super) async fn create(
         group_id,
         role,
     }: CurrentGroup,
+    tx: Tx,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<ListDetail>, ApiError> {
     use super::{MAX_DISTINCT_NAMES, MAX_PARSED_LINES};
@@ -248,10 +258,13 @@ pub(super) async fn create(
             items_cap
         )));
     }
-    super::require_lists_quota(&state, group_id).await?;
-
-    let markets = super::load_markets(&state, &body.market_ids).await?;
-    super::validate_markets_for_group(&state.pool, group_id, &markets).await?;
+    let markets = {
+        let mut conn = tx.acquire().await;
+        super::require_lists_quota(&mut **conn, &state, group_id).await?;
+        let m = super::load_markets(&mut **conn, &body.market_ids).await?;
+        super::validate_markets_for_group(&mut **conn, group_id, &m).await?;
+        m
+    };
 
     let (resolved, unresolved) =
         market::resolve_type_ids(&state.pool, &state.esi, &distinct_names).await?;
@@ -263,7 +276,8 @@ pub(super) async fn create(
     }
 
     let type_ids = dedup_type_ids(resolved.values().map(|r| r.type_id));
-    let prices_by_market = fetch_prices_for_markets(&state, group_id, &markets, &type_ids).await?;
+    let prices_by_market =
+        fetch_prices_for_markets(&state, &tx, group_id, &markets, &type_ids).await?;
 
     struct ItemRow {
         type_id: i64,
@@ -294,7 +308,7 @@ pub(super) async fn create(
         });
     }
 
-    let mut tx = state.pool.begin().await?;
+    let mut conn = tx.acquire().await;
 
     let list_id: Uuid = sqlx::query_scalar(
         "INSERT INTO lists \
@@ -309,7 +323,7 @@ pub(super) async fn create(
     .bind(body.destination_label.as_deref())
     .bind(body.notes.as_deref())
     .bind(total)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **conn)
     .await?;
 
     for m in &markets {
@@ -319,7 +333,7 @@ pub(super) async fn create(
         .bind(list_id)
         .bind(m.id)
         .bind(m.id == body.primary_market_id)
-        .execute(&mut *tx)
+        .execute(&mut **conn)
         .await?;
     }
 
@@ -338,36 +352,33 @@ pub(super) async fn create(
         .bind(it.est_market)
         .bind(user_id)
         .bind(it.line_no)
-        .execute(&mut *tx)
+        .execute(&mut **conn)
         .await?;
     }
 
-    tx.commit().await?;
-
     let creator_name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
         .bind(user_id)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut **conn)
         .await?;
-    fire_webhook(
-        &state,
-        group_id,
-        WebhookEvent::ListCreated {
-            list_destination: body.destination_label.unwrap_or_else(|| "(unnamed)".into()),
-            item_count: items_to_insert.len() as i64,
-            estimate_isk: total.to_string(),
-            creator_name,
-        },
-    );
-
-    let detail = load_list_detail(&state, list_id, user_id, role).await?;
+    let event = WebhookEvent::ListCreated {
+        list_destination: body.destination_label.unwrap_or_else(|| "(unnamed)".into()),
+        item_count: items_to_insert.len() as i64,
+        estimate_isk: total.to_string(),
+        creator_name,
+    };
+    fire_webhook(&mut **conn, group_id, &event).await?;
+    drop(conn);
+    let detail = load_list_detail(&state, &tx, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
 
 pub(super) async fn list_for_group(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup { group_id, .. }: CurrentGroup,
+    tx: Tx,
     Query(q): Query<ListForGroupQuery>,
 ) -> Result<Json<Vec<ListSummary>>, ApiError> {
+    let mut conn = tx.acquire().await;
     let rows: Vec<ListSummaryRow> = sqlx::query_as(
         r#"
         SELECT l.id,
@@ -392,7 +403,7 @@ pub(super) async fn list_for_group(
     )
     .bind(group_id)
     .bind(q.include_archived)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
 
     Ok(Json(
@@ -408,14 +419,16 @@ pub(super) async fn detail(
         role,
         ..
     }: CurrentList,
+    tx: Tx,
 ) -> Result<Json<ListDetail>, ApiError> {
-    let detail = load_list_detail(&state, list_id, user_id, role).await?;
+    let detail = load_list_detail(&state, &tx, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
 
 pub(super) async fn patch_list(
     State(state): State<AppState>,
     cur: CurrentList,
+    tx: Tx,
     Json(body): Json<PatchListBody>,
 ) -> Result<Json<ListDetail>, ApiError> {
     if body.destination_label.is_none() && body.notes.is_none() && body.status.is_none() {
@@ -434,6 +447,7 @@ pub(super) async fn patch_list(
         ..
     } = cur;
 
+    let mut conn = tx.acquire().await;
     let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE lists SET updated_at = now()");
     if let Some(label_opt) = &body.destination_label {
         q.push(", destination_label = ");
@@ -449,22 +463,25 @@ pub(super) async fn patch_list(
     }
     q.push(" WHERE id = ");
     q.push_bind(list_id);
-    q.build().execute(&state.pool).await?;
+    q.build().execute(&mut **conn).await?;
 
-    let detail = load_list_detail(&state, list_id, user_id, role).await?;
+    drop(conn);
+    let detail = load_list_detail(&state, &tx, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
 
 pub(super) async fn delete_list(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     cur: CurrentList,
+    tx: Tx,
 ) -> Result<StatusCode, ApiError> {
     if cur.created_by_user_id != cur.user_id && cur.role != domain::GroupRole::Owner {
         return Err(ApiError::forbidden());
     }
+    let mut conn = tx.acquire().await;
     let r = sqlx::query("DELETE FROM lists WHERE id = $1")
         .bind(cur.list_id)
-        .execute(&state.pool)
+        .execute(&mut **conn)
         .await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
@@ -475,6 +492,7 @@ pub(super) async fn delete_list(
 pub(super) async fn replace_markets(
     State(state): State<AppState>,
     cur: CurrentList,
+    tx: Tx,
     Json(body): Json<ReplaceMarketsBody>,
 ) -> Result<Json<ListDetail>, ApiError> {
     cur.require_mutable()?;
@@ -491,42 +509,39 @@ pub(super) async fn replace_markets(
             "primary_market_id must be in market_ids".into(),
         ));
     }
-    let markets = super::load_markets(&state, &body.market_ids).await?;
-    super::validate_markets_for_group(&state.pool, group_id, &markets).await?;
+    let mut conn = tx.acquire().await;
+    let markets = super::load_markets(&mut **conn, &body.market_ids).await?;
+    super::validate_markets_for_group(&mut **conn, group_id, &markets).await?;
 
-    let updated_after = {
-        let mut tx = state.pool.begin().await?;
-        let _: (Uuid,) = sqlx::query_as("SELECT id FROM lists WHERE id = $1 FOR UPDATE")
-            .bind(list_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(ApiError::not_found)?;
+    let _: (Uuid,) = sqlx::query_as("SELECT id FROM lists WHERE id = $1 FOR UPDATE")
+        .bind(list_id)
+        .fetch_optional(&mut **conn)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
 
-        sqlx::query("DELETE FROM list_markets WHERE list_id = $1")
-            .bind(list_id)
-            .execute(&mut *tx)
-            .await?;
-        for m in &markets {
-            sqlx::query(
-                "INSERT INTO list_markets (list_id, market_id, is_primary) VALUES ($1, $2, $3)",
-            )
-            .bind(list_id)
-            .bind(m.id)
-            .bind(m.id == body.primary_market_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        let updated_after: DateTime<Utc> = sqlx::query_scalar(
-            "UPDATE lists SET updated_at = now() WHERE id = $1 RETURNING updated_at",
+    sqlx::query("DELETE FROM list_markets WHERE list_id = $1")
+        .bind(list_id)
+        .execute(&mut **conn)
+        .await?;
+    for m in &markets {
+        sqlx::query(
+            "INSERT INTO list_markets (list_id, market_id, is_primary) VALUES ($1, $2, $3)",
         )
         .bind(list_id)
-        .fetch_one(&mut *tx)
+        .bind(m.id)
+        .bind(m.id == body.primary_market_id)
+        .execute(&mut **conn)
         .await?;
-        tx.commit().await?;
-        updated_after
-    };
+    }
+    let updated_after: DateTime<Utc> = sqlx::query_scalar(
+        "UPDATE lists SET updated_at = now() WHERE id = $1 RETURNING updated_at",
+    )
+    .bind(list_id)
+    .fetch_one(&mut **conn)
+    .await?;
+    drop(conn);
 
-    recompute_estimates(&state, list_id, updated_after).await?;
-    let detail = load_list_detail(&state, list_id, user_id, role).await?;
+    recompute_estimates(&state, &tx, list_id, updated_after).await?;
+    let detail = load_list_detail(&state, &tx, list_id, user_id, role).await?;
     Ok(Json(detail))
 }

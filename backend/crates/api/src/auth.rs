@@ -12,13 +12,13 @@ use chrono::{DateTime, Utc};
 use nea_esi::auth::{EsiTokens, PkceChallenge};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use tower_sessions::Session;
 use uuid::Uuid;
 
 use auth_tokens::MultiKeyCipher;
 
 use crate::{
+    db::Tx,
     errors::ApiError,
     extract::{CurrentUser, SESSION_KEY_USER},
     jwt::EveClaims,
@@ -143,6 +143,7 @@ async fn upgrade(
     State(state): State<AppState>,
     session: Session,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
     Query(q): Query<UpgradeQuery>,
 ) -> Result<Redirect, ApiError> {
     let cfg = &state.config.eve_sso;
@@ -172,12 +173,13 @@ async fn upgrade(
     // login_scopes (so we don't drop `publicData`) and the character's
     // already-granted scopes (so a corp-scope upgrade doesn't silently
     // revoke e.g. `esi-markets.structure_markets.v1`).
+    let mut conn = tx.acquire().await;
     let existing_scopes: Vec<String> = sqlx::query_scalar(
         "SELECT scopes FROM characters WHERE character_id = $1 AND user_id = $2",
     )
     .bind(q.character_id)
     .bind(user_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut **conn)
     .await?
     .ok_or(ApiError::Unauthorized)?;
 
@@ -211,6 +213,7 @@ struct CallbackQuery {
 async fn callback(
     State(state): State<AppState>,
     session: Session,
+    tx: Tx,
     Query(q): Query<CallbackQuery>,
 ) -> Result<Redirect, ApiError> {
     let pending: PendingAuth = session
@@ -247,8 +250,9 @@ async fn callback(
 
     let session_user: Option<Uuid> = session.get(SESSION_KEY_USER).await?;
 
+    let mut conn = tx.acquire().await;
     let user_id = upsert_character(
-        &state.pool,
+        &mut *conn,
         &state.cipher,
         &claims,
         &tokens,
@@ -257,6 +261,7 @@ async fn callback(
         state.config.limits.characters_per_user,
     )
     .await?;
+    drop(conn);
 
     session.insert(SESSION_KEY_USER, user_id).await?;
 
@@ -276,25 +281,27 @@ struct MeResponse {
 }
 
 async fn me(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
 ) -> Result<Json<MeResponse>, ApiError> {
-    let user_q = sqlx::query_as::<_, UserRow>(
+    let mut conn = tx.acquire().await;
+    let user = sqlx::query_as::<_, UserRow>(
         "SELECT id, display_name, active_character_id, created_at FROM users WHERE id = $1",
     )
     .bind(user_id)
-    .fetch_optional(&state.pool);
+    .fetch_optional(&mut **conn)
+    .await?
+    .ok_or(ApiError::Unauthorized)?;
 
-    let chars_q = sqlx::query_as::<_, CharacterRow>(
+    let characters = sqlx::query_as::<_, CharacterRow>(
         "SELECT id, user_id, character_id, character_name, owner_hash, scopes, \
                 access_token_expires_at, created_at, last_refreshed_at \
          FROM characters WHERE user_id = $1 ORDER BY created_at",
     )
     .bind(user_id)
-    .fetch_all(&state.pool);
-
-    let (user, characters) = tokio::try_join!(user_q, chars_q)?;
-    let user = user.ok_or(ApiError::Unauthorized)?;
+    .fetch_all(&mut **conn)
+    .await?;
 
     let active_character_id = user.active_character_id;
     Ok(Json(MeResponse {
@@ -359,10 +366,13 @@ struct SetActiveCharacterBody {
 async fn set_active_character(
     State(state): State<AppState>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
     Json(body): Json<SetActiveCharacterBody>,
 ) -> Result<Json<MeResponse>, ApiError> {
-    do_set_active_character(&state.pool, user_id, body.character_id).await?;
-    me(State(state), CurrentUser(user_id)).await
+    let mut conn = tx.acquire().await;
+    do_set_active_character(&mut **conn, user_id, body.character_id).await?;
+    drop(conn);
+    me(State(state), CurrentUser(user_id), tx).await
 }
 
 /// Update the user's `active_character_id`. Ownership is enforced by
@@ -370,7 +380,7 @@ async fn set_active_character(
 /// belongs to the same user; if no row matches we return `Unauthorized`
 /// so callers see a 401 rather than a silent no-op.
 pub async fn do_set_active_character(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     user_id: Uuid,
     character_id: Option<Uuid>,
 ) -> Result<(), ApiError> {
@@ -381,7 +391,7 @@ pub async fn do_set_active_character(
     )
     .bind(character_id)
     .bind(user_id)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     if result.rows_affected() == 0 {
@@ -394,14 +404,17 @@ pub async fn do_set_active_character(
 /// the caller's `users.id` — for personal-data review or self-service
 /// off-boarding. Token plaintext is *never* included; only metadata
 /// like character names, scopes, and expiry timestamps.
-pub async fn do_export_me(pool: &PgPool, user_id: Uuid) -> anyhow::Result<serde_json::Value> {
+pub async fn do_export_me(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+) -> anyhow::Result<serde_json::Value> {
     let user: serde_json::Value = sqlx::query_scalar(
         "SELECT to_jsonb(u) - 'active_character_id' \
          FROM (SELECT id, display_name, created_at, active_character_id FROM users \
                WHERE id = $1) u",
     )
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(|| anyhow!("user {user_id} not found"))?;
 
@@ -415,7 +428,7 @@ pub async fn do_export_me(pool: &PgPool, user_id: Uuid) -> anyhow::Result<serde_
          ) c",
     )
     .bind(user_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     let memberships: serde_json::Value = sqlx::query_scalar(
@@ -427,7 +440,7 @@ pub async fn do_export_me(pool: &PgPool, user_id: Uuid) -> anyhow::Result<serde_
          ) m",
     )
     .bind(user_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     let lists: serde_json::Value = sqlx::query_scalar(
@@ -438,7 +451,7 @@ pub async fn do_export_me(pool: &PgPool, user_id: Uuid) -> anyhow::Result<serde_
          ) l",
     )
     .bind(user_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     let fulfillments: serde_json::Value = sqlx::query_scalar(
@@ -450,7 +463,7 @@ pub async fn do_export_me(pool: &PgPool, user_id: Uuid) -> anyhow::Result<serde_
          ) f",
     )
     .bind(user_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     let reimbursements: serde_json::Value = sqlx::query_scalar(
@@ -461,7 +474,7 @@ pub async fn do_export_me(pool: &PgPool, user_id: Uuid) -> anyhow::Result<serde_
          ) r",
     )
     .bind(user_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     Ok(serde_json::json!({
@@ -476,14 +489,18 @@ pub async fn do_export_me(pool: &PgPool, user_id: Uuid) -> anyhow::Result<serde_
 }
 
 async fn export_me(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(do_export_me(&state.pool, user_id).await?))
+    let mut conn = tx.acquire().await;
+    let result = do_export_me(&mut **conn, user_id).await?;
+    drop(conn);
+    Ok(Json(result))
 }
 
 async fn upsert_character(
-    pool: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     cipher: &MultiKeyCipher,
     claims: &EveClaims,
     tokens: &EsiTokens,
@@ -494,13 +511,11 @@ async fn upsert_character(
     let character_id = claims.character_id()?;
     let scopes = claims.scopes();
 
-    let mut tx = pool.begin().await?;
-
     let existing: Option<(Uuid, Uuid, String)> = sqlx::query_as(
         "SELECT id, user_id, owner_hash FROM characters WHERE character_id = $1 FOR UPDATE",
     )
     .bind(character_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .context("looking up existing character")?;
 
@@ -512,12 +527,12 @@ async fn upsert_character(
         } else if let Some(sid) = session_user {
             sid
         } else {
-            create_user(&mut tx, &claims.name).await?
+            create_user(tx, &claims.name).await?
         }
     } else if let Some(sid) = session_user {
         sid
     } else {
-        create_user(&mut tx, &claims.name).await?
+        create_user(tx, &claims.name).await?
     };
 
     // Enforce characters_per_user when this insert would add a NEW row under
@@ -530,7 +545,7 @@ async fn upsert_character(
     if would_add_new {
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM characters WHERE user_id = $1")
             .bind(target_user_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
         if count >= characters_cap {
             return Err(ApiError::QuotaExceeded(format!(
@@ -579,11 +594,10 @@ async fn upsert_character(
     .bind(&at_nonce)
     .bind(tokens.expires_at)
     .bind(&kid)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("upserting character")?;
 
-    tx.commit().await?;
     Ok(target_user_id)
 }
 

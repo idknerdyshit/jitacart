@@ -8,7 +8,7 @@
 
 use domain::GroupRole;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -42,7 +42,7 @@ struct WebhookRow {
 }
 
 pub async fn do_get_webhook(
-    pool: &PgPool,
+    executor: impl PgExecutor<'_>,
     group_id: Uuid,
     role: GroupRole,
 ) -> Result<Option<WebhookConfig>, Error> {
@@ -55,7 +55,7 @@ pub async fn do_get_webhook(
          FROM group_discord_webhooks WHERE group_id = $1",
     )
     .bind(group_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     Ok(row.map(|r| WebhookConfig {
@@ -68,7 +68,7 @@ pub async fn do_get_webhook(
 }
 
 pub async fn do_upsert_webhook(
-    pool: &PgPool,
+    executor: impl PgExecutor<'_>,
     group_id: Uuid,
     role: GroupRole,
     body: WebhookConfig,
@@ -112,14 +112,14 @@ pub async fn do_upsert_webhook(
     .bind(body.notify_list_claimed)
     .bind(body.notify_list_delivered)
     .bind(body.notify_reimbursement_settled)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(body)
 }
 
 pub async fn do_delete_webhook(
-    pool: &PgPool,
+    executor: impl PgExecutor<'_>,
     group_id: Uuid,
     role: GroupRole,
 ) -> Result<(), Error> {
@@ -128,7 +128,7 @@ pub async fn do_delete_webhook(
     }
     sqlx::query("DELETE FROM group_discord_webhooks WHERE group_id = $1")
         .bind(group_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }

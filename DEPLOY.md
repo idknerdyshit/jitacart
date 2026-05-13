@@ -55,8 +55,8 @@ Five services in `docker-compose.yml`. Local dev keeps just postgres via
 6. **Pin and bring it up**:
    ```sh
    # In .env, pin a known-good tag:
-   #   JC_IMAGE_TAG=sha-<short>   # exact commit on main
-   #   JC_IMAGE_TAG=0.2.0         # released semver
+   #   JC_IMAGE_TAG=0.2.0         # released semver (recommended)
+   #   JC_IMAGE_TAG=0.2           # latest 0.2.x
    #   JC_IMAGE_TAG=latest        # tracks most recent release tag
    docker compose pull
    docker compose up -d
@@ -123,7 +123,7 @@ output (`/var/lib/docker/containers/<id>/<id>-json.log`).
 ### Update + redeploy
 
 ```sh
-# Bump the tag in .env to the new sha-/semver/latest, then:
+# Bump the tag in .env to the new semver (or 'latest'), then:
 docker compose pull
 docker compose up -d            # rolling restart of changed services
 docker image prune -f           # optional: drop the previous image

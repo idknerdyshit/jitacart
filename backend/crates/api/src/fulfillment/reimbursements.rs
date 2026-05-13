@@ -6,6 +6,7 @@ use domain::{GroupRole, ListDetail, ReimbursementStatus};
 use uuid::Uuid;
 
 use crate::{
+    db::Tx,
     errors::ApiError,
     extract::CurrentUser,
     lists::load_list_detail,
@@ -17,6 +18,7 @@ pub(super) async fn settle_reimbursement(
     State(state): State<AppState>,
     Path(reimb_id): Path<Uuid>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
 ) -> Result<Json<ListDetail>, ApiError> {
     // Need list_id from the reimbursement before we can lock_list. Read the
     // minimum, then re-read every authz-relevant field inside the tx so a
@@ -27,21 +29,21 @@ pub(super) async fn settle_reimbursement(
         status: ReimbursementStatus,
         contract_id: Option<Uuid>,
     }
+    let mut conn = tx.acquire().await;
     let pre: Option<(Uuid,)> = sqlx::query_as("SELECT list_id FROM reimbursements WHERE id = $1")
         .bind(reimb_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&mut **conn)
         .await?;
     let list_id = pre.ok_or_else(ApiError::not_found)?.0;
 
-    let mut tx = state.pool.begin().await?;
-    super::lock_list(&mut tx, list_id).await?;
+    super::lock_list(&mut **conn, list_id).await?;
 
     let row: Option<ReimbRow> = sqlx::query_as(
         "SELECT requester_user_id, status, contract_id \
          FROM reimbursements WHERE id = $1 FOR UPDATE",
     )
     .bind(reimb_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **conn)
     .await?;
 
     let r = row.ok_or_else(ApiError::not_found)?;
@@ -73,7 +75,7 @@ pub(super) async fn settle_reimbursement(
     )
     .bind(user_id)
     .bind(list_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **conn)
     .await?
     .ok_or_else(ApiError::forbidden)?;
 
@@ -85,7 +87,7 @@ pub(super) async fn settle_reimbursement(
         return Err(ApiError::forbidden());
     }
 
-    settlement::settle_manual(&mut tx, reimb_id, user_id)
+    settlement::settle_manual(&mut *conn, reimb_id, user_id)
         .await
         .map_err(|e| match e {
             settlement::SettlementError::NotFound => ApiError::not_found(),
@@ -101,14 +103,14 @@ pub(super) async fn settle_reimbursement(
     let (list_dest, group_id_for_wh): (Option<String>, Uuid) =
         sqlx::query_as("SELECT destination_label, group_id FROM lists WHERE id = $1")
             .bind(list_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **conn)
             .await?;
 
     let req_name: String = match requester_user_id {
         Some(uid) => {
             sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
                 .bind(uid)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **conn)
                 .await?
         }
         None => "Corp".into(),
@@ -119,23 +121,19 @@ pub(super) async fn settle_reimbursement(
          WHERE r.id = $1",
     )
     .bind(reimb_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **conn)
     .await?;
 
-    tx.commit().await?;
+    let event = WebhookEvent::ReimbursementSettled {
+        list_destination: list_dest.unwrap_or_else(|| "(unnamed)".into()),
+        requester_name: req_name,
+        hauler_name,
+        total_isk: total_isk.to_string(),
+    };
+    fire_webhook(&mut **conn, group_id_for_wh, &event).await?;
+    drop(conn);
 
-    fire_webhook(
-        &state,
-        group_id_for_wh,
-        WebhookEvent::ReimbursementSettled {
-            list_destination: list_dest.unwrap_or_else(|| "(unnamed)".into()),
-            requester_name: req_name,
-            hauler_name,
-            total_isk: total_isk.to_string(),
-        },
-    );
-
-    let detail = load_list_detail(&state, list_id, user_id, role).await?;
+    let detail = load_list_detail(&state, &tx, list_id, user_id, role).await?;
     Ok(Json(detail))
 }
 
@@ -144,7 +142,7 @@ pub(super) async fn settle_reimbursement(
 /// corp principal as requester; personal lists use the item requester's user principal.
 /// Never touches settled rows.
 pub(super) async fn upsert_reimbursement(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    conn: &mut sqlx::PgConnection,
     list_id: Uuid,
     requester_user_id: Uuid,
     hauler_user_id: Uuid,
@@ -199,7 +197,7 @@ pub(super) async fn upsert_reimbursement(
     .bind(list_id)
     .bind(requester_user_id)
     .bind(hauler_user_id)
-    .execute(&mut **tx)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }

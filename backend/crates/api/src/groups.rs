@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    db::Tx,
     errors::ApiError,
     extract::{CurrentGroup, CurrentUser},
     state::AppState,
@@ -55,6 +56,7 @@ struct GroupDetail {
 async fn create(
     State(state): State<AppState>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<Group>, ApiError> {
     let name = body.name.trim();
@@ -62,9 +64,8 @@ async fn create(
         return Err(ApiError::BadRequest("name must be 1–80 characters".into()));
     }
 
-    require_group_quota(&state, user_id).await?;
-
-    let mut tx = state.pool.begin().await?;
+    let mut conn = tx.acquire().await;
+    require_group_quota(&mut **conn, &state, user_id).await?;
     let mut group_row: Option<GroupRow> = None;
     for _ in 0..MAX_INVITE_GEN_ATTEMPTS {
         let code = random_invite_code();
@@ -76,7 +77,7 @@ async fn create(
         .bind(name)
         .bind(&code)
         .bind(user_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **conn)
         .await
         {
             Ok(row) => {
@@ -93,17 +94,18 @@ async fn create(
         .bind(user_id)
         .bind(group.id)
         .bind(GroupRole::Owner)
-        .execute(&mut *tx)
+        .execute(&mut **conn)
         .await?;
 
-    tx.commit().await?;
     Ok(Json(group))
 }
 
 async fn list(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
 ) -> Result<Json<Vec<GroupSummary>>, ApiError> {
+    let mut conn = tx.acquire().await;
     let rows = sqlx::query_as::<_, GroupListRow>(
         r#"
         SELECT g.id, g.name, g.invite_code, g.created_by_user_id, g.created_at,
@@ -117,7 +119,7 @@ async fn list(
         "#,
     )
     .bind(user_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
 
     Ok(Json(
@@ -126,17 +128,22 @@ async fn list(
 }
 
 async fn detail(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup { group_id, role, .. }: CurrentGroup,
+    tx: Tx,
 ) -> Result<Json<GroupDetail>, ApiError> {
-    let group_q = sqlx::query_as::<_, GroupRow>(
+    let mut conn = tx.acquire().await;
+    let group = sqlx::query_as::<_, GroupRow>(
         "SELECT id, name, invite_code, created_by_user_id, created_at, default_tip_pct \
          FROM groups WHERE id = $1",
     )
     .bind(group_id)
-    .fetch_optional(&state.pool);
+    .fetch_optional(&mut **conn)
+    .await?
+    .ok_or_else(ApiError::not_found)?
+    .into_group();
 
-    let members_q = sqlx::query_as::<_, MemberRow>(
+    let member_rows = sqlx::query_as::<_, MemberRow>(
         r#"
         SELECT m.user_id, u.display_name, m.role, m.joined_at
         FROM group_memberships m
@@ -146,10 +153,8 @@ async fn detail(
         "#,
     )
     .bind(group_id)
-    .fetch_all(&state.pool);
-
-    let (group, member_rows) = tokio::try_join!(group_q, members_q)?;
-    let group = group.ok_or_else(ApiError::not_found)?.into_group();
+    .fetch_all(&mut **conn)
+    .await?;
 
     let members: Vec<GroupMember> = member_rows
         .into_iter()
@@ -164,18 +169,19 @@ async fn detail(
 }
 
 async fn leave(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup {
         user_id, group_id, ..
     }: CurrentGroup,
+    tx: Tx,
 ) -> Result<StatusCode, ApiError> {
-    let mut tx = state.pool.begin().await?;
+    let mut conn = tx.acquire().await;
 
     let memberships = sqlx::query_as::<_, MembershipLockRow>(
         "SELECT user_id, role FROM group_memberships WHERE group_id = $1 FOR UPDATE",
     )
     .bind(group_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **conn)
     .await?;
 
     let role = memberships
@@ -199,24 +205,25 @@ async fn leave(
     sqlx::query("DELETE FROM group_memberships WHERE user_id = $1 AND group_id = $2")
         .bind(user_id)
         .bind(group_id)
-        .execute(&mut *tx)
+        .execute(&mut **conn)
         .await?;
 
-    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_group(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup { group_id, role, .. }: CurrentGroup,
+    tx: Tx,
 ) -> Result<StatusCode, ApiError> {
     if role != GroupRole::Owner {
         return Err(ApiError::Forbidden("owner role required".into()));
     }
 
+    let mut conn = tx.acquire().await;
     let result = sqlx::query("DELETE FROM groups WHERE id = $1")
         .bind(group_id)
-        .execute(&state.pool)
+        .execute(&mut **conn)
         .await?;
 
     if result.rows_affected() == 0 {
@@ -227,13 +234,15 @@ async fn delete_group(
 }
 
 async fn rotate_invite(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     CurrentGroup { group_id, role, .. }: CurrentGroup,
+    tx: Tx,
 ) -> Result<Json<Group>, ApiError> {
     if role != GroupRole::Owner {
         return Err(ApiError::Forbidden("owner role required".into()));
     }
 
+    let mut conn = tx.acquire().await;
     let mut group_row: Option<GroupRow> = None;
     for _ in 0..MAX_INVITE_GEN_ATTEMPTS {
         let code = random_invite_code();
@@ -243,7 +252,7 @@ async fn rotate_invite(
         )
         .bind(&code)
         .bind(group_id)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut **conn)
         .await
         {
             Ok(row) => {
@@ -261,9 +270,11 @@ async fn rotate_invite(
 async fn join(
     State(state): State<AppState>,
     CurrentUser(user_id): CurrentUser,
+    tx: Tx,
     Path(code): Path<String>,
 ) -> Result<Json<Group>, ApiError> {
-    require_group_quota(&state, user_id).await?;
+    let mut conn = tx.acquire().await;
+    require_group_quota(&mut **conn, &state, user_id).await?;
     let group = sqlx::query_as::<_, GroupRow>(
         r#"
         WITH g AS (
@@ -280,7 +291,7 @@ async fn join(
     )
     .bind(&code)
     .bind(user_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut **conn)
     .await?
     .ok_or_else(|| ApiError::NotFound("invite is invalid or expired".into()))?
     .into_group();
@@ -296,14 +307,14 @@ fn random_invite_code() -> String {
 /// groups — a user who joins 1000 groups via invite is just as much a
 /// problem as one who creates 1000.
 pub async fn check_group_quota(
-    pool: &sqlx::PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     user_id: Uuid,
     cap: i64,
 ) -> Result<(), ApiError> {
     let count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM group_memberships WHERE user_id = $1")
             .bind(user_id)
-            .fetch_one(pool)
+            .fetch_one(executor)
             .await?;
     if count >= cap {
         return Err(ApiError::QuotaExceeded(format!(
@@ -313,8 +324,12 @@ pub async fn check_group_quota(
     Ok(())
 }
 
-async fn require_group_quota(state: &AppState, user_id: Uuid) -> Result<(), ApiError> {
-    check_group_quota(&state.pool, user_id, state.config.limits.groups_per_user).await
+async fn require_group_quota(
+    executor: impl sqlx::PgExecutor<'_>,
+    state: &AppState,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    check_group_quota(executor, user_id, state.config.limits.groups_per_user).await
 }
 
 fn is_invite_collision(e: &sqlx::Error) -> bool {

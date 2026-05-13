@@ -8,14 +8,17 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use super::pricing::accessible_market_ids;
-use crate::{errors::ApiError, state::AppState};
+use crate::{db::Tx, errors::ApiError, state::AppState};
 
 pub(crate) async fn load_list_detail(
-    state: &AppState,
+    _state: &AppState,
+    tx: &Tx,
     list_id: Uuid,
     viewer_user_id: Uuid,
     viewer_role: GroupRole,
 ) -> Result<ListDetail, ApiError> {
+    let mut conn = tx.acquire().await;
+
     let list_row: ListRow = sqlx::query_as(
         "SELECT id, group_id, created_by_user_id, destination_label, notes, status, \
                 total_estimate_isk, tip_pct, created_at, updated_at, \
@@ -23,7 +26,7 @@ pub(crate) async fn load_list_detail(
          FROM lists WHERE id = $1",
     )
     .bind(list_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut **conn)
     .await?
     .ok_or_else(ApiError::not_found)?;
     let group_id = list_row.group_id;
@@ -36,7 +39,7 @@ pub(crate) async fn load_list_detail(
          FROM list_items WHERE list_id = $1 ORDER BY source_line_no NULLS LAST, created_at",
     )
     .bind(list_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
     let items: Vec<ListItem> = item_rows.into_iter().map(ListItemRow::into_item).collect();
 
@@ -47,7 +50,7 @@ pub(crate) async fn load_list_detail(
          WHERE lm.list_id = $1 ORDER BY lm.is_primary DESC, m.short_label",
     )
     .bind(list_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
     let primary_market_id = market_rows
         .iter()
@@ -59,7 +62,7 @@ pub(crate) async fn load_list_detail(
         .collect();
 
     let market_ids: Vec<Uuid> = markets.iter().map(|m| m.id).collect();
-    let accessible: Vec<Uuid> = accessible_market_ids(&state.pool, group_id, &market_ids)
+    let accessible: Vec<Uuid> = accessible_market_ids(&mut **conn, group_id, &market_ids)
         .await?
         .into_iter()
         .collect();
@@ -85,7 +88,7 @@ pub(crate) async fn load_list_detail(
     )
     .bind(list_id)
     .bind(&accessible)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
     let live_prices: Vec<LiveItemPrice> =
         live_rows.into_iter().map(LivePriceRow::into_live).collect();
@@ -106,7 +109,7 @@ pub(crate) async fn load_list_detail(
         "#,
     )
     .bind(list_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
     let claims: Vec<Claim> = claim_rows.into_iter().map(ClaimRow::into_claim).collect();
 
@@ -128,7 +131,7 @@ pub(crate) async fn load_list_detail(
         "#,
     )
     .bind(list_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
     let fulfillments: Vec<Fulfillment> = fulfillment_rows
         .into_iter()
@@ -163,7 +166,7 @@ pub(crate) async fn load_list_detail(
         "#,
     )
     .bind(list_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **conn)
     .await?;
     let reimbursements: Vec<Reimbursement> = reimbursement_rows
         .into_iter()
@@ -188,7 +191,7 @@ pub(crate) async fn load_list_detail(
     )
     .bind(list_id)
     .bind(viewer_user_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut **conn)
     .await?
     .flatten();
 

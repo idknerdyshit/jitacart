@@ -552,3 +552,179 @@ CREATE TABLE pending_webhooks (
 );
 CREATE INDEX pending_webhooks_ready_idx
     ON pending_webhooks (next_attempt_at);
+
+-- ── Row-Level Security ──────────────────────────────────────────────────────
+--
+-- Belt-and-suspenders: extractor JOINs in the api crate already gate every
+-- tenant-scoped query by `group_memberships`. RLS makes the database itself
+-- refuse to return or mutate rows that the caller does not own, even if a
+-- future handler forgets its predicate. The `jitacart_app` role used by the
+-- api at runtime has NOBYPASSRLS; the `jitacart_worker` role has BYPASSRLS
+-- so the worker (trusted server-side code) can keep operating across tenants.
+-- Table owner (`jitacart_admin`, equivalent here to the postgres bootstrap
+-- role) is not subject to RLS — we deliberately do NOT use FORCE ROW LEVEL
+-- SECURITY, so migrations and emergency ops over psql keep working.
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'jitacart_app') THEN
+    CREATE ROLE jitacart_app LOGIN NOSUPERUSER NOBYPASSRLS;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'jitacart_worker') THEN
+    CREATE ROLE jitacart_worker LOGIN NOSUPERUSER BYPASSRLS;
+  END IF;
+END $$;
+
+CREATE SCHEMA IF NOT EXISTS app;
+
+-- Reads the per-request session variable set by the api's tx middleware.
+-- The `true` arg to current_setting() means "missing setting returns ''" so
+-- anon requests (no logged-in user) and worker BYPASSRLS callers both get
+-- NULL here, and the per-policy EXISTS predicates trivially fail.
+CREATE OR REPLACE FUNCTION app.current_user_id() RETURNS uuid
+  LANGUAGE sql STABLE AS $$
+  SELECT NULLIF(current_setting('app.current_user_id', true), '')::uuid
+$$;
+
+-- SECURITY DEFINER so the helpers can read `group_memberships` without
+-- recursing through that table's own RLS policy.
+CREATE OR REPLACE FUNCTION app.is_group_member(p_group uuid) RETURNS boolean
+  LANGUAGE sql SECURITY DEFINER STABLE AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM group_memberships
+    WHERE user_id = app.current_user_id() AND group_id = p_group
+  )
+$$;
+
+CREATE OR REPLACE FUNCTION app.is_list_member(p_list uuid) RETURNS boolean
+  LANGUAGE sql SECURITY DEFINER STABLE AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM lists l
+    JOIN group_memberships gm ON gm.group_id = l.group_id
+    WHERE l.id = p_list AND gm.user_id = app.current_user_id()
+  )
+$$;
+
+CREATE OR REPLACE FUNCTION app.is_corp_member(p_corp uuid) RETURNS boolean
+  LANGUAGE sql SECURITY DEFINER STABLE AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM group_corps gc
+    JOIN group_memberships gm ON gm.group_id = gc.group_id
+    WHERE gc.corp_id = p_corp
+      AND gc.unlinked_at IS NULL
+      AND gm.user_id = app.current_user_id()
+  )
+$$;
+
+REVOKE ALL ON SCHEMA app FROM PUBLIC;
+GRANT USAGE ON SCHEMA app TO jitacart_app, jitacart_worker;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA app TO jitacart_app, jitacart_worker;
+
+-- Both roles get the same broad table/sequence GRANTs. RLS does the gating
+-- for jitacart_app; the worker has BYPASSRLS and is trusted code.
+GRANT USAGE ON SCHEMA public TO jitacart_app, jitacart_worker;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA public TO jitacart_app;
+GRANT USAGE, SELECT                  ON ALL SEQUENCES IN SCHEMA public TO jitacart_app;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA public TO jitacart_worker;
+GRANT USAGE, SELECT                  ON ALL SEQUENCES IN SCHEMA public TO jitacart_worker;
+
+-- Enable RLS on every tenant-scoped table. Shared/reference tables (users,
+-- characters, groups, markets, market_prices, corps, type_cache, principals,
+-- character_structure_access, character_refresh_tokens, tower_sessions) stay
+-- un-gated and rely on existing app logic.
+ALTER TABLE lists                       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE list_items                  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE list_markets                ENABLE ROW LEVEL SECURITY;
+ALTER TABLE claims                      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE claim_items                 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fulfillments                ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reimbursements              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE group_memberships           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE group_corps                 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE group_discord_webhooks      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE group_tracked_markets       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE corp_ambassadors            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE corp_wallet_divisions       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE corp_wallet_journal         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE contracts                   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE contract_items              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE contract_match_suggestions  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pending_webhooks            ENABLE ROW LEVEL SECURITY;
+
+-- Policies. `TO jitacart_app` ⇒ only that role is gated; jitacart_worker
+-- (BYPASSRLS) and jitacart_admin (table owner, no FORCE) are unaffected.
+
+-- direct group_id column
+CREATE POLICY lists_member ON lists                                       FOR ALL TO jitacart_app
+  USING (app.is_group_member(group_id))           WITH CHECK (app.is_group_member(group_id));
+CREATE POLICY group_corps_member ON group_corps                           FOR ALL TO jitacart_app
+  USING (app.is_group_member(group_id))           WITH CHECK (app.is_group_member(group_id));
+CREATE POLICY group_discord_webhooks_member ON group_discord_webhooks     FOR ALL TO jitacart_app
+  USING (app.is_group_member(group_id))           WITH CHECK (app.is_group_member(group_id));
+CREATE POLICY group_tracked_markets_member ON group_tracked_markets       FOR ALL TO jitacart_app
+  USING (app.is_group_member(group_id))           WITH CHECK (app.is_group_member(group_id));
+CREATE POLICY pending_webhooks_member ON pending_webhooks                 FOR ALL TO jitacart_app
+  USING (app.is_group_member(group_id))           WITH CHECK (app.is_group_member(group_id));
+
+-- via list_id
+CREATE POLICY list_items_member   ON list_items   FOR ALL TO jitacart_app
+  USING (app.is_list_member(list_id))             WITH CHECK (app.is_list_member(list_id));
+CREATE POLICY list_markets_member ON list_markets FOR ALL TO jitacart_app
+  USING (app.is_list_member(list_id))             WITH CHECK (app.is_list_member(list_id));
+CREATE POLICY claims_member       ON claims       FOR ALL TO jitacart_app
+  USING (app.is_list_member(list_id))             WITH CHECK (app.is_list_member(list_id));
+CREATE POLICY reimbursements_member ON reimbursements FOR ALL TO jitacart_app
+  USING (app.is_list_member(list_id))             WITH CHECK (app.is_list_member(list_id));
+
+-- nested via claim_id → list_id
+CREATE POLICY claim_items_member ON claim_items FOR ALL TO jitacart_app
+  USING      (EXISTS (SELECT 1 FROM claims c WHERE c.id = claim_items.claim_id AND app.is_list_member(c.list_id)))
+  WITH CHECK (EXISTS (SELECT 1 FROM claims c WHERE c.id = claim_items.claim_id AND app.is_list_member(c.list_id)));
+
+-- nested via list_item_id → list_id
+CREATE POLICY fulfillments_member ON fulfillments FOR ALL TO jitacart_app
+  USING      (EXISTS (SELECT 1 FROM list_items li WHERE li.id = fulfillments.list_item_id AND app.is_list_member(li.list_id)))
+  WITH CHECK (EXISTS (SELECT 1 FROM list_items li WHERE li.id = fulfillments.list_item_id AND app.is_list_member(li.list_id)));
+
+-- via corp_id
+CREATE POLICY corp_ambassadors_member ON corp_ambassadors FOR ALL TO jitacart_app
+  USING (app.is_corp_member(corp_id))             WITH CHECK (app.is_corp_member(corp_id));
+CREATE POLICY corp_wallet_divisions_member ON corp_wallet_divisions FOR ALL TO jitacart_app
+  USING (app.is_corp_member(corp_id))             WITH CHECK (app.is_corp_member(corp_id));
+CREATE POLICY corp_wallet_journal_member ON corp_wallet_journal FOR ALL TO jitacart_app
+  USING (app.is_corp_member(corp_id))             WITH CHECK (app.is_corp_member(corp_id));
+
+-- contracts: caller may be issuer, assignee, or in a group that owns the source_corp
+CREATE POLICY contracts_member ON contracts FOR ALL TO jitacart_app
+  USING (
+       issuer_user_id   = app.current_user_id()
+    OR assignee_user_id = app.current_user_id()
+    OR (source_corp_id IS NOT NULL AND app.is_corp_member(source_corp_id))
+  )
+  WITH CHECK (
+       issuer_user_id   = app.current_user_id()
+    OR assignee_user_id = app.current_user_id()
+    OR (source_corp_id IS NOT NULL AND app.is_corp_member(source_corp_id))
+  );
+
+CREATE POLICY contract_items_member ON contract_items FOR ALL TO jitacart_app
+  USING      (EXISTS (SELECT 1 FROM contracts c WHERE c.id = contract_items.contract_id
+                       AND (c.issuer_user_id = app.current_user_id()
+                            OR c.assignee_user_id = app.current_user_id()
+                            OR (c.source_corp_id IS NOT NULL AND app.is_corp_member(c.source_corp_id)))))
+  WITH CHECK (EXISTS (SELECT 1 FROM contracts c WHERE c.id = contract_items.contract_id
+                       AND (c.issuer_user_id = app.current_user_id()
+                            OR c.assignee_user_id = app.current_user_id()
+                            OR (c.source_corp_id IS NOT NULL AND app.is_corp_member(c.source_corp_id)))));
+
+CREATE POLICY contract_match_suggestions_member ON contract_match_suggestions FOR ALL TO jitacart_app
+  USING      (EXISTS (SELECT 1 FROM reimbursements r WHERE r.id = contract_match_suggestions.reimbursement_id
+                       AND app.is_list_member(r.list_id)))
+  WITH CHECK (EXISTS (SELECT 1 FROM reimbursements r WHERE r.id = contract_match_suggestions.reimbursement_id
+                       AND app.is_list_member(r.list_id)));
+
+-- group_memberships: caller sees their own rows + rows in any of their groups
+CREATE POLICY group_memberships_member ON group_memberships FOR ALL TO jitacart_app
+  USING      (user_id = app.current_user_id() OR app.is_group_member(group_id))
+  WITH CHECK (user_id = app.current_user_id() OR app.is_group_member(group_id));

@@ -9,11 +9,12 @@ use async_trait::async_trait;
 use common::*;
 use domain::GroupRole;
 use jitacart_api::webhooks::{
-    build_payload, dispatch_webhook, do_delete_webhook, do_get_webhook, do_upsert_webhook,
-    WebhookConfig, WebhookEvent, WebhookSender,
+    do_delete_webhook, do_get_webhook, do_upsert_webhook, WebhookConfig, WebhookEvent,
 };
 use sqlx::PgPool;
-use webhook_dispatch::Error as WebhookDispatchError;
+use webhook_dispatch::{
+    build_payload, dispatch_webhook, Error as WebhookDispatchError, WebhookSender,
+};
 
 fn sample_config(url: &str) -> WebhookConfig {
     WebhookConfig {

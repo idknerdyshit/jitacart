@@ -50,3 +50,4 @@ First tagged release. Everything below was built up over the phased development 
 - Market: log and skip prices that fail `Decimal::from_f64` rather than panicking (`5545254`).
 - Scoped `corps.list_journal` reads to the caller's `CurrentGroup.group_id` (`8d7b615`).
 - Allow hauler or ambassador (not just the original issuer) to unlink corp-issued contracts (`10d7045`).
+- Init migration: replace racy `IF NOT EXISTS … CREATE ROLE` with `EXCEPTION WHEN duplicate_object`, so concurrent migration application (`#[sqlx::test]`'s per-test fresh-DB harness) no longer trips on `pg_authid_rolname_index`.

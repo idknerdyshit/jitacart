@@ -63,7 +63,13 @@ require BACKUP_RESTORE_CONFIRM
 PGUSER="${POSTGRES_USER:-jitacart}"
 PGHOST="${POSTGRES_HOST:-postgres}"
 PGDB="${POSTGRES_DB:-jitacart}"
-TARGET_DB="${BACKUP_RESTORE_TARGET_DB:-$PGDB}"
+# Default the restore target to the side DB, NOT the live DB. Otherwise
+# an operator who sets BACKUP_RESTORE_CONFIRM=jitacart but forgets
+# BACKUP_RESTORE_TARGET_DB ends up restoring straight over prod (the
+# confirmation check below would still pass — both defaults would
+# resolve to "jitacart"). To overwrite prod, set
+# BACKUP_RESTORE_TARGET_DB=jitacart explicitly.
+TARGET_DB="${BACKUP_RESTORE_TARGET_DB:-jitacart_restore}"
 
 # Confirm token must literally name the DB we're about to overwrite. This
 # is the only thing standing between an operator and a destroyed prod —

@@ -73,10 +73,14 @@ docker compose run --rm \
 
 Use `restore latest` instead of a date to grab the most recent dump.
 
-Defaults restore into the prod `jitacart` DB; setting
-`BACKUP_RESTORE_TARGET_DB=jitacart_restore` (with a matching
-`BACKUP_RESTORE_CONFIRM`) lets you validate the dump in a side DB
-before swapping `DATABASE_URL` and bouncing api + worker.
+By default the restore lands in `jitacart_restore` (the side DB),
+not the live `jitacart` DB — so a forgotten `BACKUP_RESTORE_TARGET_DB`
+can't silently overwrite prod just because the confirm token happens
+to match the live DB name. To overwrite prod you must set
+`BACKUP_RESTORE_TARGET_DB=jitacart` explicitly *and* match it with
+`BACKUP_RESTORE_CONFIRM=jitacart`. The normal flow — validate the
+dump in `jitacart_restore` first, then swap `DATABASE_URL` and bounce
+api + worker — is what the defaults bias you toward.
 
 ## Quarterly restore drill
 

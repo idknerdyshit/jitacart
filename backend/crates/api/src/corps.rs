@@ -420,11 +420,9 @@ fn default_journal_limit() -> i64 {
 
 async fn list_journal(
     State(_state): State<AppState>,
-    Path((group_id, corp_id)): Path<(Uuid, Uuid)>,
+    Path((_, corp_id)): Path<(Uuid, Uuid)>,
     CurrentGroup {
-        user_id,
-        group_id: _gid,
-        ..
+        user_id, group_id, ..
     }: CurrentGroup,
     tx: Tx,
     Query(q): Query<JournalQuery>,

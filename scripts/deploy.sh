@@ -55,17 +55,28 @@ fi
 echo "$PREV_SHA" > .deploy-prev-sha
 docker compose config --images > .deploy-prev-images
 
-# 4. Pull images (digest-pinned in docker-compose.yml; `pull` is a
+# 4. Refuse to deploy unpinned or placeholder digests. The compose
+#    file MUST go through scripts/bump-image-digests.sh first, or
+#    `docker compose pull` would happily resolve `:latest` to whatever
+#    is on GHCR right now — defeating the audit-trail-in-git model.
+if grep -qE '^\s*image:.*jitacart-(backend|frontend|backup):[^@[:space:]]+$' docker-compose.yml; then
+    die "docker-compose.yml has unpinned jitacart images; run scripts/bump-image-digests.sh first"
+fi
+if grep -qE '@sha256:0{64}' docker-compose.yml; then
+    die "docker-compose.yml still has placeholder digests; run scripts/bump-image-digests.sh first"
+fi
+
+# 5. Pull images (digest-pinned in docker-compose.yml; `pull` is a
 #    no-op when the local store already has the digests).
 log "docker compose pull"
 docker compose pull
 
-# 5. Bring up. compose's existing depends_on: service_healthy edges
+# 6. Bring up. compose's existing depends_on: service_healthy edges
 #    handle ordering; we don't have to re-implement startup sequencing.
 log "docker compose up -d"
 docker compose up -d
 
-# 6. Poll readiness. /readyz exec'd from inside the api container, so
+# 7. Poll readiness. /readyz exec'd from inside the api container, so
 #    we don't depend on Caddy / DNS / cert health to know the app is
 #    serving. Worker /healthz on its in-container loopback.
 poll_ready() {
@@ -104,7 +115,7 @@ if poll_ready; then
     exit 0
 fi
 
-# 7. Rollback. Revert just docker-compose.yml (leave the rest of the
+# 8. Rollback. Revert just docker-compose.yml (leave the rest of the
 #    tree alone — it may contain doc-only commits the operator
 #    explicitly wants on disk), pull the previous digests, bring the
 #    stack back up. One retry — if even the previous good state

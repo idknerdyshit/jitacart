@@ -43,7 +43,7 @@ services:
     logging: *default-logging
 
   api:
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:${JC_IMAGE_TAG:-latest}
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest@sha256:0000000000000000000000000000000000000000000000000000000000000000
     restart: unless-stopped
     depends_on:
       postgres:
@@ -68,7 +68,7 @@ services:
     logging: *default-logging
 
   worker:
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:${JC_IMAGE_TAG:-latest}
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest@sha256:0000000000000000000000000000000000000000000000000000000000000000
     command: ["jitacart-worker"]
     restart: unless-stopped
     depends_on:
@@ -95,7 +95,7 @@ services:
     logging: *default-logging
 
   frontend:
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:${JC_IMAGE_TAG:-latest}
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:latest@sha256:0000000000000000000000000000000000000000000000000000000000000000
     restart: unless-stopped
     depends_on:
       api:
@@ -135,7 +135,7 @@ services:
   # Bring it up alongside the rest with `docker compose --profile backup up -d`.
   backup:
     profiles: [backup]
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backup:${JC_IMAGE_TAG:-latest}
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backup:latest@sha256:0000000000000000000000000000000000000000000000000000000000000000
     restart: unless-stopped
     depends_on:
       postgres:

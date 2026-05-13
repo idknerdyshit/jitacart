@@ -181,7 +181,11 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          # mode=min exports only the final stage's cache. mode=max
+          # also exports intermediate layers (including the cargo
+          # registry cache mount), which can poison subsequent builds
+          # if a previous run died mid-unpack — see jitacart#1.
+          cache-to: type=gha,mode=min,scope=${{ matrix.name }}
       # Echo the multi-arch index digest into the job log so a human
       # can grep CI output if the release-body lookup ever fails.
       # The release job re-queries via `docker buildx imagetools

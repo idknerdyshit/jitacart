@@ -565,18 +565,22 @@ CREATE INDEX pending_webhooks_ready_idx
 -- role) is not subject to RLS — we deliberately do NOT use FORCE ROW LEVEL
 -- SECURITY, so migrations and emergency ops over psql keep working.
 
--- `IF NOT EXISTS … CREATE ROLE` is racy when multiple connections apply
--- this migration against the same cluster concurrently (sqlx::test creates
--- a fresh per-test database in the shared cluster, then runs migrations in
--- parallel). Both threads pass the pg_roles check and one loses on
--- pg_authid_rolname_index. Catch the duplicate as a benign no-op.
+-- Idempotent role creation. Two races to defend against when multiple
+-- connections apply this migration against the same cluster concurrently
+-- (sqlx::test gives each test its own fresh database in the shared
+-- cluster, then runs migrations in parallel):
+--   * `duplicate_object` (42710) — CREATE ROLE's own duplicate detection.
+--   * `unique_violation` (23505) — the underlying pg_authid_rolname_index
+--     when two CREATE ROLEs reach the index insert before either has
+--     committed; Postgres surfaces the lower-level error here.
+-- Catch both as a benign no-op.
 DO $$ BEGIN
   CREATE ROLE jitacart_app LOGIN NOSUPERUSER NOBYPASSRLS;
-EXCEPTION WHEN duplicate_object THEN NULL;
+EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;
 END $$;
 DO $$ BEGIN
   CREATE ROLE jitacart_worker LOGIN NOSUPERUSER BYPASSRLS;
-EXCEPTION WHEN duplicate_object THEN NULL;
+EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;
 END $$;
 
 CREATE SCHEMA IF NOT EXISTS app;

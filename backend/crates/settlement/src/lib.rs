@@ -305,7 +305,10 @@ pub async fn settle_via_contract(
     sqlx::query(
         r#"
         UPDATE contracts
-        SET settlement_delta_isk = price_isk - COALESCE(expected_total_isk, 0),
+        SET settlement_delta_isk = CASE
+                WHEN expected_total_isk IS NULL THEN NULL
+                ELSE price_isk - expected_total_isk
+            END,
             updated_at = now()
         WHERE id = $1
         "#,

@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-05-14
+
+### Security
+
+- Harden the Postgres role topology: rename the bootstrap superuser so a superuser DSN can never reach runtime code, add a SELECT-only `jitacart_backup` role, and narrow `jitacart_app` from a blanket DELETE to the tables the api crate actually deletes from (`c7b7f55`).
+- Close the manual-link cross-tenant gap and tighten defense-in-depth (`6669f79`).
+- Close the fulfillment-reversal race, the `do_unlink` cross-tenant gap, and a webhook SSRF (`fcad9ce`).
+- Harden worker, webhook, and transaction paths and tighten frontend types (`28bca9f`).
+- Isolate the dev compose namespace and harden Postgres exposure (`1a81dc3`).
+- Tighten concurrent token re-encryption and overflow consistency (`720185a`).
+- Gate build-images on audits and pin third-party GitHub Actions by commit SHA (`24d3a52`).
+
+### Fixed
+
+- Harden worker fan-out, the budget counter, and frontend auth scoping (`acbfa4d`).
+- Bump nea-esi to 0.9.0 for Decimal-native ISK fields (`ba1deda`).
+- Give the dev Postgres its own volume name (`5ab9409`).
+- Default the backup restore target to `jitacart_restore` (`f3d7644`).
+- Accessibility and SSR fixes: aria-label, delete modal, server load (`30672e6`).
+
+### Changed
+
+- Base the backup container on `postgres:16-alpine`, pass DB credentials via a `.pgpass` file instead of `PGPASSWORD`, and bump CI and the frontend image to Node 22 (`c7b7f55`).
+- Add the `20260514000000_backup_role_and_scoped_grants` migration rather than editing the released init migration, which would trip sqlx's checksum check (`c7b7f55`).
+- Update Rust and frontend dependencies to their latest compatible versions (`c7b7f55`).
+- Gitignore the `.claude/` directory (`de71245`).
+- Expand the Turnstile-skip rationale in the auth docs (`5f20de4`).
+- Drop bump-image-digests from the README quickstart and update flow (`54b1688`).
+- Gate release on pin-digests and clean up the rebase failure path (`087eee6`).
+- Pin image digests on the release tag rather than at deploy time (`2949ea3`).
+- Fix release-notes digest extraction (`bcd9f55`).
+
 ## [0.1.0] - 2026-05-13
 
 First tagged release. Everything below was built up over the phased development that preceded this tag.

@@ -53,7 +53,7 @@ Refresh + access tokens are AES-GCM-encrypted with a per-row `token_key_id`. Con
 
 ## Migrations
 
-Single consolidated migration at `migrations/20260427000000_init.sql`. Applied by `sqlx::migrate!` on api startup. When you add a migration, both `cargo run -p jitacart-api` and api container startup will apply it before opening the listener.
+Migrations live in `migrations/`, applied in order by `sqlx::migrate!` on api startup: `20260427000000_init.sql` (consolidated initial schema) followed by `20260514000000_backup_role_and_scoped_grants.sql`. Editing an already-released migration trips sqlx's checksum check — always add a new file. When you add a migration, both `cargo run -p jitacart-api` and api container startup will apply it before opening the listener.
 
 ## Conventions
 

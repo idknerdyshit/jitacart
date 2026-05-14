@@ -79,7 +79,10 @@ pat = re.compile(
     r'^(\s*image:\s+ghcr\.io/[^/]+/jitacart-' + re.escape(img) + r'):[^@\s]+(?:@sha256:[0-9a-f]+)?',
     re.MULTILINE,
 )
-new, n = pat.subn(rf'\g<1>:{ver}@{digest}', src)
+# Use a function replacement, not a template string: `ver` is attacker-ish
+# input (a git tag name) and a template would interpret backslashes / \g<n>
+# group references inside it.
+new, n = pat.subn(lambda m: f'{m.group(1)}:{ver}@{digest}', src)
 if n == 0:
     sys.exit(f"no image: line matched for jitacart-{img}")
 with open(path, 'w') as f:

@@ -11,7 +11,11 @@
 #   ...or `restore latest` to grab the newest dump in the remote.
 #
 # Required env:
-#   POSTGRES_PASSWORD       postgres password (server)
+#   RESTORE_DB_PASSWORD     password for the restore role. Restore WRITES, so
+#                           it cannot use the read-only nightly backup role —
+#                           it connects as jitacart_admin (the table owner).
+#                           compose's backup service wires this to
+#                           POSTGRES_PASSWORD automatically.
 #   BACKUP_RCLONE_REMOTE    rclone remote + path, e.g. "b2:jitacart-backups"
 #   RCLONE_CONFIG           path to rclone.conf
 #   BACKUP_AGE_IDENTITY     path to age private key file (mounted ad-hoc)
@@ -20,7 +24,7 @@
 #                           way to set this once and forget.
 #
 # Optional env:
-#   POSTGRES_USER             (default: jitacart)
+#   RESTORE_DB_USER           (default: jitacart_admin)
 #   POSTGRES_HOST             (default: postgres)
 #   POSTGRES_DB               (default: jitacart) — restore target unless
 #                             BACKUP_RESTORE_TARGET_DB is set
@@ -52,7 +56,7 @@ if [[ $# -lt 1 ]]; then
 fi
 WHICH="$1"
 
-require POSTGRES_PASSWORD
+require RESTORE_DB_PASSWORD
 require BACKUP_RCLONE_REMOTE
 require RCLONE_CONFIG
 require BACKUP_AGE_IDENTITY
@@ -60,9 +64,18 @@ require BACKUP_RESTORE_CONFIRM
 
 [[ -r "$BACKUP_AGE_IDENTITY" ]] || die "age identity not readable: $BACKUP_AGE_IDENTITY"
 
-PGUSER="${POSTGRES_USER:-jitacart}"
+PGUSER="${RESTORE_DB_USER:-jitacart_admin}"
 PGHOST="${POSTGRES_HOST:-postgres}"
 PGDB="${POSTGRES_DB:-jitacart}"
+
+# Password via a 0600 .pgpass file, never PGPASSWORD in the environment
+# (visible in /proc/<pid>/environ). Trap wipes it even on a failed restore.
+PGPASSFILE="$(mktemp)"
+export PGPASSFILE
+trap 'rm -f "$PGPASSFILE"' EXIT
+esc_pw="${RESTORE_DB_PASSWORD//\\/\\\\}"
+esc_pw="${esc_pw//:/\\:}"
+printf '%s:*:*:%s:%s\n' "$PGHOST" "$PGUSER" "$esc_pw" > "$PGPASSFILE"
 # Default the restore target to the side DB, NOT the live DB. Otherwise
 # an operator who sets BACKUP_RESTORE_CONFIRM=jitacart but forgets
 # BACKUP_RESTORE_TARGET_DB ends up restoring straight over prod (the
@@ -104,7 +117,7 @@ log info "restoring ${SOURCE} -> ${PGHOST}/${TARGET_DB} (as ${PGUSER})"
 # parallel jobs (-j); single-stream is fine and matches the dump pipeline.
 rclone --config "$RCLONE_CONFIG" cat "$SOURCE" \
   | age -d -i "$BACKUP_AGE_IDENTITY" \
-  | PGPASSWORD="$POSTGRES_PASSWORD" pg_restore \
+  | pg_restore \
         -U "$PGUSER" \
         -h "$PGHOST" \
         -d "$TARGET_DB" \

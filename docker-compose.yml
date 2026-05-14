@@ -37,11 +37,15 @@ services:
     image: postgres:16-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
     restart: unless-stopped
     environment:
-      POSTGRES_USER: jitacart
+      # The bootstrap superuser is deliberately NOT `jitacart` — a superuser
+      # bypasses all RLS, so it must never be reachable from a runtime
+      # DATABASE_URL. Runtime code connects only as jitacart_{app,worker,backup}.
+      POSTGRES_USER: jitacart_bootstrap
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: jitacart
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
       WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:?set WORKER_DB_PASSWORD in .env}
+      BACKUP_DB_PASSWORD: ${BACKUP_DB_PASSWORD:?set BACKUP_DB_PASSWORD in .env}
     volumes:
       - jitacart-pgdata:/var/lib/postgresql/data
       # Runs once on a fresh data dir to create the RLS roles. Idempotent
@@ -49,7 +53,7 @@ services:
       # /docker-entrypoint-initdb.d/ when the cluster is being initialized.
       - ./scripts/init-roles.sh:/docker-entrypoint-initdb.d/00-init-roles.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U jitacart -d jitacart"]
+      test: ["CMD-SHELL", "pg_isready -U jitacart_bootstrap -d jitacart"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -134,7 +138,7 @@ services:
     logging: *default-logging
 
   caddy:
-    image: caddy:2-alpine@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d
+    image: caddy:2-alpine@sha256:86deaf5e3d3408a6ccec08fbb79989783dd26e206ae10bcf78a801dc8c9ab794
     restart: unless-stopped
     depends_on:
       api:
@@ -168,9 +172,17 @@ services:
         required: false
     environment:
       POSTGRES_HOST: postgres
-      POSTGRES_USER: jitacart
       POSTGRES_DB: jitacart
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Nightly backup connects as a SELECT-only, BYPASSRLS role: pg_dump can
+      # read every tenant's rows but a compromised backup container cannot
+      # mutate or delete anything.
+      POSTGRES_USER: jitacart_backup
+      POSTGRES_PASSWORD: ${BACKUP_DB_PASSWORD:?set BACKUP_DB_PASSWORD in .env}
+      # restore.sh needs write access, so it connects as the table owner
+      # (jitacart_admin, whose password is POSTGRES_PASSWORD) rather than the
+      # read-only backup role. Only consumed by `... run --rm backup restore`.
+      RESTORE_DB_USER: jitacart_admin
+      RESTORE_DB_PASSWORD: ${POSTGRES_PASSWORD}
       RCLONE_CONFIG: /config/rclone.conf
     volumes:
       - ./backup/rclone.conf:/config/rclone.conf:ro

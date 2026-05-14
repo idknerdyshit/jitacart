@@ -93,7 +93,7 @@ quarter, log the date and outcome somewhere durable.
 
    ```sh
    docker compose exec -T postgres \
-       psql -U jitacart -c "CREATE DATABASE jitacart_restore;"
+       psql -U jitacart_bootstrap -c "CREATE DATABASE jitacart_restore;"
    docker compose run --rm \
        -v "$HOME/.age/jitacart-backup.age:/run/age.key:ro" \
        -e BACKUP_AGE_IDENTITY=/run/age.key \
@@ -105,9 +105,9 @@ quarter, log the date and outcome somewhere durable.
 3. **Sanity-check row counts** against the live DB:
 
    ```sh
-   docker compose exec -T postgres psql -U jitacart -d jitacart \
+   docker compose exec -T postgres psql -U jitacart_bootstrap -d jitacart \
        -c "SELECT count(*) FROM users;"
-   docker compose exec -T postgres psql -U jitacart -d jitacart_restore \
+   docker compose exec -T postgres psql -U jitacart_bootstrap -d jitacart_restore \
        -c "SELECT count(*) FROM users;"
    ```
 
@@ -126,7 +126,7 @@ quarter, log the date and outcome somewhere durable.
 
    ```sh
    docker compose exec -T postgres \
-       psql -U jitacart -c "DROP DATABASE jitacart_restore;"
+       psql -U jitacart_bootstrap -c "DROP DATABASE jitacart_restore;"
    ```
 
 Outcomes worth alerting on:

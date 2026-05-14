@@ -266,9 +266,13 @@ sweeper to drain old rows.
 ### Rotating Postgres credentials
 
 ```sh
-# Pick a new password.
+# Pick a new password. POSTGRES_PASSWORD is shared by the bootstrap
+# superuser (jitacart_bootstrap) and the migration role (jitacart_admin),
+# so rotate both. APP_/WORKER_/BACKUP_DB_PASSWORD rotate the same way
+# against jitacart_app / jitacart_worker / jitacart_backup.
 NEW_PW=$(openssl rand -base64 24)
-docker compose exec -T postgres psql -U jitacart -c "ALTER USER jitacart PASSWORD '$NEW_PW';"
+docker compose exec -T postgres psql -U jitacart_bootstrap -c \
+    "ALTER USER jitacart_bootstrap PASSWORD '$NEW_PW'; ALTER USER jitacart_admin PASSWORD '$NEW_PW';"
 sed -i.bak "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$NEW_PW|" .env
 docker compose restart api worker
 ```

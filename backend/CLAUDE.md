@@ -18,7 +18,7 @@ cargo run -p jitacart-worker                     # run worker locally
 cargo audit --ignore RUSTSEC-2023-0071           # CI uses this exact ignore
 ```
 
-Tests need Postgres reachable at `DATABASE_URL`. CI uses `postgres://jitacart:jitacart@localhost:5432/jitacart` with `SQLX_OFFLINE=true`. Migrations in `migrations/` are applied by `cargo run` on api startup via `sqlx::migrate!`.
+Tests need Postgres reachable at `DATABASE_URL`. CI uses `postgres://jitacart_bootstrap:jitacart@localhost:5432/jitacart` with `SQLX_OFFLINE=true`. Migrations in `migrations/` are applied by `cargo run` on api startup via `sqlx::migrate!`.
 
 The `cargo audit` ignore is for RUSTSEC-2023-0071 (Marvin) in build-time-only `rsa` pulled in unconditionally by `sqlx-macros-core`. See the rationale comment in `.github/workflows/ci.yml`; do not change without checking it.
 

@@ -44,10 +44,22 @@ require BACKUP_AGE_RECIPIENT
 require BACKUP_RCLONE_REMOTE
 require RCLONE_CONFIG
 
-PGUSER="${POSTGRES_USER:-jitacart}"
+PGUSER="${POSTGRES_USER:-jitacart_backup}"
 PGHOST="${POSTGRES_HOST:-postgres}"
 PGDB="${POSTGRES_DB:-jitacart}"
 RETAIN="${BACKUP_RETAIN_DAILY:-30}"
+
+# Pass the password via a 0600 .pgpass file rather than PGPASSWORD in the
+# environment — an env var is visible in /proc/<pid>/environ to anything
+# sharing the namespace. mktemp creates the file 0600; the trap wipes it
+# even on a mid-pipeline failure.
+PGPASSFILE="$(mktemp)"
+export PGPASSFILE
+trap 'rm -f "$PGPASSFILE"' EXIT
+# .pgpass fields are colon-separated; escape ':' and '\' in the password.
+esc_pw="${POSTGRES_PASSWORD//\\/\\\\}"
+esc_pw="${esc_pw//:/\\:}"
+printf '%s:*:%s:%s:%s\n' "$PGHOST" "$PGDB" "$PGUSER" "$esc_pw" > "$PGPASSFILE"
 
 DATE="$(date -u +%F)"
 NAME="jitacart-${DATE}.dump.age"
@@ -57,7 +69,7 @@ log info "starting backup ${NAME} -> ${TARGET}"
 
 # Pipeline: pg_dump → age encrypt → rclone rcat (streams, no temp files).
 # `set -o pipefail` above means a failure anywhere short-circuits.
-PGPASSWORD="$POSTGRES_PASSWORD" pg_dump \
+pg_dump \
     -U "$PGUSER" \
     -h "$PGHOST" \
     -d "$PGDB" \

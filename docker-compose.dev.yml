@@ -8,13 +8,16 @@ services:
     image: postgres:16-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
     restart: unless-stopped
     environment:
-      POSTGRES_USER: jitacart
+      # Bootstrap superuser — never used in a runtime DATABASE_URL. See the
+      # comment in docker-compose.yml's postgres service.
+      POSTGRES_USER: jitacart_bootstrap
       POSTGRES_PASSWORD: jitacart
       POSTGRES_DB: jitacart
-      # Local dev: use the same trivial password across all three roles so the
-      # default .env.example DSNs work out of the box.
+      # Local dev: use the same trivial password across all runtime roles so
+      # the default .env.example DSNs work out of the box.
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-jitacart}
       WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:-jitacart}
+      BACKUP_DB_PASSWORD: ${BACKUP_DB_PASSWORD:-jitacart}
     ports:
       # Localhost-only: the dev DB ships trivial jitacart/jitacart creds, so
       # keep it off the LAN. Still reachable for host-run cargo/tests.
@@ -23,7 +26,7 @@ services:
       - jitacart-pgdata-dev:/var/lib/postgresql/data
       - ./scripts/init-roles.sh:/docker-entrypoint-initdb.d/00-init-roles.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U jitacart -d jitacart"]
+      test: ["CMD-SHELL", "pg_isready -U jitacart_bootstrap -d jitacart"]
       interval: 5s
       timeout: 5s
       retries: 10

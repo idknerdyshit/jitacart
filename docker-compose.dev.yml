@@ -1,7 +1,11 @@
+# Distinct project name so the dev stack's volumes, network, and container
+# names never share a namespace with the prod-style docker-compose.yml stack
+# on the same host.
+name: jitacart-dev
+
 services:
   postgres:
     image: postgres:16-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
-    container_name: jitacart-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: jitacart
@@ -12,7 +16,9 @@ services:
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-jitacart}
       WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:-jitacart}
     ports:
-      - "5432:5432"
+      # Localhost-only: the dev DB ships trivial jitacart/jitacart creds, so
+      # keep it off the LAN. Still reachable for host-run cargo/tests.
+      - "127.0.0.1:5432:5432"
     volumes:
       - jitacart-pgdata-dev:/var/lib/postgresql/data
       - ./scripts/init-roles.sh:/docker-entrypoint-initdb.d/00-init-roles.sh:ro

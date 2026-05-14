@@ -64,7 +64,7 @@ services:
     # release (the image tag drops the git tag's `v` prefix). Pre-
     # first-release this tracks :latest mutably and scripts/deploy.sh
     # will refuse to roll until the first pin lands.
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:0.2.0@sha256:3a82fa7a4c62909288ce8ad8373d08a2ee5f73aa27140c0f55ed494b6b326a3d
     restart: unless-stopped
     depends_on:
       postgres:
@@ -96,7 +96,7 @@ services:
 
   worker:
     # Same backend image as api; keep them at the same digest.
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:0.2.0@sha256:3a82fa7a4c62909288ce8ad8373d08a2ee5f73aa27140c0f55ed494b6b326a3d
     command: ["jitacart-worker"]
     restart: unless-stopped
     depends_on:
@@ -123,7 +123,7 @@ services:
     logging: *default-logging
 
   frontend:
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:latest
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:0.2.0@sha256:4ae77c90e83d9a0a840ec572f8a517f4965370d54b9b8f6bf67227bbb8995f99
     restart: unless-stopped
     depends_on:
       api:
@@ -163,7 +163,7 @@ services:
   # stays Up with a single WARN line so the missing config is visible
   # in `docker compose ps` rather than silently absent.
   backup:
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backup:latest
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backup:0.2.0@sha256:bd21b6cf586825ec2936cac82277a9e6693ef0c37af2c75530396f90af78bf5c
     restart: unless-stopped
     depends_on:
       postgres:

@@ -56,12 +56,23 @@ command -v docker >/dev/null || { echo "docker not on PATH" >&2; exit 1; }
 #
 # That index digest is what we want — it resolves to the right per-arch
 # image at pull time. (The `@sha256:...` refs under `Manifests:` are the
-# *per-arch* digests, not the index — don't grab those.) This matches
-# how the release job in ci.yml reads the same value.
+# *per-arch* digests, not the index — don't grab those.)
+#
+# Capture the inspect output into a variable BEFORE awk-ing it. Piping
+# `docker buildx imagetools inspect` straight into `awk '... exit'`
+# SIGPIPEs docker the moment awk exits on the first match — docker is
+# still streaming the `Manifests:` section — and under `set -e -o
+# pipefail` that aborts the whole script before the caller's
+# empty-digest check can run. `printf | awk` is safe: printf dumps the
+# (tiny) output into the pipe buffer and returns before awk reads it.
+# The release job in ci.yml works around the identical trap the same
+# way. A failed inspect (missing tag, network) yields empty output and
+# exit 0, so the caller's `[[ -z ]]` branch reports it cleanly.
 resolve_digest() {
     local image="$1"
-    docker buildx imagetools inspect "$image" 2>/dev/null \
-        | awk '/^Digest:/ { print $2; exit }'
+    local out
+    out="$(docker buildx imagetools inspect "$image" 2>/dev/null)" || return 0
+    printf '%s\n' "$out" | awk '/^Digest:/ { print $2; exit }'
 }
 
 rewrite_one() {

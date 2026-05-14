@@ -276,7 +276,11 @@ async fn callback(
 
     session.insert(SESSION_KEY_USER, user_id).await?;
 
-    Ok(Redirect::to(pending.return_to.as_deref().unwrap_or("/me")))
+    // Re-validate even though the value was sanitized before being stored in
+    // the signed session — cheap defense-in-depth against a session-shape
+    // change or a future code path that stores an unsanitized value.
+    let return_to = safe_return_to(pending.return_to);
+    Ok(Redirect::to(return_to.as_deref().unwrap_or("/me")))
 }
 
 async fn logout(session: Session) -> Result<Redirect, ApiError> {

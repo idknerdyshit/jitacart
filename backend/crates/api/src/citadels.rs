@@ -50,7 +50,13 @@ async fn search(
     if trimmed.len() > 100 {
         return Err(ApiError::BadRequest("query too long".into()));
     }
-    let pattern = format!("%{}%", trimmed.replace(['%', '_'], ""));
+    // Escape LIKE metacharacters (and the escape char itself) so a literal
+    // `_`/`%` in the query matches literally rather than as a wildcard.
+    let escaped = trimmed
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
 
     let mut conn = tx.acquire().await;
     let rows: Vec<HitRow> = sqlx::query_as(

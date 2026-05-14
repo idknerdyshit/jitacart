@@ -65,6 +65,7 @@ async fn create(
     }
 
     let mut conn = tx.acquire().await;
+    lock_user_for_quota(&mut **conn, user_id).await?;
     require_group_quota(&mut **conn, &state, user_id).await?;
     let mut group_row: Option<GroupRow> = None;
     for _ in 0..MAX_INVITE_GEN_ATTEMPTS {
@@ -274,6 +275,7 @@ async fn join(
     Path(code): Path<String>,
 ) -> Result<Json<Group>, ApiError> {
     let mut conn = tx.acquire().await;
+    lock_user_for_quota(&mut **conn, user_id).await?;
     require_group_quota(&mut **conn, &state, user_id).await?;
     let group = sqlx::query_as::<_, GroupRow>(
         r#"
@@ -330,6 +332,21 @@ async fn require_group_quota(
     user_id: Uuid,
 ) -> Result<(), ApiError> {
     check_group_quota(executor, user_id, state.config.limits.groups_per_user).await
+}
+
+/// Take a row lock on the caller's `users` row so that the quota count and the
+/// subsequent membership insert are atomic for that user. Without this, two
+/// concurrent joins each read a stale count and both insert, exceeding the cap.
+async fn lock_user_for_quota(
+    executor: impl sqlx::PgExecutor<'_>,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user_id)
+        .fetch_optional(executor)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    Ok(())
 }
 
 fn is_invite_collision(e: &sqlx::Error) -> bool {

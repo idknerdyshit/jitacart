@@ -232,6 +232,7 @@ where
                r.status              AS reimbursement_status,
                r.contract_id         AS reimbursement_contract_id,
                r.hauler_user_id,
+               r.hauler_principal_id,
                r.requester_user_id,
                r.requester_principal_id,
                l.group_id
@@ -305,6 +306,7 @@ struct LinkLockRow {
     reimbursement_status: ReimbursementStatus,
     reimbursement_contract_id: Option<Uuid>,
     hauler_user_id: Uuid,
+    hauler_principal_id: Uuid,
     /// NULL for corp-funded reimbursements (requester is a corp principal).
     requester_user_id: Option<Uuid>,
     requester_principal_id: Uuid,
@@ -335,6 +337,17 @@ async fn validate_link(
     // issuer_user_id is None and issuer_principal_id identifies a corp).
     if ctx.issuer_user_id.is_some() && ctx.issuer_user_id != Some(user_id) {
         return Err(ApiError::forbidden());
+    }
+    // Tenant binding: contracts have no group_id column, so a contract is tied
+    // to a reimbursement's group only through principals. The worker matcher
+    // pairs issuer_principal = hauler_principal and assignee_principal =
+    // requester_principal; manual-link must enforce the same, or a contract
+    // whose parties live in group A could be linked to a reimbursement in
+    // group B.
+    if ctx.issuer_principal_id != Some(ctx.hauler_principal_id) {
+        return Err(ApiError::Conflict(
+            "contract issuer does not match the reimbursement's hauler".into(),
+        ));
     }
     // Assignee, if set, must match the reimbursement's requester principal.
     if ctx
@@ -535,6 +548,7 @@ where
             r.status                AS reimbursement_status,
             r.contract_id           AS reimbursement_contract_id,
             r.hauler_user_id,
+            r.hauler_principal_id,
             r.requester_user_id,
             r.requester_principal_id,
             l.group_id

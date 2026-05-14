@@ -443,6 +443,7 @@ pub(super) async fn patch_list(
     }
     let CurrentList {
         list_id,
+        group_id,
         user_id,
         role,
         ..
@@ -462,8 +463,12 @@ pub(super) async fn patch_list(
         q.push(", status = ");
         q.push_bind(status);
     }
+    // Defense-in-depth: CurrentList already proved tenancy, but keep an inline
+    // group_id guard so the mutation is safe even if the extractor changes.
     q.push(" WHERE id = ");
     q.push_bind(list_id);
+    q.push(" AND group_id = ");
+    q.push_bind(group_id);
     q.build().execute(&mut **conn).await?;
 
     drop(conn);
@@ -480,8 +485,9 @@ pub(super) async fn delete_list(
         return Err(ApiError::forbidden());
     }
     let mut conn = tx.acquire().await;
-    let r = sqlx::query("DELETE FROM lists WHERE id = $1")
+    let r = sqlx::query("DELETE FROM lists WHERE id = $1 AND group_id = $2")
         .bind(cur.list_id)
+        .bind(cur.group_id)
         .execute(&mut **conn)
         .await?;
     if r.rows_affected() == 0 {

@@ -159,6 +159,52 @@ async fn manual_link_cross_tenant_is_forbidden(pool: PgPool) {
     assert!(bound.is_none());
 }
 
+/// `do_manual_link` uses a `CROSS JOIN` of contracts × reimbursements; contracts
+/// have no `group_id`, so the tenant tie is the principal pairing. A contract
+/// whose `issuer_principal_id` does not match the reimbursement's
+/// `hauler_principal_id` must be rejected even when the user-level checks pass
+/// (here the contract is corp-issued, so `issuer_user_id` is NULL and that
+/// check is skipped).
+#[sqlx::test(migrations = "../../migrations")]
+async fn manual_link_principal_mismatch_is_rejected(pool: PgPool) {
+    let t = seed_two_tenants(&pool).await;
+
+    // Make contract_a corp-issued (issuer_user_id = NULL so that check is
+    // skipped) and point its issuer principal at a principal that is NOT the
+    // reimbursement's hauler principal.
+    let requester_pid = get_user_principal_id(&pool, t.a.requester_user_id).await;
+    sqlx::query(
+        "UPDATE contracts SET issuer_user_id = NULL, issuer_principal_id = $1 WHERE id = $2",
+    )
+    .bind(requester_pid)
+    .bind(t.contract_a.contract_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = do_manual_link(
+        &pool,
+        t.a.hauler_user_id,
+        t.contract_a.contract_id,
+        t.a.reimbursement_id,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, ApiError::Conflict(_)),
+        "issuer/hauler principal mismatch must be rejected, got {err:?}"
+    );
+
+    // Reimbursement still unbound.
+    let bound: Option<Uuid> =
+        sqlx::query_scalar("SELECT contract_id FROM reimbursements WHERE id = $1")
+            .bind(t.a.reimbursement_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(bound.is_none());
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn unlink_by_non_issuer_cross_tenant_is_forbidden(pool: PgPool) {
     let t = seed_two_tenants(&pool).await;

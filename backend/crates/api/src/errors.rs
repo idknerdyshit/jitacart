@@ -58,7 +58,10 @@ impl From<anyhow::Error> for ApiError {
 
 impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
-        ApiError::Internal(e.into())
+        match e {
+            sqlx::Error::RowNotFound => ApiError::NotFound("not found".into()),
+            other => ApiError::Internal(other.into()),
+        }
     }
 }
 

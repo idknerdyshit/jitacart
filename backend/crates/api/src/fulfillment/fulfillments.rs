@@ -27,6 +27,11 @@ pub(super) struct RecordFulfillmentBody {
     claim_id: Option<Uuid>,
 }
 
+/// Deliberate authorization grant: any group member may record a fulfillment
+/// on an item, including unclaimed items, regardless of their role. Haulers
+/// frequently buy items before formally claiming them, and requiring a claim
+/// or manager role first would block the common workflow. Tenancy is still
+/// enforced by `CurrentList`; only the *role* check is intentionally relaxed.
 pub(super) async fn record_fulfillment(
     State(state): State<AppState>,
     Path((_list_id, item_id)): Path<(Uuid, Uuid)>,

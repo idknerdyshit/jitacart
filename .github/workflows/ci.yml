@@ -143,13 +143,13 @@ jobs:
           fi
 
   build-images:
-    name: build & push images
-    runs-on: ubuntu-latest
+    name: build ${{ matrix.image.name }} (${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.runner }}
     if: startsWith(github.ref, 'refs/tags/v')
     # Wait on every gate that could block a release before we push
     # images to ghcr — audit failures and secret-scan failures must
-    # stop publication, not race it. `pin-digests` and `release`
-    # already chain after `build-images` and inherit this gate.
+    # stop publication, not race it. `merge-images`, `pin-digests`,
+    # and `release` all chain after this and inherit the gate.
     needs: [backend, frontend, audit-backend, audit-frontend, secret-scan]
     permissions:
       contents: read
@@ -157,7 +157,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
+        # Each {image} is built once per {platform} on a native runner
+        # — no QEMU. The arm64 leg in particular (the Rust backend
+        # under emulation was the slowest job in the release pipeline)
+        # now runs on a real arm64 host. merge-images stitches the
+        # per-arch pushes into one multi-arch index afterward.
+        image:
           - name: backend
             context: ./backend
             dockerfile: ./backend/Dockerfile
@@ -167,9 +172,77 @@ jobs:
           - name: backup
             context: ./backup
             dockerfile: ./backup/Dockerfile
+        platform:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/jitacart-${{ matrix.image.name }}
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          platforms: linux/${{ matrix.platform.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Push by digest only — no tags here. merge-images applies
+          # the semver/latest tags to the assembled multi-arch index.
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/jitacart-${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
+          # Cache scope is per image AND per arch: an amd64 layer is
+          # useless to an arm64 build, and a shared scope would have
+          # the two legs clobbering each other.
+          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ matrix.platform.arch }}
+          # mode=min exports only the final stage's cache. mode=max
+          # also exports intermediate layers (including the cargo
+          # registry cache mount), which can poison subsequent builds
+          # if a previous run died mid-unpack — see jitacart#1.
+          cache-to: type=gha,mode=min,scope=${{ matrix.image.name }}-${{ matrix.platform.arch }}
+      # Hand the per-arch digest to merge-images via an artifact. The
+      # file name is the bare digest (sha256: prefix stripped); the
+      # merge job globs the directory and re-adds the prefix.
+      - name: export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: digest-${{ matrix.image.name }}-${{ matrix.platform.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-images:
+    name: merge multi-arch ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-images]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [backend, frontend, backup]
+    steps:
+      # Pull both per-arch digest artifacts for this image into one
+      # flat directory.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.name }}-*
+          merge-multiple: true
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         with:
@@ -184,33 +257,30 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
-      - id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          # mode=min exports only the final stage's cache. mode=max
-          # also exports intermediate layers (including the cargo
-          # registry cache mount), which can poison subsequent builds
-          # if a previous run died mid-unpack — see jitacart#1.
-          cache-to: type=gha,mode=min,scope=${{ matrix.name }}
+      # Assemble the multi-arch index: tag it with the metadata-action
+      # tags, pointing at the per-arch digests pushed by build-images.
+      - name: create multi-arch manifest
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/jitacart-${{ matrix.name }}
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
       # Echo the multi-arch index digest into the job log so a human
-      # can grep CI output if the release-body lookup ever fails.
-      # The release job re-queries via `docker buildx imagetools
-      # inspect` — that's the source of truth in the release body.
-      - run: |
-          echo "digest for jitacart-${{ matrix.name }}: ${{ steps.build.outputs.digest }}"
+      # can grep CI output if the release-body lookup ever fails. The
+      # release job re-queries via `docker buildx imagetools inspect`
+      # — that's the source of truth in the release body.
+      - name: inspect
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/jitacart-${{ matrix.name }}
+        run: docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.version }}"
 
   pin-digests:
     name: pin digests to main
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-images]
+    needs: [merge-images]
     permissions:
       contents: write
       packages: read
@@ -264,7 +334,7 @@ jobs:
     # Wait for pin-digests so the release notes' "pinned into
     # docker-compose.yml on main" claim is true by the time the
     # release page goes live.
-    needs: [build-images, pin-digests]
+    needs: [merge-images, pin-digests]
     permissions:
       contents: write
       packages: read

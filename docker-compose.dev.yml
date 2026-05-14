@@ -14,7 +14,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - jitacart-pgdata:/var/lib/postgresql/data
+      - jitacart-pgdata-dev:/var/lib/postgresql/data
       - ./scripts/init-roles.sh:/docker-entrypoint-initdb.d/00-init-roles.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U jitacart -d jitacart"]
@@ -23,4 +23,6 @@ services:
       retries: 10
 
 volumes:
-  jitacart-pgdata:
+  # Distinct from the prod-style stack's jitacart-pgdata so the two never
+  # share a Postgres volume on the same host.
+  jitacart-pgdata-dev:

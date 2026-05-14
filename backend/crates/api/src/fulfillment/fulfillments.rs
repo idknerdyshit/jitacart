@@ -255,22 +255,36 @@ pub(super) async fn reverse_fulfillment(
 ) -> Result<Json<ListDetail>, ApiError> {
     let mut conn = tx.acquire().await;
 
-    // Load fulfillment + its list context to get the group membership.
-    // Read inside the request tx so the authz check and mutations are atomic.
-    type ReverseRow = (Uuid, Uuid, Uuid, Option<DateTime<Utc>>, ListStatus);
+    // Resolve the fulfillment's list so we can lock it. The reversal/authz
+    // state is re-read *after* the lock — see below.
+    type ReverseRow = (Uuid, Uuid, Uuid);
     let row: Option<ReverseRow> = sqlx::query_as(
-        "SELECT f.hauler_user_id, li.list_id, li.requested_by_user_id, f.reversed_at, l.status \
+        "SELECT f.hauler_user_id, li.list_id, li.requested_by_user_id \
          FROM fulfillments f \
          JOIN list_items li ON li.id = f.list_item_id \
-         JOIN lists l ON l.id = li.list_id \
          WHERE f.id = $1",
     )
     .bind(fulfillment_id)
     .fetch_optional(&mut **conn)
     .await?;
 
-    let (hauler_user_id, list_id, requested_by_user_id, reversed_at, list_status) =
-        row.ok_or_else(ApiError::not_found)?;
+    let (hauler_user_id, list_id, requested_by_user_id) = row.ok_or_else(ApiError::not_found)?;
+
+    super::lock_list(&mut **conn, list_id).await?;
+
+    // Re-read reversal + list status under the list lock so two concurrent
+    // reverse requests serialize: the second one sees `reversed_at` set and
+    // bails instead of double-reversing.
+    let (reversed_at, list_status): (Option<DateTime<Utc>>, ListStatus) = sqlx::query_as(
+        "SELECT f.reversed_at, l.status \
+         FROM fulfillments f \
+         JOIN list_items li ON li.id = f.list_item_id \
+         JOIN lists l ON l.id = li.list_id \
+         WHERE f.id = $1",
+    )
+    .bind(fulfillment_id)
+    .fetch_one(&mut **conn)
+    .await?;
 
     if list_status == ListStatus::Archived {
         return Err(ApiError::Conflict(
@@ -283,8 +297,6 @@ pub(super) async fn reverse_fulfillment(
             "fulfillment is already reversed".into(),
         ));
     }
-
-    super::lock_list(&mut **conn, list_id).await?;
 
     // Read group membership inside the tx so authz reflects the same state
     // we'll mutate. A non-member returns 403; non-hauler-non-owner also 403.
@@ -336,11 +348,13 @@ pub(super) async fn reverse_fulfillment(
     }
 
     let item_id: Uuid = sqlx::query_scalar(
-        "UPDATE fulfillments SET reversed_at = now() WHERE id = $1 RETURNING list_item_id",
+        "UPDATE fulfillments SET reversed_at = now() \
+         WHERE id = $1 AND reversed_at IS NULL RETURNING list_item_id",
     )
     .bind(fulfillment_id)
-    .fetch_one(&mut **conn)
-    .await?;
+    .fetch_optional(&mut **conn)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest("fulfillment is already reversed".into()))?;
 
     super::recompute_item_status(&mut **conn, item_id, super::DeliveredDemotion::Allow).await?;
     super::reimbursements::upsert_reimbursement(

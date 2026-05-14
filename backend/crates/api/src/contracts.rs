@@ -651,6 +651,28 @@ where
     if !allowed {
         return Err(ApiError::forbidden());
     }
+
+    // Isolation: unlinking mutates `reimbursements`, a tenant-scoped table.
+    // Contract-level standing (issuer / assignee / corp ambassador) is not
+    // sufficient — the caller must also belong to every group whose
+    // reimbursement is linked to this contract.
+    let outside_group: bool = sqlx::query_scalar(
+        "SELECT EXISTS (\
+             SELECT 1 FROM reimbursements r \
+             JOIN lists l ON l.id = r.list_id \
+             WHERE r.contract_id = $1 \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM group_memberships gm \
+                   WHERE gm.group_id = l.group_id AND gm.user_id = $2))",
+    )
+    .bind(contract_id)
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if outside_group {
+        return Err(ApiError::forbidden());
+    }
+
     let is_finished = status.is_terminal_success();
     if is_finished {
         return Err(ApiError::Conflict(

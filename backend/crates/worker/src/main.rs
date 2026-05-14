@@ -230,6 +230,10 @@ async fn main() -> anyhow::Result<()> {
         budget: EsiBudgetGuard::default(),
         webhook_http: reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            // SSRF guard: the stored webhook URL is validated to be a Discord
+            // host, but following a 3xx could bounce us to an internal
+            // address. Webhook delivery never legitimately redirects.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("building webhook http client")?,
     });

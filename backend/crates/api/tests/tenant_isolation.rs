@@ -168,6 +168,71 @@ async fn unlink_by_non_issuer_cross_tenant_is_forbidden(pool: PgPool) {
     assert!(matches!(err, ApiError::Forbidden(_)), "got {err:?}");
 }
 
+/// A corp ambassador has standing over the *corp's* contracts, so the
+/// `allowed` check passes for a corp-issued contract. But unlinking also
+/// mutates `reimbursements` — a tenant-scoped table. An ambassador who is not a
+/// member of the group owning the linked reimbursement must still be rejected.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unlink_corp_issued_by_outside_ambassador_is_forbidden(pool: PgPool) {
+    let t = seed_two_tenants(&pool).await;
+
+    // Make contract_a corp-issued, owned by a corp.
+    let corp_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO corps (esi_corporation_id, name, ticker) \
+         VALUES ($1, 'IssuerCorp', 'ISSC') RETURNING id",
+    )
+    .bind(98_000_777_i64)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE contracts SET issuer_user_id = NULL, source_corp_id = $1 WHERE id = $2")
+        .bind(corp_id)
+        .bind(t.contract_a.contract_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Make the stranger (group B only) an ambassador of that corp.
+    let stranger_char: Uuid = sqlx::query_scalar(
+        "INSERT INTO characters \
+         (user_id, character_id, character_name, owner_hash, \
+          refresh_token_ciphertext, refresh_token_nonce) \
+         VALUES ($1, $2, 'StrangerChar', 'hash', $3, $3) RETURNING id",
+    )
+    .bind(t.stranger_in_b)
+    .bind(42_000_001_i64)
+    .bind(vec![0u8])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO corp_ambassadors (corp_id, character_id) VALUES ($1, $2)")
+        .bind(corp_id)
+        .bind(stranger_char)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Link group A's reimbursement to the contract so there is a tenant-scoped
+    // row the unlink would mutate.
+    bind_reimbursement_to_contract(&pool, t.a.reimbursement_id, t.contract_a.contract_id).await;
+
+    // The stranger passes the corp-ambassador `allowed` check but is not a
+    // member of group A — the isolation guard must still reject.
+    let err = do_unlink(&pool, t.stranger_in_b, t.contract_a.contract_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Forbidden(_)), "got {err:?}");
+
+    // Reimbursement remains linked.
+    let bound: Option<Uuid> =
+        sqlx::query_scalar("SELECT contract_id FROM reimbursements WHERE id = $1")
+            .bind(t.a.reimbursement_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(bound, Some(t.contract_a.contract_id));
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn reject_suggestion_cross_tenant_is_forbidden(pool: PgPool) {
     let t = seed_two_tenants(&pool).await;

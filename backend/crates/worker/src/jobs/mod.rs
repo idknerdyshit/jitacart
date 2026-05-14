@@ -51,6 +51,15 @@ pub(crate) fn jitter_secs(base: u64) -> i64 {
     r.rem_euclid(2 * span + 1) - span
 }
 
+/// Convert an ESI ISK amount to `Decimal`.
+///
+/// ESI ISK values reach us as `f64` — `nea-esi` deserializes every price /
+/// reward / collateral / balance / amount field that way, so the JSON→f64
+/// rounding has already happened before this is called. `from_f64` cleanly
+/// recovers values with up to ~15 significant digits, which covers all
+/// typical contracts; precision only degrades above ~10 trillion ISK with
+/// sub-ISK fractions (large corp wallet balances). A complete fix needs a
+/// Decimal-aware ESI deserializer — see issue tracker.
 pub(crate) fn isk_or_zero(v: f64) -> Decimal {
     Decimal::from_f64(v).unwrap_or(Decimal::ZERO)
 }

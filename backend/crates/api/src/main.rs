@@ -95,9 +95,13 @@ async fn main() -> anyhow::Result<()> {
 
     let budget_guard = EsiBudgetGuard::default();
 
+    // Used for outbound webhook delivery and Turnstile siteverify. Both are
+    // direct POSTs that never legitimately redirect; disabling redirects
+    // closes an SSRF vector where a 3xx could bounce us to an internal host.
     let webhook_http = reqwest::Client::builder()
         .user_agent("JitaCart-Webhook/1.0")
         .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building webhook reqwest client")?;
 

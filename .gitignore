@@ -20,6 +20,7 @@ backup/rclone.conf
 .vscode/
 .idea/
 .DS_Store
+.claude/
 
 # Logs
 *.log

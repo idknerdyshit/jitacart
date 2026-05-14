@@ -14,7 +14,6 @@ use std::sync::OnceLock;
 use chrono::{DateTime, Utc};
 use domain::Market;
 use nea_esi::EsiClient;
-use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
@@ -181,8 +180,8 @@ pub async fn refresh_one(
         .await
         .map_err(|e| anyhow::anyhow!("ESI market_orders: {e}"))?;
 
-    let mut best_sell_f: Option<f64> = None;
-    let mut best_buy_f: Option<f64> = None;
+    let mut best_sell: Option<Decimal> = None;
+    let mut best_buy: Option<Decimal> = None;
     let mut sell_volume: i64 = 0;
     let mut buy_volume: i64 = 0;
 
@@ -192,22 +191,22 @@ pub async fn refresh_one(
     {
         if o.is_buy_order {
             buy_volume = buy_volume.saturating_add(o.volume_remain);
-            best_buy_f = Some(match best_buy_f {
-                Some(c) => c.max(o.price),
-                None => o.price,
+            best_buy = Some(match best_buy {
+                Some(c) => c.max(*o.price),
+                None => *o.price,
             });
         } else {
             sell_volume = sell_volume.saturating_add(o.volume_remain);
-            best_sell_f = Some(match best_sell_f {
-                Some(c) => c.min(o.price),
-                None => o.price,
+            best_sell = Some(match best_sell {
+                Some(c) => c.min(*o.price),
+                None => *o.price,
             });
         }
     }
 
     let agg = PriceAggregate {
-        best_sell: best_sell_f.and_then(Decimal::from_f64),
-        best_buy: best_buy_f.and_then(Decimal::from_f64),
+        best_sell,
+        best_buy,
         sell_volume,
         buy_volume,
         computed_at: Utc::now(),
@@ -268,8 +267,8 @@ pub async fn refresh_many_for_citadel(
     let mut seen: HashSet<i64> = HashSet::new();
     // Per type_id aggregator state.
     struct Acc {
-        best_sell_f: Option<f64>,
-        best_buy_f: Option<f64>,
+        best_sell: Option<Decimal>,
+        best_buy: Option<Decimal>,
         sell_volume: i64,
         buy_volume: i64,
     }
@@ -283,22 +282,22 @@ pub async fn refresh_many_for_citadel(
             continue;
         }
         let acc = by_type.entry(type_id).or_insert(Acc {
-            best_sell_f: None,
-            best_buy_f: None,
+            best_sell: None,
+            best_buy: None,
             sell_volume: 0,
             buy_volume: 0,
         });
         if o.is_buy_order {
             acc.buy_volume = acc.buy_volume.saturating_add(o.volume_remain);
-            acc.best_buy_f = Some(match acc.best_buy_f {
-                Some(c) => c.max(o.price),
-                None => o.price,
+            acc.best_buy = Some(match acc.best_buy {
+                Some(c) => c.max(*o.price),
+                None => *o.price,
             });
         } else {
             acc.sell_volume = acc.sell_volume.saturating_add(o.volume_remain);
-            acc.best_sell_f = Some(match acc.best_sell_f {
-                Some(c) => c.min(o.price),
-                None => o.price,
+            acc.best_sell = Some(match acc.best_sell {
+                Some(c) => c.min(*o.price),
+                None => *o.price,
             });
         }
     }
@@ -310,8 +309,8 @@ pub async fn refresh_many_for_citadel(
     for &type_id in type_ids {
         let agg = match by_type.get(&type_id) {
             Some(acc) => PriceAggregate {
-                best_sell: acc.best_sell_f.and_then(Decimal::from_f64),
-                best_buy: acc.best_buy_f.and_then(Decimal::from_f64),
+                best_sell: acc.best_sell,
+                best_buy: acc.best_buy,
                 sell_volume: acc.sell_volume,
                 buy_volume: acc.buy_volume,
                 computed_at,

@@ -250,7 +250,7 @@ async fn poll_one_corp_wallet(
 
         // Upsert division balances.
         for w in &wallets {
-            let balance = isk_or_zero(w.balance);
+            let balance = rust_decimal::Decimal::from(w.balance);
             sqlx::query(
                 r#"
                 INSERT INTO corp_wallet_divisions (corp_id, division, balance_isk, last_synced_at)
@@ -305,8 +305,8 @@ async fn poll_one_corp_wallet(
             };
 
             for entry in &journal {
-                let amount = entry.amount.map(isk_or_zero).unwrap_or_default();
-                let balance = entry.balance.map(isk_or_zero).unwrap_or_default();
+                let amount = isk_or_zero(entry.amount);
+                let balance = isk_or_zero(entry.balance);
                 let raw = serde_json::to_value(entry)?;
 
                 // Insert; RETURNING tells us if it was newly inserted (non-conflict).

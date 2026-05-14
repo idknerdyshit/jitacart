@@ -13,7 +13,6 @@ pub mod token_reencrypt;
 use std::future::Future;
 use std::pin::Pin;
 
-use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 
 use crate::{Ctx, WorkerConfig};
@@ -51,15 +50,11 @@ pub(crate) fn jitter_secs(base: u64) -> i64 {
     r.rem_euclid(2 * span + 1) - span
 }
 
-/// Convert an ESI ISK amount to `Decimal`.
+/// Collapse an optional ESI ISK field to `Decimal`, treating absent as zero.
 ///
-/// ESI ISK values reach us as `f64` — `nea-esi` deserializes every price /
-/// reward / collateral / balance / amount field that way, so the JSON→f64
-/// rounding has already happened before this is called. `from_f64` cleanly
-/// recovers values with up to ~15 significant digits, which covers all
-/// typical contracts; precision only degrades above ~10 trillion ISK with
-/// sub-ISK fractions (large corp wallet balances). A complete fix needs a
-/// Decimal-aware ESI deserializer — see issue tracker.
-pub(crate) fn isk_or_zero(v: f64) -> Decimal {
-    Decimal::from_f64(v).unwrap_or(Decimal::ZERO)
+/// `nea-esi` deserializes every money field through its `Isk` newtype — a
+/// `rust_decimal::Decimal` parsed at arbitrary precision straight from the
+/// JSON number, so no f64 rounding ever happens.
+pub(crate) fn isk_or_zero(v: Option<nea_esi::Isk>) -> Decimal {
+    v.map(Decimal::from).unwrap_or(Decimal::ZERO)
 }

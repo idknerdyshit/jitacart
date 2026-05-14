@@ -3,7 +3,8 @@
 # specific GHCR tag + its multi-arch index digest.
 #
 # Usage:
-#     scripts/bump-image-digests.sh v0.3.0
+#     scripts/bump-image-digests.sh 0.3.0
+#     scripts/bump-image-digests.sh v0.3.0        # leading `v` is stripped
 #     scripts/bump-image-digests.sh latest        # tracks mutable :latest
 #
 # CI's pin-digests job runs this automatically on every `vX.Y.Z` tag
@@ -25,10 +26,15 @@
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
-    echo "usage: $0 <vX.Y.Z|latest>" >&2
+    echo "usage: $0 <vX.Y.Z|X.Y.Z|latest>" >&2
     exit 1
 fi
-VERSION="$1"
+# Normalize a leading `v`: git tags are `vX.Y.Z`, but docker/metadata-action
+# tags the images `X.Y.Z` (semver pattern drops the `v`). CI's pin-digests
+# job passes `github.ref_name` (the `v`-prefixed git tag) straight through,
+# so strip it here rather than making every caller remember to. `latest`
+# and other non-version tags pass through untouched.
+VERSION="${1#v}"
 
 cd "$(dirname "$0")/.."
 
@@ -41,15 +47,21 @@ COMPOSE=docker-compose.yml
 
 command -v docker >/dev/null || { echo "docker not on PATH" >&2; exit 1; }
 
-# `docker buildx imagetools inspect` prints the manifest-list digest
-# on the first line: `Name: ghcr.io/.../X:tag@sha256:DIGEST`. That's
-# the digest we want — it points at the manifest index, which docker
-# then resolves to the right per-arch image at pull time.
+# `docker buildx imagetools inspect <tag>` prints the manifest-index
+# digest on its own `Digest:` line:
+#
+#     Name:      ghcr.io/.../X:tag
+#     MediaType: application/vnd.oci.image.index.v1+json
+#     Digest:    sha256:DIGEST
+#
+# That index digest is what we want — it resolves to the right per-arch
+# image at pull time. (The `@sha256:...` refs under `Manifests:` are the
+# *per-arch* digests, not the index — don't grab those.) This matches
+# how the release job in ci.yml reads the same value.
 resolve_digest() {
     local image="$1"
     docker buildx imagetools inspect "$image" 2>/dev/null \
-        | awk '/^Name:/ { print $2; exit }' \
-        | sed -nE 's/.*@(sha256:[0-9a-f]+).*/\1/p'
+        | awk '/^Digest:/ { print $2; exit }'
 }
 
 rewrite_one() {

@@ -60,9 +60,10 @@ services:
     logging: *default-logging
 
   api:
-    # CI's pin-digests job rewrites this to vX.Y.Z@sha256:... on each
-    # release. Pre-first-release this tracks :latest mutably and
-    # scripts/deploy.sh will refuse to roll until the first pin lands.
+    # CI's pin-digests job rewrites this to X.Y.Z@sha256:... on each
+    # release (the image tag drops the git tag's `v` prefix). Pre-
+    # first-release this tracks :latest mutably and scripts/deploy.sh
+    # will refuse to roll until the first pin lands.
     image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest
     restart: unless-stopped
     depends_on:

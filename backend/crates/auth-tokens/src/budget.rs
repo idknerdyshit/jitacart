@@ -51,9 +51,18 @@ impl EsiBudgetGuard {
         self.inner.remaining.load(Ordering::Relaxed)
     }
 
-    /// Decrement on a non-2xx response.
+    /// Decrement on a non-2xx response, clamped at zero.
     pub fn record_non_2xx(&self) {
-        self.inner.remaining.fetch_sub(1, Ordering::Relaxed);
+        let _ = self
+            .inner
+            .remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v > 0 {
+                    Some(v - 1)
+                } else {
+                    None
+                }
+            });
     }
 
     /// Restore to the ceiling (called periodically from the worker once a
@@ -103,6 +112,15 @@ mod tests {
         g.reset();
         assert!(g.has_budget());
         assert_eq!(g.remaining(), 10);
+    }
+
+    #[test]
+    fn record_non_2xx_floors_at_zero() {
+        let g = EsiBudgetGuard::new(3, 1);
+        for _ in 0..10 {
+            g.record_non_2xx();
+        }
+        assert_eq!(g.remaining(), 0, "must not drift below zero");
     }
 
     #[tokio::test]

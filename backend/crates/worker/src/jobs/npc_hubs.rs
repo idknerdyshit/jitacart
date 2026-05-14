@@ -95,30 +95,31 @@ pub async fn run(ctx: &Ctx) -> anyhow::Result<()> {
     let esi = ctx.esi_anon.as_ref();
     let budget = &ctx.budget;
     // Cap (market × type_id) fan-out so a list with N markets and M items
-    // doesn't open N*M concurrent ESI calls.
+    // doesn't open N*M concurrent ESI calls. FuturesUnordered polls the
+    // tasks lazily instead of allocating every future up front.
     let sem = Arc::new(Semaphore::new(ctx.config.worker.npc_hub_concurrency));
-    let refreshes = by_market.into_iter().map(|(_, (m, type_ids))| {
-        let sem = sem.clone();
-        async move {
-            let label = m.short_label.clone().unwrap_or_else(|| "(unnamed)".into());
-            let inner = type_ids.into_iter().map(|type_id| {
-                let m = m.clone();
-                let sem = sem.clone();
-                async move {
-                    let _permit = sem.acquire().await.expect("semaphore not closed");
-                    let r = budgeted(budget, market::refresh_one(pool, esi, &m, type_id)).await;
-                    (type_id, r)
-                }
+
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let mut futs = FuturesUnordered::new();
+    for (_, (m, type_ids)) in by_market {
+        for type_id in type_ids {
+            let m = m.clone();
+            let sem = sem.clone();
+            futs.push(async move {
+                let _permit = sem.acquire().await.expect("semaphore not closed");
+                let res = budgeted(budget, market::refresh_one(pool, esi, &m, type_id)).await;
+                let label = m.short_label.clone().unwrap_or_else(|| "(unnamed)".into());
+                (label, type_id, res)
             });
-            let results = futures_util::future::join_all(inner).await;
-            for (type_id, res) in results {
-                if let Err(e) = res {
-                    tracing::warn!(error = ?e, market = %label, type_id, "market refresh failed");
-                }
-            }
         }
-    });
-    futures_util::future::join_all(refreshes).await;
+    }
+
+    while let Some((label, type_id, res)) = futs.next().await {
+        if let Err(e) = res {
+            tracing::warn!(error = ?e, market = %label, type_id, "market refresh failed");
+        }
+    }
     Ok(())
 }
 

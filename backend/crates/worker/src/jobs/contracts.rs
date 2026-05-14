@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use nea_esi::{EsiContract, EsiError};
-use serde_json::Value;
 use settlement::ContractUpsert;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
@@ -286,7 +285,7 @@ async fn poll_one_character(
             date_completed: c.date_completed,
             start_location_id: c.start_location_id.map(domain::EsiLocationId),
             end_location_id: c.end_location_id.map(domain::EsiLocationId),
-            raw_json: serde_json::to_value(c).unwrap_or(Value::Null),
+            raw_json: serde_json::to_value(c)?,
             source_corp_id: None,
         };
 

@@ -1,26 +1,28 @@
-import { redirect } from '@sveltejs/kit';
+import { redirect, error } from '@sveltejs/kit';
 import type { LayoutServerLoad } from './$types';
 
 /**
- * Server-side auth gate for the (authed) route group. Forwards the user's
- * cookies to the backend's /api/me endpoint via SvelteKit's `event.fetch`.
- * On 200 we return the parsed body; on 401 we redirect before any HTML is
- * sent to the browser. Removing the client-only `ssr = false` lets this
- * gate run before hydration.
+ * Server-side auth gate for the (authed) route group. `hooks.server.ts`
+ * has already resolved `/api/me` into request-scoped `locals`. We gate on
+ * that here, before any HTML is sent:
+ *  - authenticated  -> hand the payload to the page tree as `data.me`
+ *  - 403            -> account disabled/banned: show a dedicated error page
+ *  - 401 / no cookie -> redirect to the landing page
+ *  - anything else  -> surface as an error rather than a misleading
+ *    "logged in but everything is broken" render
  */
-export const load: LayoutServerLoad = async ({ fetch, request }) => {
-    const cookie = request.headers.get('cookie') ?? '';
-    const res = await fetch('/api/me', {
-        headers: { cookie },
-    });
-    if (res.status === 401) {
+export const load: LayoutServerLoad = async ({ locals }) => {
+    if (locals.me) {
+        return { me: locals.me };
+    }
+    if (locals.meStatus === 403) {
+        throw error(
+            403,
+            'Your account is disabled. Contact your group owner if you think this is a mistake.'
+        );
+    }
+    if (locals.meStatus === 401 || locals.meStatus === 0) {
         throw redirect(302, '/');
     }
-    if (!res.ok) {
-        // Surface non-401 errors so the user gets an error page, not a
-        // misleading "you're logged in but everything is broken" experience.
-        throw new Error(`/me responded ${res.status}`);
-    }
-    const me = await res.json();
-    return { me };
+    throw error(502, `/me responded ${locals.meStatus}`);
 };

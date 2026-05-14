@@ -659,7 +659,17 @@ pub fn merge_upgrade_scopes(
 
 fn safe_return_to(return_to: Option<String>) -> Option<String> {
     let path = return_to?;
-    if path.starts_with('/') && !path.starts_with("//") && !path.contains(['\r', '\n']) {
+    // Must be a site-relative path. Reject:
+    //  - protocol-relative `//host` and (after browser backslash normalization)
+    //    `/\host` / `\\host`, which redirect off-site;
+    //  - any backslash, since browsers normalize `\` to `/` in the Location
+    //    header before resolving;
+    //  - CRLF, to block header injection.
+    if path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains('\\')
+        && !path.contains(['\r', '\n'])
+    {
         Some(path)
     } else {
         None
@@ -717,5 +727,30 @@ mod tests {
         let mut sorted = merged.clone();
         sorted.sort();
         assert_eq!(merged, sorted, "output should be lexicographically sorted");
+    }
+
+    #[test]
+    fn safe_return_to_accepts_site_relative_paths() {
+        assert_eq!(
+            safe_return_to(Some("/groups/abc".into())),
+            Some("/groups/abc".into())
+        );
+        assert_eq!(safe_return_to(Some("/".into())), Some("/".into()));
+        assert_eq!(safe_return_to(None), None);
+    }
+
+    #[test]
+    fn safe_return_to_rejects_open_redirects() {
+        // protocol-relative and absolute URLs
+        assert_eq!(safe_return_to(Some("//evil.com".into())), None);
+        assert_eq!(safe_return_to(Some("https://evil.com".into())), None);
+        // backslash variants browsers normalize to `/` -> off-site
+        assert_eq!(safe_return_to(Some("/\\evil.com".into())), None);
+        assert_eq!(safe_return_to(Some("\\\\evil.com".into())), None);
+        assert_eq!(safe_return_to(Some("/\\/evil.com".into())), None);
+        // header injection
+        assert_eq!(safe_return_to(Some("/foo\r\nSet-Cookie: x".into())), None);
+        // not site-relative
+        assert_eq!(safe_return_to(Some("evil.com".into())), None);
     }
 }

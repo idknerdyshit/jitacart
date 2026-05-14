@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use nea_esi::{EsiError, EsiWalletJournalEntry};
-use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -308,7 +307,7 @@ async fn poll_one_corp_wallet(
             for entry in &journal {
                 let amount = entry.amount.map(isk_or_zero).unwrap_or_default();
                 let balance = entry.balance.map(isk_or_zero).unwrap_or_default();
-                let raw = serde_json::to_value(entry).unwrap_or(Value::Null);
+                let raw = serde_json::to_value(entry)?;
 
                 // Insert; RETURNING tells us if it was newly inserted (non-conflict).
                 let inserted: Option<(Option<i64>,)> = sqlx::query_as(

@@ -1,41 +1,40 @@
 <script lang="ts">
-    import { me, viewerCharacters } from '$lib/stores/me';
+    let { data } = $props();
 
-    const characters = $derived($viewerCharacters);
+    // Server-validated payload from the (authed) layout load — rendered in
+    // the initial SSR HTML, no client round-trip.
+    const me = $derived(data.me);
+    const characters = $derived(me.characters);
 </script>
 
 <p><a href="/">← Home</a></p>
 <h1>Profile</h1>
 
-{#if $me}
-    <p>
-        Signed in as <strong>{$me.user.display_name}</strong>
-        <span style="color: #8b949e">({$me.user.id})</span>
-    </p>
+<p>
+    Signed in as <strong>{me.user.display_name}</strong>
+    <span style="color: #8b949e">({me.user.id})</span>
+</p>
 
-    <h2>Linked characters</h2>
-    {#if characters.length === 0}
-        <p>No characters linked yet.</p>
-    {:else}
-        <ul>
-            {#each characters as c (c.id)}
-                <li>
-                    <strong>{c.character_name}</strong>
-                    <span style="color: #8b949e">#{c.character_id}</span>
-                    <div style="color: #8b949e; font-size: 0.85rem">
-                        scopes: {c.scopes.join(', ') || '(none)'}
-                    </div>
-                </li>
-            {/each}
-        </ul>
-    {/if}
-
-    <p>
-        <a class="btn" href="/api/auth/eve/login?attach=1">+ Add another character</a>
-    </p>
+<h2>Linked characters</h2>
+{#if characters.length === 0}
+    <p>No characters linked yet.</p>
 {:else}
-    <p>Loading…</p>
+    <ul>
+        {#each characters as c (c.id)}
+            <li>
+                <strong>{c.character_name}</strong>
+                <span style="color: #8b949e">#{c.character_id}</span>
+                <div style="color: #8b949e; font-size: 0.85rem">
+                    scopes: {c.scopes.join(', ') || '(none)'}
+                </div>
+            </li>
+        {/each}
+    </ul>
 {/if}
+
+<p>
+    <a class="btn" href="/api/auth/eve/login?attach=1">+ Add another character</a>
+</p>
 
 <style>
     li {

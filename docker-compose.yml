@@ -73,10 +73,12 @@ services:
       ADMIN_DATABASE_URL: postgres://jitacart_admin:${POSTGRES_PASSWORD}@postgres:5432/jitacart
       DATABASE_URL: postgres://jitacart_app:${APP_DB_PASSWORD}@postgres:5432/jitacart
       SERVER__BIND: 0.0.0.0:8080
-      # Loopback only; scrape via `docker compose exec api curl
-      # 127.0.0.1:9090/metrics` or a sidecar in the same netns.
-      # Caddy does not proxy this port.
-      METRICS__BIND: 127.0.0.1:9090
+      # METRICS__BIND is intentionally NOT set here: an inline `environment`
+      # value wins over `.env`, so setting it would make the operator's
+      # .env override silently ineffective. It comes from `.env` (env_file)
+      # when present, else the binary's own default (127.0.0.1:9090 — a
+      # loopback bind Caddy does not proxy; scrape via `docker compose exec
+      # api curl 127.0.0.1:9090/metrics` or a same-netns sidecar).
     expose:
       - "8080"
     healthcheck:

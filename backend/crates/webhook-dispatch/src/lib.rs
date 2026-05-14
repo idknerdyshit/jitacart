@@ -247,12 +247,19 @@ impl ReqwestSender {
     }
 }
 
+/// Hard ceiling on a single webhook POST. Set per-request rather than
+/// relying on the caller's `Client` having a timeout — the worker's
+/// client does, the API's does not necessarily, and a hung Discord
+/// endpoint must not pin a connection indefinitely either way.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[async_trait::async_trait]
 impl WebhookSender for ReqwestSender {
     async fn send(&self, url: &str, payload: serde_json::Value) -> anyhow::Result<()> {
         self.0
             .post(url)
             .json(&payload)
+            .timeout(SEND_TIMEOUT)
             .send()
             .await?
             .error_for_status()?;

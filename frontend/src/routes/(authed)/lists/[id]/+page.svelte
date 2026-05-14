@@ -173,7 +173,7 @@
     }
 
     const qtyTimers = new Map<string, ReturnType<typeof setTimeout>>();
-    let qtyInflightIds = $state<Set<string>>(new SvelteSet());
+    let qtyInflightIds = $state<SvelteSet<string>>(new SvelteSet());
     function setInflight(id: string, on: boolean) {
         if (on) qtyInflightIds.add(id);
         else qtyInflightIds.delete(id);

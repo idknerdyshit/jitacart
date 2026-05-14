@@ -227,7 +227,7 @@
                 </tr>
             </thead>
             <tbody>
-                {#each preview.lines as line, i (line.name + i)}
+                {#each preview.lines as line, i (i)}
                     <tr class:err-row={line.error != null}>
                         <td>
                             {#if line.error}<span class="err">⚠ </span>{/if}

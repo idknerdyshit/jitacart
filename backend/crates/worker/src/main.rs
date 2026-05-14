@@ -261,15 +261,28 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn drive_slot(slot: Box<dyn JobSlot>, ctx: Arc<Ctx>) {
+    use futures_util::FutureExt;
+
     let secs = slot.interval_secs(&ctx.config);
     let mut t = mk_interval(secs);
     loop {
         t.tick().await;
-        let outcome = match slot.run(&ctx).await {
-            Ok(()) => "ok",
-            Err(e) => {
+        // A panic inside `run` would otherwise abort this spawned task
+        // and silently kill the slot's ticker for the lifetime of the
+        // process. Catch it, log it, and let the next tick retry — same
+        // recovery semantics as a returned `Err`.
+        let result = std::panic::AssertUnwindSafe(slot.run(&ctx))
+            .catch_unwind()
+            .await;
+        let outcome = match result {
+            Ok(Ok(())) => "ok",
+            Ok(Err(e)) => {
                 tracing::error!(error = ?e, slot = slot.name(), "tick failed");
                 "err"
+            }
+            Err(_) => {
+                tracing::error!(slot = slot.name(), "tick panicked; ticker continues");
+                "panic"
             }
         };
         // Per-slot tick counter, labelled with outcome so an alerting

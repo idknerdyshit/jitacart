@@ -162,6 +162,17 @@ pub async fn tx_middleware(
             tracing::error!(error = ?e, success = is_success,
                 "tx_middleware: commit/rollback failed");
         }
+    } else {
+        // The slot should always hold the tx here: handlers only ever
+        // `acquire()` a guard, never `take()`. An empty slot means the
+        // tx was dropped without an explicit commit/rollback (e.g. a
+        // handler panicked mid-guard). Postgres rolls back the orphaned
+        // transaction on connection return, but log it so the silent
+        // rollback is visible to operators.
+        tracing::warn!(
+            "tx_middleware: transaction slot empty at request end; \
+             tx was dropped without explicit commit/rollback"
+        );
     }
 
     response

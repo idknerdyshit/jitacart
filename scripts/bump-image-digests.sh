@@ -88,6 +88,12 @@ PY
 }
 
 echo "resolving digests for ${VERSION} (owner=${OWNER}):"
+# NOTE: `api` and `worker` both run the jitacart-backend image, and the
+# rewrite is keyed on `jitacart-<img>:` — so each of these two calls
+# (re)writes *both* backend `image:` lines. That's idempotent today
+# because they resolve to the same digest. If a third service ever runs
+# jitacart-backend at a *different* version, this loop can no longer
+# express that; switch rewrite_one to target a specific service block.
 rewrite_one api      backend
 rewrite_one worker   backend
 rewrite_one frontend frontend

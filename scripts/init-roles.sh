@@ -9,13 +9,18 @@
 # must not be reachable by application code. Only the four roles below ever
 # appear in a connection string:
 #   - jitacart_admin   : table owner; runs migrations. RLS does not apply.
-#                        Has CREATEROLE because the init migration's idempotent
-#                        `CREATE ROLE … EXCEPTION WHEN duplicate_object` is
-#                        checked for privilege BEFORE existence — a non-
-#                        CREATEROLE admin gets 42501 even when the role
-#                        already exists. PG 16's CREATEROLE is constrained
-#                        (cannot create superusers, cannot toggle BYPASSRLS,
-#                        can only manage roles it has admin option on).
+#                        Has CREATEROLE + BYPASSRLS because the init migration's
+#                        idempotent `CREATE ROLE … EXCEPTION WHEN
+#                        duplicate_object` is checked for privilege BEFORE
+#                        existence — a non-CREATEROLE admin gets 42501 even
+#                        when the role already exists. CREATEROLE covers
+#                        jitacart_app (NOBYPASSRLS) but PG 16 separately
+#                        requires the creator to hold BYPASSRLS to create a
+#                        BYPASSRLS role (jitacart_worker, jitacart_backup), so
+#                        admin needs both. BYPASSRLS on admin itself is a
+#                        functional no-op — admin is the table owner and is
+#                        already exempt from RLS unless we add FORCE RLS,
+#                        which we deliberately don't.
 #   - jitacart_app     : api runtime role; NOBYPASSRLS, gated by policies.
 #   - jitacart_worker  : worker runtime role; BYPASSRLS for cross-tenant jobs.
 #   - jitacart_backup  : backup runtime role; SELECT-only + BYPASSRLS so
@@ -31,7 +36,7 @@
 set -e
 
 psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<EOSQL
-CREATE ROLE jitacart_admin  LOGIN NOSUPERUSER NOBYPASSRLS CREATEROLE PASSWORD '${POSTGRES_PASSWORD}';
+CREATE ROLE jitacart_admin  LOGIN NOSUPERUSER BYPASSRLS CREATEROLE PASSWORD '${POSTGRES_PASSWORD}';
 CREATE ROLE jitacart_app    LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '${APP_DB_PASSWORD}';
 CREATE ROLE jitacart_worker LOGIN NOSUPERUSER BYPASSRLS   PASSWORD '${WORKER_DB_PASSWORD}';
 CREATE ROLE jitacart_backup LOGIN NOSUPERUSER BYPASSRLS   PASSWORD '${BACKUP_DB_PASSWORD}';

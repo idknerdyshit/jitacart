@@ -49,3 +49,10 @@
         format json
     }
 }
+
+# Optional extra vhosts. The glob matches nothing on a plain prod host,
+# so this is a no-op by default. Used to front a co-located staging
+# stack at staging.<domain> with a real cert — copy
+# caddy/conf.d/staging.caddy.example to caddy/conf.d/staging.caddy and
+# fill in the hostname. See DEPLOY.md § Staging environment.
+import /etc/caddy/conf.d/*.caddy

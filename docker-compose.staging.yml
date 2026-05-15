@@ -1,0 +1,171 @@
+# Staging stack: postgres + api + worker + frontend + caddy (no backup).
+#
+# Full five-service topology, co-located on the SAME HOST as the prod
+# stack (docker-compose.yml). It exists to smoke-test the newest CI
+# build before it's promoted to a `vX.Y.Z` release — prod deploys
+# digest-pinned images, staging deliberately tracks mutable `:latest`.
+#
+# Bring-up (see DEPLOY.md § Staging environment):
+#     docker compose -f docker-compose.staging.yml --env-file .env.staging pull
+#     docker compose -f docker-compose.staging.yml --env-file .env.staging up -d
+#
+# scripts/deploy.sh is PROD-ONLY (it enforces digest pins + a clean git
+# tree); never point it at this file. Staging redeploys are a plain
+# `pull && up -d`.
+#
+# This is a STANDALONE file, not an override on docker-compose.yml:
+# repointing named volumes and remapping `ports:` via an override hits
+# compose's array-merge ambiguity (service `ports` concatenate rather
+# than replace). The cost is structural duplication — if you add or
+# change a service in docker-compose.yml, sync the change here.
+#
+# Differences from docker-compose.yml:
+#   - name: jitacart-staging  → isolates from prod (jitacart) + dev
+#     (jitacart-dev) projects on the same host.
+#   - images: :latest, NOT @sha256-pinned — tracks whatever CI pushed.
+#   - volumes: *-staging suffixed so they never collide with prod's.
+#   - caddy host ports remapped to 8080/8443 (prod owns 80/443).
+#   - env_file: .env.staging instead of .env.
+#   - backup service omitted — staging data is disposable.
+
+name: jitacart-staging
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
+    restart: unless-stopped
+    environment:
+      # The bootstrap superuser is deliberately NOT `jitacart` — a superuser
+      # bypasses all RLS, so it must never be reachable from a runtime
+      # DATABASE_URL. Runtime code connects only as jitacart_{app,worker}.
+      POSTGRES_USER: jitacart_bootstrap
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.staging}
+      POSTGRES_DB: jitacart
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.staging}
+      WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:?set WORKER_DB_PASSWORD in .env.staging}
+      BACKUP_DB_PASSWORD: ${BACKUP_DB_PASSWORD:?set BACKUP_DB_PASSWORD in .env.staging}
+    volumes:
+      - jitacart-pgdata-staging:/var/lib/postgresql/data
+      # Runs once on a fresh data dir to create the RLS roles. Idempotent
+      # on subsequent restarts: the entrypoint only invokes
+      # /docker-entrypoint-initdb.d/ when the cluster is being initialized.
+      - ./scripts/init-roles.sh:/docker-entrypoint-initdb.d/00-init-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jitacart_bootstrap -d jitacart"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+
+  api:
+    # Mutable :latest — staging tracks whatever CI last pushed. This is
+    # the whole point of the staging stack; do NOT digest-pin here.
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env.staging
+        required: false
+    environment:
+      # Migration runner uses the admin role (table owner; runs CREATE/ALTER);
+      # all runtime queries go through jitacart_app, which is gated by RLS.
+      ADMIN_DATABASE_URL: postgres://jitacart_admin:${POSTGRES_PASSWORD}@postgres:5432/jitacart
+      DATABASE_URL: postgres://jitacart_app:${APP_DB_PASSWORD}@postgres:5432/jitacart
+      SERVER__BIND: 0.0.0.0:8080
+      # METRICS__BIND is intentionally NOT set here: an inline `environment`
+      # value wins over `.env.staging`, so setting it would make the
+      # operator's override silently ineffective. It comes from
+      # `.env.staging` (env_file) when present, else the binary's own
+      # default (127.0.0.1:9090 — a loopback bind Caddy does not proxy).
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+  worker:
+    # Same backend image as api; keep them at the same tag.
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest
+    command: ["jitacart-worker"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    env_file:
+      - path: .env.staging
+        required: false
+    environment:
+      # Worker connects as jitacart_worker (BYPASSRLS) — it operates across
+      # tenants by design (price refresh, contract sync, webhook drain, …).
+      DATABASE_URL: postgres://jitacart_worker:${WORKER_DB_PASSWORD}@postgres:5432/jitacart
+      WORKER__HEALTHZ_BIND: 127.0.0.1:9091
+    expose:
+      - "9091"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+  frontend:
+    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:latest
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2-alpine@sha256:86deaf5e3d3408a6ccec08fbb79989783dd26e206ae10bcf78a801dc8c9ab794
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    environment:
+      JC_DOMAIN: ${JC_DOMAIN:?set JC_DOMAIN in .env.staging (e.g. :80 for HTTP-only on http://<host>:8080)}
+    ports:
+      # Prod owns 80/443 on this host; staging gets remapped, env-overridable
+      # ports. ACME HTTP-01 cannot work behind a remapped :80 — keep
+      # JC_DOMAIN=:80 (HTTP-only) or front staging with a subdomain on the
+      # prod Caddy. See .env.staging.example.
+      - "${JC_STAGING_HTTP_PORT:-8080}:80"
+      - "${JC_STAGING_HTTPS_PORT:-8443}:443"
+      - "${JC_STAGING_HTTPS_PORT:-8443}:443/udp"  # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data-staging:/data
+      - caddy-config-staging:/config
+    logging: *default-logging
+
+volumes:
+  # *-staging suffixed so they never share a namespace with the prod
+  # (jitacart_*) or dev (jitacart-dev_*) stacks on the same host.
+  jitacart-pgdata-staging:
+  caddy-data-staging:
+  caddy-config-staging:

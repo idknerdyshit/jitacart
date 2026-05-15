@@ -152,8 +152,16 @@ services:
       - "80:80"
       - "443:443"
       - "443:443/udp"  # HTTP/3
+    # Lets the Caddyfile's conf.d vhosts reach host-published ports —
+    # specifically a co-located staging stack on JC_STAGING_HTTP_PORT.
+    # Harmless when no conf.d/*.caddy file is present.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Optional extra vhosts (e.g. staging.<domain>). Empty by default;
+      # see caddy/conf.d/staging.caddy.example.
+      - ./caddy/conf.d:/etc/caddy/conf.d:ro
       - caddy-data:/data
       - caddy-config:/config
     logging: *default-logging

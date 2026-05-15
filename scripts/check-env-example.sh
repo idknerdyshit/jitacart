@@ -22,6 +22,8 @@ EXCLUDE=(
     PATH HOME TZ          # OS-provided
     JC_IMAGE_TAG          # dev-only; build override (docker-compose.build.yml)
                           # uses it. Prod docker-compose.yml digest-pins.
+    JC_STAGING_HTTP_PORT  # staging-only; docker-compose.staging.yml remaps
+    JC_STAGING_HTTPS_PORT # caddy host ports. Not in prod's .env.example.
 )
 
 is_excluded() {

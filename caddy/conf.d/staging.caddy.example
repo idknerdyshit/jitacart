@@ -1,0 +1,39 @@
+# Staging front-end vhost for the prod Caddy.
+#
+# Fronts a co-located staging stack (docker-compose.staging.yml) at
+# staging.<domain> with a real Let's Encrypt cert, terminating TLS on
+# the prod Caddy and reverse-proxying to the staging stack's own Caddy
+# over the host port it publishes (JC_STAGING_HTTP_PORT, default 8080).
+#
+# Why this exists: staging's Caddy is remapped off :80/:443 (prod owns
+# them), so it can't run ACME HTTP-01 itself. The prod Caddy already has
+# :443 + working ACME, so it issues the cert and proxies through.
+#
+# Setup:
+#   1. cp caddy/conf.d/staging.caddy.example caddy/conf.d/staging.caddy
+#   2. Edit staging.caddy: set the real hostname below.
+#   3. The prod caddy service mounts ./caddy/conf.d and has
+#      host.docker.internal mapped (see docker-compose.yml) — no further
+#      compose changes needed. Reload: docker compose up -d caddy
+#   4. DNS: point staging.<domain> at this host.
+#   5. In .env.staging set EVE_SSO__CALLBACK_URL to
+#      https://staging.<domain>/auth/eve/callback and register it on the
+#      staging EVE app.
+#
+# A real caddy/conf.d/*.caddy file is gitignored — this .example is the
+# only tracked file in the directory.
+
+staging.jitacart.example.com {
+    encode zstd gzip
+
+    # Thin pass-through: the staging stack's own Caddy (reached via the
+    # host port it publishes) applies the security headers and the
+    # /api/* split, using the same ./Caddyfile this prod Caddy runs.
+    # reverse_proxy sets X-Forwarded-{For,Proto,Host} automatically.
+    reverse_proxy host.docker.internal:8080
+
+    log {
+        output stdout
+        format json
+    }
+}

@@ -13,8 +13,12 @@ dist/
 # Env / secrets
 .env
 .env.local
+.env.staging
 *.pem
 backup/rclone.conf
+
+# Operator-local Caddy vhosts (the *.example template stays tracked)
+caddy/conf.d/*.caddy
 
 # Editor
 .vscode/

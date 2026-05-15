@@ -26,7 +26,29 @@ day-2 ops.
 ```
 
 Five services in `docker-compose.yml`. Local dev keeps just postgres via
-`docker-compose.dev.yml`.
+`docker-compose.dev.yml`. A third option, `docker-compose.staging.yml`,
+runs the same five-service topology against mutable `:latest` images for
+a full-stack smoke test before a release tag — see *Staging environment*
+below.
+
+## EVE SSO callback URLs
+
+EVE SSO matches the callback URL exactly against what's registered on the
+app at <https://developers.eveonline.com/applications>. Run **one EVE app
+per environment** — never reuse prod's client id/secret in dev or
+staging — and register each environment's callback below as that app's
+callback URL. The path is always `/auth/eve/callback`; only the
+scheme/host/port change.
+
+| Env | `EVE_SSO__CALLBACK_URL` | Notes |
+|-----|------------------------|-------|
+| **dev** | `http://localhost:8080/auth/eve/callback` | api runs on the host at :8080. Register a dedicated dev EVE app. |
+| **staging** | `http://<staging-host>:8080/auth/eve/callback` | Goes through staging's Caddy on `JC_STAGING_HTTP_PORT` (8080 by default). If you front staging with a subdomain on the prod Caddy instead, use `https://staging.<domain>/auth/eve/callback`. |
+| **prod** | `https://<JC_DOMAIN>/auth/eve/callback` | Through Caddy on :443 with a real cert. |
+
+A single EVE app can hold multiple callback URLs, so dev+staging may
+share one app if you prefer — but keep prod's app separate so a leaked
+non-prod secret can't touch production.
 
 ## First-time deploy
 
@@ -322,3 +344,82 @@ JC_DOMAIN=:80 JC_IMAGE_OWNER=local JC_IMAGE_TAG=dev \
 
 `:80` tells Caddy to bind plain HTTP on port 80 only and skip ACME.
 Fine for confidence-checking the layout; do NOT run prod this way.
+
+## Staging environment
+
+`docker-compose.staging.yml` is the full five-service stack (no `backup`)
+running the mutable `ghcr.io/<owner>/jitacart-*:latest` images — whatever
+CI last pushed. It exists to catch breakage (migrations, Caddyfile
+changes, ESI behaviour) *before* you cut a `vX.Y.Z` tag, and it's
+designed to run **co-located on the same host as prod**: distinct compose
+project name (`jitacart-staging`), `-staging`-suffixed volumes, and Caddy
+host ports remapped to 8080/8443 (prod keeps 80/443).
+
+Unlike prod, staging deliberately does **not** digest-pin — tracking
+`:latest` is the whole point.
+
+### One-time setup
+
+```sh
+cp .env.staging.example .env.staging
+# then edit .env.staging: set EVE_SSO__*, TOKEN_ENC_KEY, and DB
+# passwords (distinct from prod — staging shares the host, not the
+# secrets).
+```
+
+Register the staging callback URL on a staging EVE app (see *EVE SSO
+callback URLs* above). Which URL depends on whether you put staging
+behind TLS — see the next subsection.
+
+### TLS via the prod Caddy
+
+Staging's own Caddy is remapped off :80/:443 (prod owns them), so it
+can't run ACME HTTP-01 itself. Instead, front staging with a
+`staging.<domain>` vhost on the **prod** Caddy — it already has :443 and
+working ACME, so it issues the cert and reverse-proxies through to the
+staging stack's Caddy on the host port it publishes
+(`JC_STAGING_HTTP_PORT`, default 8080):
+
+```sh
+cp caddy/conf.d/staging.caddy.example caddy/conf.d/staging.caddy
+# edit caddy/conf.d/staging.caddy: set the real staging.<domain> hostname
+docker compose up -d caddy        # prod caddy picks up the new vhost
+```
+
+The prod `caddy` service already mounts `./caddy/conf.d` and has
+`host.docker.internal` mapped — no other compose changes needed. Point a
+DNS record for `staging.<domain>` at this host, then set
+`EVE_SSO__CALLBACK_URL=https://staging.<domain>/auth/eve/callback` in
+`.env.staging` and register that on the staging EVE app.
+
+`caddy/conf.d/*.caddy` is gitignored, so this stays operator-local; the
+prod Caddyfile's `import` glob is a no-op on hosts without it.
+
+Skipping this leaves staging HTTP-only on `http://<host>:8080` — fine
+for a quick smoke test, but then the callback URL is
+`http://<staging-host>:8080/auth/eve/callback`.
+
+### Bring-up and redeploy
+
+```sh
+docker compose -f docker-compose.staging.yml --env-file .env.staging pull
+docker compose -f docker-compose.staging.yml --env-file .env.staging up -d
+```
+
+A staging redeploy is just that `pull && up -d` again — it picks up the
+newest `:latest`. **Do not** use `scripts/deploy.sh` for staging: it is
+prod-only and enforces digest pins plus a clean, up-to-date git tree,
+neither of which applies here.
+
+### Co-location notes
+
+The distinct project name means plain `docker compose ps` (no `-f`) will
+**not** show staging containers — you must pass
+`-f docker-compose.staging.yml`. Likewise prod commands without `-f` stay
+scoped to the prod stack and never touch staging.
+
+```sh
+docker compose -f docker-compose.staging.yml ps          # staging only
+docker volume ls | grep jitacart                         # jitacart_* and jitacart-staging_*, distinct
+docker compose -f docker-compose.staging.yml down -v      # teardown — staging volumes only
+```

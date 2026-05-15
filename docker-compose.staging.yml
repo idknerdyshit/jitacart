@@ -66,7 +66,7 @@ services:
   api:
     # Mutable :latest — staging tracks whatever CI last pushed. This is
     # the whole point of the staging stack; do NOT digest-pin here.
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest
+    image: ghcr.io/${JC_IMAGE_OWNER:-idknerdyshit}/jitacart-backend:latest
     restart: unless-stopped
     depends_on:
       postgres:
@@ -97,7 +97,7 @@ services:
 
   worker:
     # Same backend image as api; keep them at the same tag.
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:latest
+    image: ghcr.io/${JC_IMAGE_OWNER:-idknerdyshit}/jitacart-backend:latest
     command: ["jitacart-worker"]
     restart: unless-stopped
     depends_on:
@@ -124,7 +124,7 @@ services:
     logging: *default-logging
 
   frontend:
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:latest
+    image: ghcr.io/${JC_IMAGE_OWNER:-idknerdyshit}/jitacart-frontend:latest
     restart: unless-stopped
     depends_on:
       api:

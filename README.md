@@ -90,7 +90,7 @@ and DNS pointed at it.
 ```sh
 # 1. Get the repo (only the compose files, Caddyfile, and .env.example are
 #    actually needed on the server; everything else is in the images).
-git clone https://github.com/eyedeekay/jitacart.git
+git clone https://github.com/idknerdyshit/jitacart.git
 cd jitacart
 
 # 2. Register an EVE app at https://developers.eveonline.com/applications

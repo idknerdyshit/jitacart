@@ -24,11 +24,21 @@ RUN apk add --no-cache \
         tini \
         tzdata
 
+# Run unprivileged. The postgres base image ships its own `postgres`
+# user, but this image overrides the base entrypoint, so nothing drops
+# privileges unless we do it here. uid 10001 matches the api/worker/
+# frontend images. pg_dump/pg_restore connect over TCP, age and rclone
+# stream, and the .pgpass file goes to a mktemp under /tmp — none of it
+# needs root or the `postgres` uid.
+RUN addgroup -S jitacart && adduser -S -G jitacart -u 10001 -h /home/jitacart jitacart
+
 COPY backup.sh /usr/local/bin/backup.sh
 COPY restore.sh /usr/local/bin/restore.sh
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/backup.sh /usr/local/bin/restore.sh /usr/local/bin/entrypoint.sh
 
 ENV TZ=UTC
+ENV HOME=/home/jitacart
+USER jitacart
 
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]

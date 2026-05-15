@@ -32,10 +32,33 @@ x-logging: &default-logging
     max-size: "10m"
     max-file: "3"
 
+# Least-privilege defaults for the app containers (api, worker, frontend,
+# backup). All four already run as a non-root uid in their images; this
+# adds the defense-in-depth on top: no privilege escalation, zero Linux
+# caps (none of them bind privileged ports or touch devices), and a
+# read-only root filesystem with a tmpfs for the only path that needs
+# writes (/tmp — Rust/Node scratch, and backup's mktemp .pgpass).
+# postgres and caddy can't take all of this (root-owned data dir init,
+# privileged-port bind) and are hardened inline below.
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  read_only: true
+  tmpfs:
+    - /tmp
+
 services:
   postgres:
     image: postgres:16-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
     restart: unless-stopped
+    # No cap_drop / read_only here: the official entrypoint starts as
+    # root to init/chown the data dir and gosu-drops to the postgres
+    # user. no-new-privileges is still safe — gosu uses the setuid()
+    # syscall as an already-root process, not a setuid binary.
+    security_opt:
+      - no-new-privileges:true
     environment:
       # The bootstrap superuser is deliberately NOT `jitacart` — a superuser
       # bypasses all RLS, so it must never be reachable from a runtime
@@ -60,11 +83,12 @@ services:
     logging: *default-logging
 
   api:
+    <<: *hardening
     # CI's pin-digests job rewrites this to X.Y.Z@sha256:... on each
     # release (the image tag drops the git tag's `v` prefix). Pre-
     # first-release this tracks :latest mutably and scripts/deploy.sh
     # will refuse to roll until the first pin lands.
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:0.2.0@sha256:3a82fa7a4c62909288ce8ad8373d08a2ee5f73aa27140c0f55ed494b6b326a3d
+    image: ghcr.io/${JC_IMAGE_OWNER:-idknerdyshit}/jitacart-backend:0.2.0@sha256:3a82fa7a4c62909288ce8ad8373d08a2ee5f73aa27140c0f55ed494b6b326a3d
     restart: unless-stopped
     depends_on:
       postgres:
@@ -95,8 +119,9 @@ services:
     logging: *default-logging
 
   worker:
+    <<: *hardening
     # Same backend image as api; keep them at the same digest.
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:0.2.0@sha256:3a82fa7a4c62909288ce8ad8373d08a2ee5f73aa27140c0f55ed494b6b326a3d
+    image: ghcr.io/${JC_IMAGE_OWNER:-idknerdyshit}/jitacart-backend:0.2.0@sha256:3a82fa7a4c62909288ce8ad8373d08a2ee5f73aa27140c0f55ed494b6b326a3d
     command: ["jitacart-worker"]
     restart: unless-stopped
     depends_on:
@@ -123,7 +148,8 @@ services:
     logging: *default-logging
 
   frontend:
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:0.2.0@sha256:4ae77c90e83d9a0a840ec572f8a517f4965370d54b9b8f6bf67227bbb8995f99
+    <<: *hardening
+    image: ghcr.io/${JC_IMAGE_OWNER:-idknerdyshit}/jitacart-frontend:0.2.0@sha256:4ae77c90e83d9a0a840ec572f8a517f4965370d54b9b8f6bf67227bbb8995f99
     restart: unless-stopped
     depends_on:
       api:
@@ -141,6 +167,17 @@ services:
   caddy:
     image: caddy:2-alpine@sha256:86deaf5e3d3408a6ccec08fbb79989783dd26e206ae10bcf78a801dc8c9ab794
     restart: unless-stopped
+    # Caddy runs as root to bind :80/:443 and run ACME; drop every cap
+    # except the one that buys — binding privileged ports. Not read_only:
+    # its writable state (/data, /config) is on named volumes, but the
+    # upstream image isn't validated for a read-only rootfs and TLS is
+    # too important to gamble on.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
     depends_on:
       api:
         condition: service_healthy
@@ -171,8 +208,15 @@ services:
   # stays Up with a single WARN line so the missing config is visible
   # in `docker compose ps` rather than silently absent.
   backup:
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backup:0.2.0@sha256:bd21b6cf586825ec2936cac82277a9e6693ef0c37af2c75530396f90af78bf5c
+    <<: *hardening
+    image: ghcr.io/${JC_IMAGE_OWNER:-idknerdyshit}/jitacart-backup:0.2.0@sha256:bd21b6cf586825ec2936cac82277a9e6693ef0c37af2c75530396f90af78bf5c
     restart: unless-stopped
+    # Overrides the *hardening tmpfs: backup also needs a writable HOME
+    # for rclone's config/cache dir probing (it streams, but still
+    # touches ~/.config/rclone). /tmp carries the mktemp .pgpass.
+    tmpfs:
+      - /tmp
+      - /home/jitacart
     depends_on:
       postgres:
         condition: service_healthy

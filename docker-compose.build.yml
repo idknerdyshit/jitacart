@@ -19,22 +19,22 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:${JC_IMAGE_TAG:-dev}
+    image: ghcr.io/${JC_IMAGE_OWNER:-idknerdyshit}/jitacart-backend:${JC_IMAGE_TAG:-dev}
 
   worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backend:${JC_IMAGE_TAG:-dev}
+    image: ghcr.io/${JC_IMAGE_OWNER:-idknerdyshit}/jitacart-backend:${JC_IMAGE_TAG:-dev}
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-frontend:${JC_IMAGE_TAG:-dev}
+    image: ghcr.io/${JC_IMAGE_OWNER:-idknerdyshit}/jitacart-frontend:${JC_IMAGE_TAG:-dev}
 
   backup:
     build:
       context: ./backup
       dockerfile: Dockerfile
-    image: ghcr.io/${JC_IMAGE_OWNER:-eyedeekay}/jitacart-backup:${JC_IMAGE_TAG:-dev}
+    image: ghcr.io/${JC_IMAGE_OWNER:-idknerdyshit}/jitacart-backup:${JC_IMAGE_TAG:-dev}

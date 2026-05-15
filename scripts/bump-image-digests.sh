@@ -40,7 +40,7 @@ cd "$(dirname "$0")/.."
 
 # Owner defaults to the in-tree default; override via env to lock to
 # a fork.
-OWNER="${JC_IMAGE_OWNER:-eyedeekay}"
+OWNER="${JC_IMAGE_OWNER:-idknerdyshit}"
 
 COMPOSE=docker-compose.yml
 [[ -f "$COMPOSE" ]] || { echo "no $COMPOSE in $(pwd)" >&2; exit 1; }
@@ -90,7 +90,7 @@ rewrite_one() {
 
     # Match `    image: ghcr.io/<owner-or-interp>/jitacart-<img>:...`
     # at the start of the line. The owner segment may be a literal or
-    # the `${JC_IMAGE_OWNER:-eyedeekay}` interpolation — keep
+    # the `${JC_IMAGE_OWNER:-idknerdyshit}` interpolation — keep
     # whichever the file already has. Anchor on `jitacart-<img>:` so
     # we don't touch postgres / caddy / unrelated services.
     python3 - "$COMPOSE" "$img" "$VERSION" "$digest" <<'PY'

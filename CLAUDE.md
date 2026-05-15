@@ -72,7 +72,8 @@ JC_DOMAIN=:80 JC_IMAGE_OWNER=local JC_IMAGE_TAG=dev \
 - `audit-frontend`: `npm audit --audit-level=high`.
 - `env-lint`: `scripts/check-env-example.sh`.
 - `secret-scan`: gitleaks + a backstop check that refuses any tracked file matching `(^|/)\.env($|\.[^.]+$)` other than `.env.{example,sample,template}`.
-- `build-images` + `release`: on `v*` tags only, push multi-arch images to `ghcr.io/<owner>/jitacart-{backend,frontend,backup}` and create a GitHub Release.
+- `build-images` + `merge-images`: on pushes to `main` and on `v*` tags, build and push multi-arch images to `ghcr.io/<owner>/jitacart-{backend,frontend,backup}`. A `main` push moves only `:latest` (what the staging stack pulls); a `v*` tag also gets the semver tags.
+- `pin-digests` + `release`: on `v*` tags only, pin the release digests into `docker-compose.yml` on `main` and create a GitHub Release.
 
 ## Conventions
 

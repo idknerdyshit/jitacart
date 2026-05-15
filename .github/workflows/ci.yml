@@ -149,10 +149,12 @@ jobs:
   build-images:
     name: build ${{ matrix.image.name }} (${{ matrix.platform.arch }})
     runs-on: ${{ matrix.platform.runner }}
-    if: startsWith(github.ref, 'refs/tags/v')
-    # Wait on every gate that could block a release before we push
-    # images to ghcr — audit failures and secret-scan failures must
-    # stop publication, not race it. `merge-images`, `pin-digests`,
+    # Runs on main pushes (to publish :latest for the co-located staging
+    # stack to pull) and on v* tags (the release pipeline). Not on PRs.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # Wait on every gate that could block publication before we push
+    # images to ghcr — test, audit, and secret-scan failures must stop
+    # publication, not race it. On tags, `merge-images`, `pin-digests`,
     # and `release` all chain after this and inherit the gate.
     needs: [backend, frontend, audit-backend, audit-frontend, secret-scan]
     permissions:
@@ -230,7 +232,10 @@ jobs:
   merge-images:
     name: merge multi-arch ${{ matrix.name }}
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Same trigger as build-images. On a main push the metadata-action
+    # below emits only the `latest` tag (the semver patterns are
+    # tag-only), so a main push moves :latest and nothing else.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: [build-images]
     permissions:
       contents: read
